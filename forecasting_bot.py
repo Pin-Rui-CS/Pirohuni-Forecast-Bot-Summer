@@ -4,6 +4,7 @@ import argparse
 import asyncio
 from collections import Counter
 import datetime
+from email.utils import parsedate_to_datetime
 import json
 import os
 import re
@@ -33,7 +34,10 @@ NUM_RUNS_PER_QUESTION = (
     5  # The median forecast is taken between NUM_RUNS_PER_QUESTION runs
 )
 SKIP_PREVIOUSLY_FORECASTED_QUESTIONS = False
-METACULUS_API_RATE_LIMITER = asyncio.Semaphore(3)
+METACULUS_MAX_CONCURRENT_REQUESTS = int(
+    os.getenv("METACULUS_MAX_CONCURRENT_REQUESTS", "1")
+)
+METACULUS_API_RATE_LIMITER = asyncio.Semaphore(METACULUS_MAX_CONCURRENT_REQUESTS)
 METACULUS_REQUEST_INTERVAL = float(os.getenv("METACULUS_REQUEST_INTERVAL", "3.0"))
 
 # Environment variables
@@ -143,6 +147,33 @@ def _truncate_response_text(text: str, max_len: int = 350) -> str:
     return text[: max_len - 3] + "..."
 
 
+def _get_retry_wait_seconds(response: httpx.Response, fallback_wait_seconds: float) -> float:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is None:
+        return fallback_wait_seconds
+
+    stripped = retry_after.strip()
+    try:
+        wait_seconds = float(stripped)
+        if wait_seconds > 0:
+            return wait_seconds
+    except ValueError:
+        pass
+
+    try:
+        retry_after_dt = parsedate_to_datetime(stripped)
+        if retry_after_dt.tzinfo is None:
+            retry_after_dt = retry_after_dt.replace(tzinfo=datetime.timezone.utc)
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        wait_seconds = (retry_after_dt - now_utc).total_seconds()
+        if wait_seconds > 0:
+            return wait_seconds
+    except Exception:
+        pass
+
+    return fallback_wait_seconds
+
+
 def _metaculus_get_json_with_retries(
     url: str,
     *,
@@ -178,11 +209,12 @@ def _metaculus_get_json_with_retries(
         response_text = response.text
         rate_limited = _is_rate_limited_response(response.status_code, response_text)
         if rate_limited and attempt < MAX_API_GET_RETRIES:
+            retry_wait_seconds = _get_retry_wait_seconds(response, wait_seconds)
             print(
                 f"{request_label} rate-limited on try {attempt}/{MAX_API_GET_RETRIES} for URL {url}. "
-                f"Status={response.status_code}. Retrying in {wait_seconds:.1f}s."
+                f"Status={response.status_code}. Retrying in {retry_wait_seconds:.1f}s."
             )
-            time.sleep(wait_seconds)
+            time.sleep(retry_wait_seconds)
             wait_seconds *= 2
             continue
 
@@ -223,11 +255,12 @@ async def _metaculus_async_get_json_with_retries(url: str, *, request_label: str
             response_text = response.text
             rate_limited = _is_rate_limited_response(response.status_code, response_text)
             if rate_limited and attempt < MAX_API_GET_RETRIES:
+                retry_wait_seconds = _get_retry_wait_seconds(response, wait_seconds)
                 print(
                     f"{request_label} rate-limited on try {attempt}/{MAX_API_GET_RETRIES} for URL {url}. "
-                    f"Status={response.status_code}. Retrying in {wait_seconds:.1f}s."
+                    f"Status={response.status_code}. Retrying in {retry_wait_seconds:.1f}s."
                 )
-                await asyncio.sleep(wait_seconds)
+                await asyncio.sleep(retry_wait_seconds)
                 wait_seconds *= 2
                 continue
 
@@ -278,11 +311,12 @@ async def _metaculus_async_post_with_retries(
             response_text = response.text
             rate_limited = _is_rate_limited_response(response.status_code, response_text)
             if rate_limited and attempt < MAX_API_GET_RETRIES:
+                retry_wait_seconds = _get_retry_wait_seconds(response, wait_seconds)
                 print(
                     f"{request_label} rate-limited on try {attempt}/{MAX_API_GET_RETRIES} for URL {url}. "
-                    f"Status={response.status_code}. Retrying in {wait_seconds:.1f}s."
+                    f"Status={response.status_code}. Retrying in {retry_wait_seconds:.1f}s."
                 )
-                await asyncio.sleep(wait_seconds)
+                await asyncio.sleep(retry_wait_seconds)
                 wait_seconds *= 2
                 continue
 
@@ -1649,7 +1683,10 @@ async def forecast_individual_question(
     summary_of_forecast += (
         f"-----------------------------------------------\nQuestion: {title}\n"
     )
-    summary_of_forecast += f"URL: https://www.metaculus.com/questions/{post_id}/\n"
+    summary_of_forecast += (
+        f"Post ID: {post_id}\nQuestion ID: {question_id}\n"
+        f"Post API URL: {API_BASE_URL}/posts/{post_id}/\n"
+    )
 
     if question_type == "multiple_choice":
         options = question_details["options"]
@@ -1745,7 +1782,9 @@ async def forecast_questions(
         question_id, post_id = question_id_post_id
         if isinstance(forecast_summary, Exception):
             print(
-                f"-----------------------------------------------\nPost {post_id} Question {question_id}:\nError: {forecast_summary.__class__.__name__} {forecast_summary}\nURL: https://www.metaculus.com/questions/{post_id}/\n"
+                f"-----------------------------------------------\nPost {post_id} Question {question_id}:\n"
+                f"Error: {forecast_summary.__class__.__name__} {forecast_summary}\n"
+                f"Post API URL: {API_BASE_URL}/posts/{post_id}/\n"
             )
             errors.append(forecast_summary)
         else:
