@@ -112,6 +112,10 @@ EXAMPLE_QUESTIONS = [  # (question_id, post_id)
 AUTH_HEADERS = {"Authorization": f"Token {METACULUS_TOKEN}"}
 API_BASE_URL = "https://www.metaculus.com/api"
 RESOLUTION_SCRAPER: ResolutionScraper | None = None
+MAX_API_GET_RETRIES = 3
+INITIAL_API_GET_RETRY_WAIT_SECONDS = float(
+    os.getenv("INITIAL_API_GET_RETRY_WAIT_SECONDS", "3.0")
+)
 
 if RESOLUTION_SCRAPER_ENABLED:
     try:
@@ -122,53 +126,209 @@ if RESOLUTION_SCRAPER_ENABLED:
         print(f"Warning: resolution scraper disabled due to init error: {exc}")
 
 
+def _is_rate_limited_response(status_code: int, response_text: str) -> bool:
+    if status_code == 429:
+        return True
+    lowered = response_text.lower()
+    return (
+        "rate limit" in lowered
+        or "too many requests" in lowered
+        or ("cloudflare" in lowered and "access denied" in lowered)
+    )
+
+
+def _truncate_response_text(text: str, max_len: int = 350) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _metaculus_get_json_with_retries(
+    url: str,
+    *,
+    params: dict | None = None,
+    request_label: str,
+) -> dict:
+    wait_seconds = INITIAL_API_GET_RETRY_WAIT_SECONDS
+    for attempt in range(1, MAX_API_GET_RETRIES + 1):
+        time.sleep(METACULUS_REQUEST_INTERVAL)
+        try:
+            response = httpx.get(
+                url,
+                headers=AUTH_HEADERS,
+                params=params,
+                timeout=30.0,
+            )
+        except httpx.RequestError as exc:
+            if attempt == MAX_API_GET_RETRIES:
+                raise RuntimeError(
+                    f"{request_label} failed after {MAX_API_GET_RETRIES} tries for URL {url}: {exc}"
+                ) from exc
+            print(
+                f"{request_label} network error on try {attempt}/{MAX_API_GET_RETRIES} for URL {url}: {exc}. "
+                f"Retrying in {wait_seconds:.1f}s."
+            )
+            time.sleep(wait_seconds)
+            wait_seconds *= 2
+            continue
+
+        if response.status_code < 400:
+            return response.json()
+
+        response_text = response.text
+        rate_limited = _is_rate_limited_response(response.status_code, response_text)
+        if rate_limited and attempt < MAX_API_GET_RETRIES:
+            print(
+                f"{request_label} rate-limited on try {attempt}/{MAX_API_GET_RETRIES} for URL {url}. "
+                f"Status={response.status_code}. Retrying in {wait_seconds:.1f}s."
+            )
+            time.sleep(wait_seconds)
+            wait_seconds *= 2
+            continue
+
+        raise RuntimeError(
+            f"{request_label} failed on try {attempt}/{MAX_API_GET_RETRIES} for URL {url}. "
+            f"Status={response.status_code}. Response={_truncate_response_text(response_text)}"
+        )
+
+    raise RuntimeError(
+        f"{request_label} failed after {MAX_API_GET_RETRIES} tries for URL {url}"
+    )
+
+
+async def _metaculus_async_get_json_with_retries(url: str, *, request_label: str) -> dict:
+    wait_seconds = INITIAL_API_GET_RETRY_WAIT_SECONDS
+    async with METACULUS_API_RATE_LIMITER:
+        for attempt in range(1, MAX_API_GET_RETRIES + 1):
+            await asyncio.sleep(METACULUS_REQUEST_INTERVAL)
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(url, headers=AUTH_HEADERS, timeout=30.0)
+            except httpx.RequestError as exc:
+                if attempt == MAX_API_GET_RETRIES:
+                    raise RuntimeError(
+                        f"{request_label} failed after {MAX_API_GET_RETRIES} tries for URL {url}: {exc}"
+                    ) from exc
+                print(
+                    f"{request_label} network error on try {attempt}/{MAX_API_GET_RETRIES} for URL {url}: {exc}. "
+                    f"Retrying in {wait_seconds:.1f}s."
+                )
+                await asyncio.sleep(wait_seconds)
+                wait_seconds *= 2
+                continue
+
+            if response.status_code < 400:
+                return response.json()
+
+            response_text = response.text
+            rate_limited = _is_rate_limited_response(response.status_code, response_text)
+            if rate_limited and attempt < MAX_API_GET_RETRIES:
+                print(
+                    f"{request_label} rate-limited on try {attempt}/{MAX_API_GET_RETRIES} for URL {url}. "
+                    f"Status={response.status_code}. Retrying in {wait_seconds:.1f}s."
+                )
+                await asyncio.sleep(wait_seconds)
+                wait_seconds *= 2
+                continue
+
+            raise RuntimeError(
+                f"{request_label} failed on try {attempt}/{MAX_API_GET_RETRIES} for URL {url}. "
+                f"Status={response.status_code}. Response={_truncate_response_text(response_text)}"
+            )
+
+    raise RuntimeError(
+        f"{request_label} failed after {MAX_API_GET_RETRIES} tries for URL {url}"
+    )
+
+
+async def _metaculus_async_post_with_retries(
+    url: str,
+    *,
+    json_payload: dict | list,
+    request_label: str,
+) -> httpx.Response:
+    wait_seconds = INITIAL_API_GET_RETRY_WAIT_SECONDS
+    async with METACULUS_API_RATE_LIMITER:
+        for attempt in range(1, MAX_API_GET_RETRIES + 1):
+            await asyncio.sleep(METACULUS_REQUEST_INTERVAL)
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        url,
+                        json=json_payload,
+                        headers=AUTH_HEADERS,
+                        timeout=30.0,
+                    )
+            except httpx.RequestError as exc:
+                if attempt == MAX_API_GET_RETRIES:
+                    raise RuntimeError(
+                        f"{request_label} failed after {MAX_API_GET_RETRIES} tries for URL {url}: {exc}"
+                    ) from exc
+                print(
+                    f"{request_label} network error on try {attempt}/{MAX_API_GET_RETRIES} for URL {url}: {exc}. "
+                    f"Retrying in {wait_seconds:.1f}s."
+                )
+                await asyncio.sleep(wait_seconds)
+                wait_seconds *= 2
+                continue
+
+            if response.status_code < 400:
+                return response
+
+            response_text = response.text
+            rate_limited = _is_rate_limited_response(response.status_code, response_text)
+            if rate_limited and attempt < MAX_API_GET_RETRIES:
+                print(
+                    f"{request_label} rate-limited on try {attempt}/{MAX_API_GET_RETRIES} for URL {url}. "
+                    f"Status={response.status_code}. Retrying in {wait_seconds:.1f}s."
+                )
+                await asyncio.sleep(wait_seconds)
+                wait_seconds *= 2
+                continue
+
+            raise RuntimeError(
+                f"{request_label} failed on try {attempt}/{MAX_API_GET_RETRIES} for URL {url}. "
+                f"Status={response.status_code}. Response={_truncate_response_text(response_text)}"
+            )
+
+    raise RuntimeError(
+        f"{request_label} failed after {MAX_API_GET_RETRIES} tries for URL {url}"
+    )
+
+
 async def post_question_comment(post_id: int, comment_text: str) -> None:
     """
     Post a comment on the question page as the bot user.
     """
-    async with METACULUS_API_RATE_LIMITER:
-        await asyncio.sleep(METACULUS_REQUEST_INTERVAL)
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{API_BASE_URL}/comments/create/",
-                json={
-                    "text": comment_text,
-                    "parent": None,
-                    "included_forecast": True,
-                    "is_private": True,
-                    "on_post": post_id,
-                },
-                headers=AUTH_HEADERS,
-                timeout=30.0,
-            )
-        if response.status_code >= 400:
-            raise RuntimeError(response.text)
+    await _metaculus_async_post_with_retries(
+        f"{API_BASE_URL}/comments/create/",
+        json_payload={
+            "text": comment_text,
+            "parent": None,
+            "included_forecast": True,
+            "is_private": True,
+            "on_post": post_id,
+        },
+        request_label=f"post_question_comment(post_id={post_id})",
+    )
 
 
 async def post_question_prediction(question_id: int, forecast_payload: dict) -> None:
     """
     Post a forecast on a question.
     """
-    async with METACULUS_API_RATE_LIMITER:
-        await asyncio.sleep(METACULUS_REQUEST_INTERVAL)
-        
-        url = f"{API_BASE_URL}/questions/forecast/"
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url,
-                json=[
-                    {
-                        "question": question_id,
-                        **forecast_payload,
-                    },
-                ],
-                headers=AUTH_HEADERS,
-                timeout=30.0,
-            )
-        print(f"Prediction Post status code: {response.status_code}")
-        if response.status_code >= 400:
-            raise RuntimeError(response.text)
+    url = f"{API_BASE_URL}/questions/forecast/"
+    response = await _metaculus_async_post_with_retries(
+        url,
+        json_payload=[
+            {
+                "question": question_id,
+                **forecast_payload,
+            },
+        ],
+        request_label=f"post_question_prediction(question_id={question_id})",
+    )
+    print(f"Prediction Post status code: {response.status_code}")
 
 
 def create_forecast_payload(
@@ -206,7 +366,7 @@ def create_forecast_payload(
 
 def list_posts_from_tournament(
     tournament_id: int | str = DEFAULT_TOURNAMENT_ID, offset: int = 0, count: int = 50
-) -> list[dict]:
+) -> dict:
     """
     List (all details) {count} posts from the {tournament_id}
     """
@@ -227,12 +387,14 @@ def list_posts_from_tournament(
         "include_description": "true",
     }
     url = f"{API_BASE_URL}/posts/"
-    # Synchronous call - respect rate limit between calls
-    time.sleep(METACULUS_REQUEST_INTERVAL)
-    response = httpx.get(url, headers=AUTH_HEADERS, params=url_qparams, timeout=30.0)
-    if response.status_code >= 400:
-        raise Exception(response.text)
-    data = response.json()
+    data = _metaculus_get_json_with_retries(
+        url,
+        params=url_qparams,
+        request_label=(
+            "list_posts_from_tournament"
+            f"(tournament_id={tournament_id}, offset={offset}, limit={count})"
+        ),
+    )
     return data
 
 
@@ -264,17 +426,11 @@ async def get_post_details(post_id: int) -> dict:
     """
     url = f"{API_BASE_URL}/posts/{post_id}/"
     print(f"Getting details for {url}")
-    
-    async with METACULUS_API_RATE_LIMITER:
-        # Add a small delay between requests
-        await asyncio.sleep(0.5)  # 500ms delay
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=AUTH_HEADERS, timeout=30.0)
-        if response.status_code >= 400:
-            raise Exception(response.text)
-        details = response.json()
-        return details
+    details = await _metaculus_async_get_json_with_retries(
+        url,
+        request_label=f"get_post_details(post_id={post_id})",
+    )
+    return details
 
 
 CONCURRENT_REQUESTS_LIMIT = 5
@@ -1511,7 +1667,12 @@ async def forecast_individual_question(
         try:
             scrape_results = await scraper.scrape_question_sources(question_details)
             signals = scraper.flatten_signals(scrape_results)
-            resolution_snapshot = format_resolution_snapshot(signals)
+            if signals:
+                resolution_snapshot = format_resolution_snapshot(signals)
+            else:
+                summary_of_forecast += (
+                    "Resolution scraper returned no structured signals; continuing without scraper context.\n"
+                )
         except Exception as exc:
             summary_of_forecast += f"Resolution scrape error: {exc}\n"
 

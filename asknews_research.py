@@ -8,7 +8,7 @@ Import this module in your forecasting_bot.py:
     from asknews_research import call_asknews_rate_limited, call_asknews_fast
 
 Rate limits (Metaculus free tier):
-- 1 request per 10 seconds
+- 1 request per 20 seconds
 - 1 concurrent request at a time
 """
 
@@ -26,18 +26,19 @@ dotenv.load_dotenv()
 # Get API credentials from environment
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID")
 ASKNEWS_SECRET = os.getenv("ASKNEWS_SECRET")
+ASKNEWS_MIN_SECONDS_BETWEEN_CALLS = 20.0
 
 # Global variables for rate limiting
 _last_asknews_call_time = None
 _asknews_lock = threading.Lock()  # Use proper threading lock instead of boolean
 
 
-def wait_for_rate_limit(min_seconds_between_calls: float = 10.0):
+def wait_for_rate_limit(min_seconds_between_calls: float = ASKNEWS_MIN_SECONDS_BETWEEN_CALLS):
     """
     Ensures we wait at least min_seconds_between_calls since the last API call.
     
     Args:
-        min_seconds_between_calls: Minimum seconds to wait (10 for Metaculus free tier)
+        min_seconds_between_calls: Minimum seconds to wait (20 for Metaculus free tier)
     """
     global _last_asknews_call_time
     
@@ -65,7 +66,7 @@ def call_asknews_rate_limited(question: str) -> str:
     Returns:
         Formatted string containing relevant news articles
     
-    Total time: ~20 seconds (10s between calls + API response time)
+    Total time: ~40 seconds (20s between calls + API response time)
     """
     if not ASKNEWS_CLIENT_ID or not ASKNEWS_SECRET:
         return "AskNews credentials not found in environment variables."
@@ -90,7 +91,7 @@ def call_asknews_rate_limited(question: str) -> str:
             # FIRST API CALL: Hot news
             hot_articles = None
             try:
-                wait_for_rate_limit(min_seconds_between_calls=10.0)
+                wait_for_rate_limit(min_seconds_between_calls=ASKNEWS_MIN_SECONDS_BETWEEN_CALLS)
                 print("📡 API Call 1/2: Fetching latest news (past 48 hours)...")
                 
                 hot_response = ask.news.search_news(
@@ -124,7 +125,7 @@ def call_asknews_rate_limited(question: str) -> str:
             # SECOND API CALL: Historical news
             historical_articles = None
             try:
-                wait_for_rate_limit(min_seconds_between_calls=10.0)
+                wait_for_rate_limit(min_seconds_between_calls=ASKNEWS_MIN_SECONDS_BETWEEN_CALLS)
                 print("📡 API Call 2/2: Fetching historical news (past 60 days)...")
                 
                 historical_response = ask.news.search_news(
@@ -161,7 +162,7 @@ def call_asknews_rate_limited(question: str) -> str:
             
             # Check if we got any results
             if not hot_articles and not historical_articles:
-                return "AskNews rate limit exceeded or no articles found. Please wait 10 seconds and try again."
+                return "AskNews rate limit exceeded or no articles found. Please wait 20 seconds and try again."
             
             print("✓ AskNews research completed successfully!")
             return formatted_articles
@@ -190,7 +191,7 @@ def call_asknews_fast(question: str, max_wait: float = 30.0) -> str:
     Returns:
         Formatted string containing relevant news articles
     
-    Total time: ~10 seconds + API response time
+    Total time: ~20 seconds + API response time
     """
     if not ASKNEWS_CLIENT_ID or not ASKNEWS_SECRET:
         return "AskNews credentials not found in environment variables."
@@ -210,12 +211,12 @@ def call_asknews_fast(question: str, max_wait: float = 30.0) -> str:
             global _last_asknews_call_time
             if _last_asknews_call_time is not None:
                 elapsed = time.time() - _last_asknews_call_time
-                if elapsed < 10.0:
-                    wait_time = 10.0 - elapsed
+                if elapsed < ASKNEWS_MIN_SECONDS_BETWEEN_CALLS:
+                    wait_time = ASKNEWS_MIN_SECONDS_BETWEEN_CALLS - elapsed
                     if wait_time > max_wait:
                         return f"Rate limit: need to wait {wait_time:.0f}s (exceeds max_wait={max_wait}s)"
             
-            wait_for_rate_limit(min_seconds_between_calls=10.0)
+            wait_for_rate_limit(min_seconds_between_calls=ASKNEWS_MIN_SECONDS_BETWEEN_CALLS)
             print("📡 Fetching latest news...")
             
             hot_response = ask.news.search_news(
@@ -253,7 +254,7 @@ def call_asknews_fast(question: str, max_wait: float = 30.0) -> str:
         
         except RateLimitExceededError as e:
             print(f"⚠️  Rate limit exceeded: {str(e)}")
-            return "Rate limit exceeded. Please wait 10 seconds."
+            return "Rate limit exceeded. Please wait 20 seconds."
         
         except Exception as e:
             error_msg = f"AskNews error: {str(e)}"
@@ -274,8 +275,8 @@ def batch_asknews_research(questions: list[str], use_fast_mode: bool = False) ->
         Dictionary mapping questions to their research results
     
     Time estimate:
-        Fast mode: ~10 seconds per question
-        Full mode: ~20 seconds per question
+        Fast mode: ~20 seconds per question
+        Full mode: ~40 seconds per question
     """
     results = {}
     total_questions = len(questions)
@@ -283,7 +284,7 @@ def batch_asknews_research(questions: list[str], use_fast_mode: bool = False) ->
     print(f"\n{'='*80}")
     print(f"BATCH RESEARCH: {total_questions} questions")
     print(f"Mode: {'Fast (hot news only)' if use_fast_mode else 'Full (hot + historical)'}")
-    print(f"Estimated time: {(10 if use_fast_mode else 20) * total_questions} seconds")
+    print(f"Estimated time: {(20 if use_fast_mode else 40) * total_questions} seconds")
     print(f"{'='*80}\n")
     
     for i, question in enumerate(questions, 1):
@@ -299,7 +300,7 @@ def batch_asknews_research(questions: list[str], use_fast_mode: bool = False) ->
         # Show progress
         remaining = total_questions - i
         if remaining > 0:
-            est_time = (10 if use_fast_mode else 20) * remaining
+            est_time = (20 if use_fast_mode else 40) * remaining
             print(f"✓ Completed. {remaining} questions remaining (~{est_time}s)")
     
     print(f"\n{'='*80}")
