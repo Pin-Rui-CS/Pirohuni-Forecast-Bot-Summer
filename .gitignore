@@ -25,4 +25,5 @@ test_results/
 docs/
 forecast_custom_question.py
 inspect_bot.py
+experiment.py
 test.py

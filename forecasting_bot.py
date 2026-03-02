@@ -281,6 +281,15 @@ CONCURRENT_REQUESTS_LIMIT = 5
 llm_rate_limiter = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
 
 
+def log_prediction_prompt(question_type: str, title: str, prompt: str) -> None:
+    print(
+        "########################\n"
+        f"Formatted {question_type} prediction prompt for: {title}\n"
+        f"{prompt}\n"
+        "########################"
+    )
+
+
 async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temperature: float = 0.3) -> str:
     client = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
@@ -512,6 +521,7 @@ async def get_binary_gpt_prediction(
         summary_report=summary_report,
         resolution_snapshot_section=resolution_snapshot_section,
     )
+    log_prediction_prompt("binary", title, content)
 
     async def get_rationale_and_probability(content: str) -> tuple[float, str]:
         rationale = await call_llm(content)
@@ -1208,6 +1218,7 @@ async def get_numeric_gpt_prediction(
         upper_bound_message=upper_bound_message,
         units=unit_of_measure,
     )
+    log_prediction_prompt(question_type, title, content)
 
     async def ask_llm_to_get_cdf(content: str) -> tuple[list[float], str]:
         rationale = await call_llm(content)
@@ -1399,6 +1410,7 @@ async def get_multiple_choice_gpt_prediction(
         resolution_snapshot_section=resolution_snapshot_section,
         options=options,
     )
+    log_prediction_prompt("multiple_choice", title, content)
 
     async def ask_llm_for_multiple_choice_probabilities(
         content: str,

@@ -5,7 +5,6 @@ import time
 
 from .adapters import (
     BrowserAdapter,
-    CsvAdapter,
     JsonApiAdapter,
     SourceAdapter,
     StaticHtmlAdapter,
@@ -31,7 +30,6 @@ class ResolutionScraper:
         base_adapters: list[SourceAdapter] = [
             WikipediaAdapter(self.config),
             JsonApiAdapter(self.config),
-            CsvAdapter(self.config),
             StaticHtmlAdapter(self.config),
         ]
         if self.config.use_browser_fallback:
