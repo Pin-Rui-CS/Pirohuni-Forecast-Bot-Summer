@@ -1925,7 +1925,7 @@ if __name__ == "__main__":
         print("⚠️  Running in TEST mode - predictions will NOT be submitted to Metaculus")
     
     print(f"Using {args.num_runs} runs per question")
-    print(f"Skip previously forecasted: {args.skip_previous}\n")
+    print(f"Skip previously forecasted: {SKIP_PREVIOUSLY_FORECASTED_QUESTIONS}\n")
     
     # Run the forecasting
     asyncio.run(
@@ -1933,7 +1933,7 @@ if __name__ == "__main__":
             all_questions,
             submit_prediction,
             args.num_runs,
-            args.skip_previous,
+            SKIP_PREVIOUSLY_FORECASTED_QUESTIONS,
             RESOLUTION_SCRAPER,
         )
     )
