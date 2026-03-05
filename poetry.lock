@@ -4379,6 +4379,20 @@ files = [
 watchmedo = ["PyYAML (>=3.10)"]
 
 [[package]]
+name = "wikipedia-api"
+version = "0.8.1"
+description = "Python Wrapper for Wikipedia"
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [
+    {file = "wikipedia_api-0.8.1.tar.gz", hash = "sha256:b31e93b3f5407c1a1ba413ed7326a05379a3c270df6cf6a211aca67a14c5658b"},
+]
+
+[package.dependencies]
+requests = "*"
+
+[[package]]
 name = "yarl"
 version = "1.22.0"
 description = "Yet another URL library"
@@ -4546,4 +4560,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<4.0"
-content-hash = "359e8591061de5a0588ccbbb4df5a8a1f81e9b1410bdf0fff768c118be07f231"
+content-hash = "211aa8f571c816ad2113d0d7780772ab87245ba2fd70450b57d757f35dc186ce"

@@ -1046,6 +1046,20 @@ class NumericDistribution(BaseModel):
             <= upper_bound_plus_wiggle_room
         ]
         if len(percentiles_within_bounds_plus_wiggle_room) == 0:
+            all_above_upper = all(
+                percentile.value > upper_bound_plus_wiggle_room
+                for percentile in percentiles
+            )
+            all_below_lower = all(
+                percentile.value < lower_bound_minus_wiggle_room
+                for percentile in percentiles
+            )
+
+            if (all_above_upper and self.open_upper_bound) or (
+                all_below_lower and self.open_lower_bound
+            ):
+                return
+
             raise ValueError(
                 f"No declared percentiles are within the range of the question +/- {wiggle_percent * 100}%. "
                 f"Lower bound: {self.lower_bound}, upper bound: {self.upper_bound}. "
@@ -1053,12 +1067,19 @@ class NumericDistribution(BaseModel):
             )
 
         max_to_min_range_buffer = max_to_min_range * 2
-        percentiles_far_exceeding_bounds = [
-            percentile
-            for percentile in percentiles
-            if percentile.value < self.lower_bound - max_to_min_range_buffer
-            or percentile.value > self.upper_bound + max_to_min_range_buffer
-        ]
+        percentiles_far_exceeding_bounds = []
+        for percentile in percentiles:
+            too_low_on_closed_side = (
+                (not self.open_lower_bound)
+                and percentile.value < self.lower_bound - max_to_min_range_buffer
+            )
+            too_high_on_closed_side = (
+                (not self.open_upper_bound)
+                and percentile.value > self.upper_bound + max_to_min_range_buffer
+            )
+            if too_low_on_closed_side or too_high_on_closed_side:
+                percentiles_far_exceeding_bounds.append(percentile)
+
         if len(percentiles_far_exceeding_bounds) > 0:
             raise ValueError(
                 "Some declared percentiles are far exceeding the bounds of the question. "
