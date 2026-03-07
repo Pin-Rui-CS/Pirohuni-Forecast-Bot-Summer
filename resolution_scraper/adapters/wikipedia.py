@@ -157,6 +157,18 @@ class WikipediaAdapter(SourceAdapter):
                 raw=None,
             )
         )
+        signals.append(
+            ResolutionSignal(
+                url=request.url,
+                metric=f"wikipedia_full_text_{lang}",
+                value=full_text,
+                as_of_utc=utc_now_iso(),
+                parser=self.name,
+                confidence="low",
+                note="Full page text from wikipedia-api page.text.",
+                raw={"text_length": len(full_text)},
+            )
+        )
         if first_number is not None:
             signals.append(
                 ResolutionSignal(

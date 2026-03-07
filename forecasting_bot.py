@@ -31,7 +31,7 @@ from resolution_scraper import (
 SUBMIT_PREDICTION = True  # set to True to publish your predictions to Metaculus
 USE_EXAMPLE_QUESTIONS = False  # set to True to forecast example questions rather than the tournament questions
 NUM_RUNS_PER_QUESTION = (
-    5  # The median forecast is taken between NUM_RUNS_PER_QUESTION runs
+    8  # The median forecast is taken between NUM_RUNS_PER_QUESTION runs
 )
 SKIP_PREVIOUSLY_FORECASTED_QUESTIONS = False
 METACULUS_MAX_CONCURRENT_REQUESTS = int(
@@ -733,11 +733,50 @@ async def get_binary_gpt_prediction(
         f"## Rationale {i+1}\n{comment}" for i, comment in enumerate(comments)
     ]
     probabilities = [pair[0] for pair in probability_and_comment_pairs]
-    median_probability = float(np.median(probabilities)) / 100
 
-    final_comment = f"Median Probability: {median_probability}\n\n" + "\n\n".join(
-        final_comment_sections
-    )
+    SPREAD_THRESHOLD = 30  # percentage points — if range exceeds this, use tiebreaker
+    prob_spread = max(probabilities) - min(probabilities)
+
+    if prob_spread >= SPREAD_THRESHOLD:
+        # High variance — compile everything and ask LLM for a single final judgment
+        rationale_blocks = "\n\n".join(
+            f"Run {i+1} (predicted {probabilities[i]}%):\n{comments[i]}"
+            for i in range(len(probabilities))
+        )
+        tiebreaker_prompt = (
+            f"{content}\n\n"
+            "---\n\n"
+            "IMPORTANT: Multiple independent forecasting runs produced highly divergent results. "
+            f"Their probability estimates ranged from {min(probabilities):.0f}% to {max(probabilities):.0f}% "
+            f"(spread: {prob_spread:.0f} percentage points). "
+            "Please review all the reasoning from each run below and cast a single final probability, "
+            "carefully weighing the strongest arguments and discarding any runs that appear to have "
+            "misread the question or made obvious errors.\n\n"
+            f"{rationale_blocks}\n\n"
+            "Based on all of the above reasoning, give your final synthesized answer as: "
+            '"Probability: ZZ%", 0-100'
+        )
+        print(
+            f"[TIEBREAKER] High variance detected for binary question (spread: {prob_spread:.0f}pp, "
+            f"values: {probabilities}). Sending tiebreaker prompt to LLM."
+        )
+        final_rationale = await call_llm(tiebreaker_prompt)
+        final_probability = extract_probability_from_response_as_percentage_not_decimal(
+            final_rationale
+        )
+        median_probability = float(final_probability) / 100
+        tiebreaker_header = (
+            f"HIGH VARIANCE DETECTED (spread: {prob_spread:.0f}pp, all values: {probabilities})\n"
+            f"Tiebreaker LLM used. Final Probability: {median_probability}\n\n"
+            f"Tiebreaker Rationale:\n{final_rationale}\n\n"
+        )
+        final_comment = tiebreaker_header + "\n\n".join(final_comment_sections)
+    else:
+        median_probability = float(np.median(probabilities)) / 100
+        final_comment = f"Median Probability: {median_probability}\n\n" + "\n\n".join(
+            final_comment_sections
+        )
+
     return median_probability, final_comment
 
 
