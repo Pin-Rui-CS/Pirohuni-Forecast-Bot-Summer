@@ -101,12 +101,6 @@ class ResolutionScraper:
             error=f"{adapter.name}: {last_error}",
         )
 
-    def choose_adapter(self, request: ScrapeRequest) -> SourceAdapter | None:
-        for adapter in self.adapters:
-            if adapter.can_handle(request):
-                return adapter
-        return None
-
     async def scrape_url(self, request: ScrapeRequest) -> ScrapeResult:
         cached = self._get_cached(request.url)
         if cached is not None:

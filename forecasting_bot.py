@@ -16,7 +16,6 @@ dotenv.load_dotenv()
 import forecasting_tools
 import numpy as np
 import httpx
-from asknews_sdk import AskNewsSDK
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, model_validator
 from asknews_research import call_asknews_rate_limited, call_asknews_fast
@@ -28,8 +27,6 @@ from resolution_scraper import (
 
 ######################### CONSTANTS #########################
 # Constants
-SUBMIT_PREDICTION = True  # set to True to publish your predictions to Metaculus
-USE_EXAMPLE_QUESTIONS = False  # set to True to forecast example questions rather than the tournament questions
 NUM_RUNS_PER_QUESTION = (
     8  # The median forecast is taken between NUM_RUNS_PER_QUESTION runs
 )
@@ -46,7 +43,6 @@ METACULUS_TOKEN = os.getenv("METACULUS_TOKEN")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID")
 ASKNEWS_SECRET = os.getenv("ASKNEWS_SECRET")
-ASKNEWS_API_KEY = os.getenv("ASKNEWS_API_KEY")
 EXA_API_KEY = os.getenv("EXA_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENAI_API_KEY = os.getenv(
@@ -577,58 +573,14 @@ async def call_exa_smart_searcher(question: str) -> str:
     return response
 
 
-def call_asknews(question: str) -> str:
-    """
-    Use the AskNews `news` endpoint to get news context for your query.
-    The full API reference can be found here: https://docs.asknews.app/en/reference#get-/v1/news/search
-    """
-    ask = AskNewsSDK(
-        client_id=ASKNEWS_CLIENT_ID, client_secret=ASKNEWS_SECRET, scopes=set(["news"])
+def _build_resolution_snapshot_section(resolution_snapshot: str) -> str:
+    if not resolution_snapshot.strip():
+        return ""
+    return (
+        "Resolution source snapshot (informational; official criteria still control):\n"
+        f"{resolution_snapshot}"
     )
 
-    # get the latest news related to the query (within the past 48 hours)
-    hot_response = ask.news.search_news(
-        query=question,  # your natural language query
-        n_articles=6,  # control the number of articles to include in the context, originally 5
-        return_type="both",
-        strategy="latest news",  # enforces looking at the latest news only
-    )
-
-    # get context from the "historical" database that contains a news archive going back to 2023
-    historical_response = ask.news.search_news(
-        query=question,
-        n_articles=10,
-        return_type="both",
-        strategy="news knowledge",  # looks for relevant news within the past 60 days
-    )
-
-    hot_articles = hot_response.as_dicts
-    historical_articles = historical_response.as_dicts
-    formatted_articles = "Here are the relevant news articles:\n\n"
-
-    if hot_articles:
-        hot_articles = [article.__dict__ for article in hot_articles]
-        hot_articles = sorted(hot_articles, key=lambda x: x["pub_date"], reverse=True)
-
-        for article in hot_articles:
-            pub_date = article["pub_date"].strftime("%B %d, %Y %I:%M %p")
-            formatted_articles += f"**{article['eng_title']}**\n{article['summary']}\nOriginal language: {article['language']}\nPublish date: {pub_date}\nSource:[{article['source_id']}]({article['article_url']})\n\n"
-
-    if historical_articles:
-        historical_articles = [article.__dict__ for article in historical_articles]
-        historical_articles = sorted(
-            historical_articles, key=lambda x: x["pub_date"], reverse=True
-        )
-
-        for article in historical_articles:
-            pub_date = article["pub_date"].strftime("%B %d, %Y %I:%M %p")
-            formatted_articles += f"**{article['eng_title']}**\n{article['summary']}\nOriginal language: {article['language']}\nPublish date: {pub_date}\nSource:[{article['source_id']}]({article['article_url']})\n\n"
-
-    if not hot_articles and not historical_articles:
-        formatted_articles += "No articles were found.\n\n"
-        return formatted_articles
-
-    return formatted_articles
 
 ############### BINARY ###############
 # @title Binary prompt & functions
@@ -692,15 +644,9 @@ async def get_binary_gpt_prediction(
     resolution_criteria = question_details["resolution_criteria"]
     background = question_details["description"]
     fine_print = question_details["fine_print"]
-    question_type = question_details["type"]
 
     summary_report = await run_research(title)
-    resolution_snapshot_section = ""
-    if resolution_snapshot.strip():
-        resolution_snapshot_section = (
-            "Resolution source snapshot (informational; official criteria still control):\n"
-            f"{resolution_snapshot}"
-        )
+    resolution_snapshot_section = _build_resolution_snapshot_section(resolution_snapshot)
 
     content = BINARY_PROMPT_TEMPLATE.format(
         title=title,
@@ -1173,16 +1119,6 @@ class NumericDistribution(BaseModel):
         ]
         assert len(percentiles) == cdf_size
 
-        validation_distribution = NumericDistribution(
-            declared_percentiles=percentiles,
-            open_upper_bound=self.open_upper_bound,
-            open_lower_bound=self.open_lower_bound,
-            upper_bound=self.upper_bound,
-            lower_bound=self.lower_bound,
-            zero_point=self.zero_point,
-            standardize_cdf=self.standardize_cdf,
-        )
-        NumericDistribution.model_validate(validation_distribution)
         return percentiles
 
     @classmethod
@@ -1449,12 +1385,7 @@ async def get_numeric_gpt_prediction(
         lower_bound_message = f"The outcome can not be lower than {lower_bound}."
 
     summary_report = await run_research(title)
-    resolution_snapshot_section = ""
-    if resolution_snapshot.strip():
-        resolution_snapshot_section = (
-            "Resolution source snapshot (informational; official criteria still control):\n"
-            f"{resolution_snapshot}"
-        )
+    resolution_snapshot_section = _build_resolution_snapshot_section(resolution_snapshot)
 
     content = NUMERIC_PROMPT_TEMPLATE.format(
         title=title,
@@ -1639,16 +1570,10 @@ async def get_multiple_choice_gpt_prediction(
     resolution_criteria = question_details["resolution_criteria"]
     background = question_details["description"]
     fine_print = question_details["fine_print"]
-    question_type = question_details["type"]
     options = question_details["options"]
 
     summary_report = await run_research(title)
-    resolution_snapshot_section = ""
-    if resolution_snapshot.strip():
-        resolution_snapshot_section = (
-            "Resolution source snapshot (informational; official criteria still control):\n"
-            f"{resolution_snapshot}"
-        )
+    resolution_snapshot_section = _build_resolution_snapshot_section(resolution_snapshot)
 
     content = MULTIPLE_CHOICE_PROMPT_TEMPLATE.format(
         title=title,
@@ -1777,11 +1702,7 @@ async def forecast_individual_question(
         forecast, comment = await get_binary_gpt_prediction(
             question_details, num_runs_per_question, resolution_snapshot
         )
-    elif question_type == "numeric":
-        forecast, comment = await get_numeric_gpt_prediction(
-            question_details, num_runs_per_question, resolution_snapshot
-        )
-    elif question_type == "discrete":
+    elif question_type in ("numeric", "discrete"):
         forecast, comment = await get_numeric_gpt_prediction(
             question_details, num_runs_per_question, resolution_snapshot
         )
@@ -1798,7 +1719,7 @@ async def forecast_individual_question(
     print(f"Forecast for post {post_id} (question {question_id}):\n{forecast}")
     print(f"Comment for post {post_id} (question {question_id}):\n{comment}")
 
-    if question_type == "numeric" or question_type == "discrete":
+    if question_type in ("numeric", "discrete"):
         summary_of_forecast += f"Forecast: {str(forecast)[:200]}...\n"
     else:
         summary_of_forecast += f"Forecast: {forecast}\n"
@@ -1985,15 +1906,15 @@ if __name__ == "__main__":
         print("⚠️  Running in TEST mode - predictions will NOT be submitted to Metaculus")
     
     print(f"Using {args.num_runs} runs per question")
-    print(f"Skip previously forecasted: {SKIP_PREVIOUSLY_FORECASTED_QUESTIONS}\n")
-    
+    print(f"Skip previously forecasted: {args.skip_previous}\n")
+
     # Run the forecasting
     asyncio.run(
         forecast_questions(
             all_questions,
             submit_prediction,
             args.num_runs,
-            SKIP_PREVIOUSLY_FORECASTED_QUESTIONS,
+            args.skip_previous,
             RESOLUTION_SCRAPER,
         )
     )

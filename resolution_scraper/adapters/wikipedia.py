@@ -183,44 +183,6 @@ class WikipediaAdapter(SourceAdapter):
                 )
             )
 
-        links_count = len(page.links)
-        categories_count = len(page.categories)
-        sections_count = len(page.sections)
-        signals.extend(
-            [
-                ResolutionSignal(
-                    url=request.url,
-                    metric=f"wikipedia_links_count_{lang}",
-                    value=links_count,
-                    as_of_utc=utc_now_iso(),
-                    parser=self.name,
-                    confidence="low",
-                    note="Number of linked pages.",
-                    raw=None,
-                ),
-                ResolutionSignal(
-                    url=request.url,
-                    metric=f"wikipedia_categories_count_{lang}",
-                    value=categories_count,
-                    as_of_utc=utc_now_iso(),
-                    parser=self.name,
-                    confidence="low",
-                    note="Number of page categories.",
-                    raw=None,
-                ),
-                ResolutionSignal(
-                    url=request.url,
-                    metric=f"wikipedia_top_sections_count_{lang}",
-                    value=sections_count,
-                    as_of_utc=utc_now_iso(),
-                    parser=self.name,
-                    confidence="low",
-                    note="Number of top-level sections.",
-                    raw=None,
-                ),
-            ]
-        )
-
         conf = (
             "high"
             if "article" in request.resolution_text.lower()

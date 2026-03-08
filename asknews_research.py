@@ -75,9 +75,6 @@ def call_asknews_rate_limited(question: str) -> str:
     # Using 'with' ensures lock is ALWAYS released, even if there's an error
     with _asknews_lock:
         try:
-            from asknews_sdk import AskNewsSDK
-            from asknews_sdk.errors import RateLimitExceededError
-            
             print(f"🔍 Starting AskNews research for: {question[:60]}...")
             
             ask = AskNewsSDK(
@@ -308,28 +305,6 @@ def batch_asknews_research(questions: list[str], use_fast_mode: bool = False) ->
     print(f"{'='*80}\n")
     
     return results
-
-
-def reset_rate_limit_state():
-    """
-    Emergency function to reset the rate limit state.
-    Use this if you get stuck in an infinite loop.
-    """
-    global _last_asknews_call_time
-    
-    print("🔧 Resetting AskNews rate limit state...")
-    _last_asknews_call_time = None
-    
-    # Try to release lock if it's somehow stuck (shouldn't happen with 'with' statements)
-    try:
-        if _asknews_lock.locked():
-            print("⚠️  Warning: Lock was stuck, attempting to release...")
-            # Can't force release a threading.Lock, but we can create a new one
-            # This shouldn't be needed with proper 'with' statements
-    except:
-        pass
-    
-    print("✓ Rate limit state reset")
 
 
 # For testing this module directly
