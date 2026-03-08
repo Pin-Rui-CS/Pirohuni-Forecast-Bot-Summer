@@ -25,6 +25,8 @@ from resolution_scraper import (
     format_resolution_snapshot,
 )
 
+from polymarket_research import scrape_polymarket as _scrape_polymarket
+
 ######################### CONSTANTS #########################
 # Constants
 NUM_RUNS_PER_QUESTION = (
@@ -496,7 +498,8 @@ async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temper
 
 async def run_research(question: str) -> str:
     """
-    Run research using AskNews, Exa/SmartSearcher, or Perplexity.
+    Run research using AskNews, Exa/SmartSearcher, or Perplexity, then append
+    Polymarket crowd probabilities for any matching markets.
     This function is async-safe and will run blocking SDK calls in a thread.
     """
     research = ""
@@ -508,6 +511,12 @@ async def run_research(question: str) -> str:
         research = await call_perplexity(question)
     else:
         research = "No research done"
+
+    try:
+        polymarket_data = await asyncio.to_thread(_scrape_polymarket, question)
+        research = f"{research}\n\n{polymarket_data}"
+    except Exception as exc:
+        print(f"[Polymarket] Research failed: {exc}")
 
     print(f"########################\nResearch Found:\n{research}\n########################")
     return research
