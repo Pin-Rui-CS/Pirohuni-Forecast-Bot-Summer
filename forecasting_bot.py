@@ -18,13 +18,7 @@ import numpy as np
 import httpx
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, model_validator
-from asknews_research import call_asknews_rate_limited, call_asknews_fast
-from resolution_scraper import (
-    ResolutionScraper,
-    ScraperConfig,
-    format_resolution_snapshot,
-)
-
+from asknews_research import call_asknews_rate_limited
 from polymarket_research import scrape_polymarket as _scrape_polymarket
 
 ######################### CONSTANTS #########################
@@ -50,13 +44,6 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENAI_API_KEY = os.getenv(
     "OPENAI_API_KEY"
 )  # You'll also need the OpenAI API Key if you want to use the Exa Smart Searcher
-RESOLUTION_SCRAPER_ENABLED = os.getenv(
-    "RESOLUTION_SCRAPER_ENABLED", "true"
-).lower() in ("1", "true", "yes")
-RESOLUTION_SCRAPER_BROWSER_FALLBACK = os.getenv(
-    "RESOLUTION_SCRAPER_BROWSER_FALLBACK", "false"
-).lower() in ("1", "true", "yes")
-
 # The tournament IDs below can be used for testing your bot.
 Q4_2024_AI_BENCHMARKING_ID = 32506
 Q1_2025_AI_BENCHMARKING_ID = 32627
@@ -113,20 +100,10 @@ EXAMPLE_QUESTIONS = [  # (question_id, post_id)
 # @title Helper functions
 AUTH_HEADERS = {"Authorization": f"Token {METACULUS_TOKEN}"}
 API_BASE_URL = "https://www.metaculus.com/api"
-RESOLUTION_SCRAPER: ResolutionScraper | None = None
 MAX_API_GET_RETRIES = 3
 INITIAL_API_GET_RETRY_WAIT_SECONDS = float(
     os.getenv("INITIAL_API_GET_RETRY_WAIT_SECONDS", "3.0")
 )
-
-if RESOLUTION_SCRAPER_ENABLED:
-    try:
-        RESOLUTION_SCRAPER = ResolutionScraper(
-            ScraperConfig(use_browser_fallback=RESOLUTION_SCRAPER_BROWSER_FALLBACK)
-        )
-    except Exception as exc:
-        print(f"Warning: resolution scraper disabled due to init error: {exc}")
-
 
 def _is_rate_limited_response(status_code: int, response_text: str) -> bool:
     if status_code == 429:
@@ -504,7 +481,7 @@ async def run_research(question: str) -> str:
     """
     research = ""
     if ASKNEWS_CLIENT_ID and ASKNEWS_SECRET:
-        research = await asyncio.to_thread(call_asknews_fast, question)
+        research = await asyncio.to_thread(call_asknews_rate_limited, question)
     elif EXA_API_KEY:
         research = await call_exa_smart_searcher(question)
     elif PERPLEXITY_API_KEY:
@@ -582,14 +559,6 @@ async def call_exa_smart_searcher(question: str) -> str:
     return response
 
 
-def _build_resolution_snapshot_section(resolution_snapshot: str) -> str:
-    if not resolution_snapshot.strip():
-        return ""
-    return (
-        "Resolution source snapshot (informational; official criteria still control):\n"
-        f"{resolution_snapshot}"
-    )
-
 
 ############### BINARY ###############
 # @title Binary prompt & functions
@@ -614,8 +583,6 @@ This question's outcome will be determined by the specific criteria below. These
 
 Your research assistant says:
 {summary_report}
-
-{resolution_snapshot_section}
 
 Today is {today}.
 
@@ -645,7 +612,7 @@ def extract_probability_from_response_as_percentage_not_decimal(
 
 
 async def get_binary_gpt_prediction(
-    question_details: dict, num_runs: int, resolution_snapshot: str = ""
+    question_details: dict, num_runs: int,
 ) -> tuple[float, str]:
 
     today = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -655,7 +622,6 @@ async def get_binary_gpt_prediction(
     fine_print = question_details["fine_print"]
 
     summary_report = await run_research(title)
-    resolution_snapshot_section = _build_resolution_snapshot_section(resolution_snapshot)
 
     content = BINARY_PROMPT_TEMPLATE.format(
         title=title,
@@ -664,7 +630,6 @@ async def get_binary_gpt_prediction(
         resolution_criteria=resolution_criteria,
         fine_print=fine_print,
         summary_report=summary_report,
-        resolution_snapshot_section=resolution_snapshot_section,
     )
     log_prediction_prompt("binary", title, content)
 
@@ -755,8 +720,6 @@ Units for answer: {units}
 
 Your research assistant says:
 {summary_report}
-
-{resolution_snapshot_section}
 
 Today is {today}.
 
@@ -1357,7 +1320,7 @@ class NumericDistribution(BaseModel):
 
 
 async def get_numeric_gpt_prediction(
-    question_details: dict, num_runs: int, resolution_snapshot: str = ""
+    question_details: dict, num_runs: int,
 ) -> tuple[list[float], str]:
 
     today = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -1394,7 +1357,6 @@ async def get_numeric_gpt_prediction(
         lower_bound_message = f"The outcome can not be lower than {lower_bound}."
 
     summary_report = await run_research(title)
-    resolution_snapshot_section = _build_resolution_snapshot_section(resolution_snapshot)
 
     content = NUMERIC_PROMPT_TEMPLATE.format(
         title=title,
@@ -1403,7 +1365,6 @@ async def get_numeric_gpt_prediction(
         resolution_criteria=resolution_criteria,
         fine_print=fine_print,
         summary_report=summary_report,
-        resolution_snapshot_section=resolution_snapshot_section,
         lower_bound_message=lower_bound_message,
         upper_bound_message=upper_bound_message,
         units=unit_of_measure,
@@ -1471,8 +1432,6 @@ Background:
 
 Your research assistant says:
 {summary_report}
-
-{resolution_snapshot_section}
 
 Today is {today}.
 
@@ -1571,7 +1530,6 @@ def generate_multiple_choice_forecast(options, option_probabilities) -> dict:
 async def get_multiple_choice_gpt_prediction(
     question_details: dict,
     num_runs: int,
-    resolution_snapshot: str = "",
 ) -> tuple[dict[str, float], str]:
 
     today = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -1582,7 +1540,6 @@ async def get_multiple_choice_gpt_prediction(
     options = question_details["options"]
 
     summary_report = await run_research(title)
-    resolution_snapshot_section = _build_resolution_snapshot_section(resolution_snapshot)
 
     content = MULTIPLE_CHOICE_PROMPT_TEMPLATE.format(
         title=title,
@@ -1591,7 +1548,6 @@ async def get_multiple_choice_gpt_prediction(
         resolution_criteria=resolution_criteria,
         fine_print=fine_print,
         summary_report=summary_report,
-        resolution_snapshot_section=resolution_snapshot_section,
         options=options,
     )
     log_prediction_prompt("multiple_choice", title, content)
@@ -1666,7 +1622,6 @@ async def forecast_individual_question(
     submit_prediction: bool,
     num_runs_per_question: int,
     skip_previously_forecasted_questions: bool,
-    scraper: ResolutionScraper | None = None,
 ) -> str:
     post_details = await get_post_details(post_id)
     question_details = post_details["question"]
@@ -1693,31 +1648,17 @@ async def forecast_individual_question(
         summary_of_forecast += f"Skipped: Forecast already made\n"
         return summary_of_forecast
 
-    resolution_snapshot = ""
-    if scraper is not None:
-        try:
-            scrape_results = await scraper.scrape_question_sources(question_details)
-            signals = scraper.flatten_signals(scrape_results)
-            if signals:
-                resolution_snapshot = format_resolution_snapshot(signals)
-            else:
-                summary_of_forecast += (
-                    "Resolution scraper returned no structured signals; continuing without scraper context.\n"
-                )
-        except Exception as exc:
-            summary_of_forecast += f"Resolution scrape error: {exc}\n"
-
     if question_type == "binary":
         forecast, comment = await get_binary_gpt_prediction(
-            question_details, num_runs_per_question, resolution_snapshot
+            question_details, num_runs_per_question
         )
     elif question_type in ("numeric", "discrete"):
         forecast, comment = await get_numeric_gpt_prediction(
-            question_details, num_runs_per_question, resolution_snapshot
+            question_details, num_runs_per_question
         )
     elif question_type == "multiple_choice":
         forecast, comment = await get_multiple_choice_gpt_prediction(
-            question_details, num_runs_per_question, resolution_snapshot
+            question_details, num_runs_per_question
         )
     else:
         raise ValueError(f"Unknown question type: {question_type}")
@@ -1749,7 +1690,6 @@ async def forecast_questions(
     submit_prediction: bool,
     num_runs_per_question: int,
     skip_previously_forecasted_questions: bool,
-    scraper: ResolutionScraper | None = None,
 ) -> None:
     forecast_tasks = [
         forecast_individual_question(
@@ -1758,7 +1698,6 @@ async def forecast_questions(
             submit_prediction,
             num_runs_per_question,
             skip_previously_forecasted_questions,
-            scraper,
         )
         for question_id, post_id in open_question_id_post_id
     ]
@@ -1780,6 +1719,11 @@ async def forecast_questions(
         else:
             print(forecast_summary)
 
+    if errors:
+        print("\n", "#" * 100, f"\n{len(errors)} question(s) FAILED:\n", "#" * 100)
+        for err in errors:
+            print(f"  {err.__class__.__name__}: {err}")
+
 
 ######################## CLI ARGUMENT PARSING #########################
 def parse_arguments() -> argparse.Namespace:
@@ -1795,7 +1739,6 @@ Examples:
   poetry run python forecasting_bot --mode tournament --tournament metaculus-cup
   poetry run python forecasting_bot --mode examples
   poetry run python forecasting_bot --mode tournament --no-submit --tournament q1-2025-ai
-  poetry run python forecasting_bot --mode tournament --skip-previous=False
         """
     )
     
@@ -1819,13 +1762,6 @@ Examples:
         "--no-submit",
         action="store_true",
         help="Run the bot without submitting predictions to Metaculus (useful for testing)",
-    )
-    
-    parser.add_argument(
-        "--skip-previous",
-        type=lambda x: x.lower() in ("true", "1", "yes"),
-        default=True,
-        help="Skip questions that have already been forecasted (default: True)",
     )
     
     parser.add_argument(
@@ -1915,7 +1851,7 @@ if __name__ == "__main__":
         print("⚠️  Running in TEST mode - predictions will NOT be submitted to Metaculus")
     
     print(f"Using {args.num_runs} runs per question")
-    print(f"Skip previously forecasted: {args.skip_previous}\n")
+    print(f"Skip previously forecasted: {SKIP_PREVIOUSLY_FORECASTED_QUESTIONS}\n")
 
     # Run the forecasting
     asyncio.run(
@@ -1923,7 +1859,6 @@ if __name__ == "__main__":
             all_questions,
             submit_prediction,
             args.num_runs,
-            args.skip_previous,
-            RESOLUTION_SCRAPER,
+            SKIP_PREVIOUSLY_FORECASTED_QUESTIONS,
         )
     )

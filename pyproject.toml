@@ -15,10 +15,6 @@ dependencies = [
     "asknews>=0.13.10,<0.14.0",
     "forecasting-tools>=0.2.85,<0.3.0",
     "httpx>=0.24.0",
-    "beautifulsoup4 (>=4.14.3,<5.0.0)",
-    "lxml (>=6.0.2,<7.0.0)",
-    "playwright (>=1.58.0,<2.0.0)",
-    "wikipedia-api (>=0.8.1,<1.0.0)"
 ]
 
 
