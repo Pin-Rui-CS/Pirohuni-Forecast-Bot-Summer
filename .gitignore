@@ -28,3 +28,4 @@ inspect_bot.py
 experiment.py
 test.py
 forecast_custom_questions.py
+metaculus_research.py

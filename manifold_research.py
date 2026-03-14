@@ -1,12 +1,13 @@
 """
-polymarket_research.py
-----------------------
-Search Polymarket for prediction markets relevant to a forecasting question,
-score them for relevance via an LLM, and return a formatted research string.
+manifold_research.py
+--------------------
+Search Manifold Markets for prediction markets relevant to a forecasting
+question, score them for relevance via an LLM, and return a formatted
+research string.
 
 Usage:
-    from polymarket_research import scrape_polymarket
-    result = scrape_polymarket("Will the US and Iran agree to a ceasefire before May 2026?")
+    from manifold_research import scrape_manifold
+    result = scrape_manifold("Will the US and Iran agree to a ceasefire before May 2026?")
     print(result)
 
 The function is synchronous and safe to call from asyncio via asyncio.to_thread().
@@ -28,15 +29,15 @@ from openai import OpenAI
 _OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # Cheap/fast model for relevance scoring only — override via env var if needed
-_POLYMARKET_SCORING_MODEL = "anthropic/claude-opus-4.6"
+_MANIFOLD_SCORING_MODEL = "anthropic/claude-opus-4.6"
 
-_GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+_MANIFOLD_API_BASE = "https://api.manifold.markets/v0"
 _MAX_RESULTS = 3              # max markets included in final output
-_SEARCH_CANDIDATE_LIMIT = 20  # markets fetched from Gamma before scoring
+_SEARCH_CANDIDATE_LIMIT = 20  # markets fetched per query before scoring
 _MIN_RELEVANCE_SCORE = 6.0    # minimum LLM relevance score (0–10) to include
 
 # ---------------------------------------------------------------------------
-# Search
+# Search query generation
 # ---------------------------------------------------------------------------
 
 _STOP_WORDS = {
@@ -57,23 +58,23 @@ def _extract_keywords(question: str) -> str:
 
 def _generate_search_queries(question: str) -> list[str]:
     """
-    Use an LLM to generate 2-3 short, semantically-aware search queries for
-    Polymarket's Gamma API. Falls back to keyword extraction if the call fails.
+    Use an LLM to generate 3-4 short, semantically-aware search queries for
+    Manifold's search endpoint. Falls back to keyword extraction if the call fails.
     """
     prompt = (
         f'Forecasting question: "{question}"\n\n'
-        "Generate 3-4 search queries to find this topic on Polymarket.\n"
+        "Generate 3-4 search queries to find this topic on Manifold Markets.\n"
         "Rules:\n"
-        "  - Keep each query to 1-3 words — shorter queries work better on Polymarket\n"
+        "  - Keep each query to 1-3 words — shorter queries work better on Manifold\n"
         "  - Use the plain common name for the subject (e.g. 'Brent spot price' → 'crude oil', 'S&P 500 index' → 'S&P 500')\n"
         "  - Use synonyms and alternate names (e.g. also try 'oil price' alongside 'crude oil')\n"
         "  - Omit dates, ranges, question words, and filler\n"
-        "  - Think: what 1-3 words would appear in a Polymarket market title about this subject?\n\n"
+        "  - Think: what 1-3 words would appear in a Manifold Markets question title about this subject?\n\n"
         'Reply with ONLY a JSON array of strings. Example: ["crude oil", "oil price", "Brent crude"]'
     )
     try:
         response = _get_openai_client().chat.completions.create(
-            model=_POLYMARKET_SCORING_MODEL,
+            model=_MANIFOLD_SCORING_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
         )
@@ -95,36 +96,45 @@ def _generate_search_queries(question: str) -> list[str]:
     return list(dict.fromkeys([kw, short]))
 
 
+# ---------------------------------------------------------------------------
+# API search
+# ---------------------------------------------------------------------------
+
 def _search_once(query: str, limit: int) -> list[dict]:
     resp = httpx.get(
-        f"{_GAMMA_API_BASE}/public-search",
-        params={"q": query, "limit": limit},
+        f"{_MANIFOLD_API_BASE}/search-markets",
+        params={
+            "term": query,
+            "limit": limit,
+            "sort": "most-popular",
+            "filter": "open",
+        },
         timeout=10,
     )
     resp.raise_for_status()
-    return resp.json().get("events", [])
+    return resp.json() if isinstance(resp.json(), list) else []
 
 
-def _search_events(question: str) -> list[dict]:
+def _search_markets(question: str) -> list[dict]:
     """
-    LLM-generated semantic queries + deduplication by event ID.
-    Falls back to keyword extraction if the LLM query generation fails.
+    LLM-generated semantic queries + deduplication by market ID.
+    Falls back to keyword extraction if LLM query generation fails.
     """
     queries = _generate_search_queries(question)
 
     seen_ids: set[str] = set()
     merged: list[dict] = []
     for query in queries:
-        for event in _search_once(query, limit=_SEARCH_CANDIDATE_LIMIT):
-            eid = str(event.get("id", ""))
-            if eid and eid not in seen_ids:
-                seen_ids.add(eid)
-                merged.append(event)
+        for market in _search_once(query, limit=_SEARCH_CANDIDATE_LIMIT):
+            mid = str(market.get("id", ""))
+            if mid and mid not in seen_ids:
+                seen_ids.add(mid)
+                merged.append(market)
     return merged
 
 
 # ---------------------------------------------------------------------------
-# Extractor
+# Parser
 # ---------------------------------------------------------------------------
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -134,50 +144,43 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
-def _parse_list_field(value) -> list:
-    """Gamma returns some fields as JSON strings or already-parsed lists."""
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except (json.JSONDecodeError, ValueError):
-            return []
-    return []
-
-
-def _parse_sub_market(raw: dict) -> dict | None:
-    if raw.get("closed") or not raw.get("active", True):
+def _parse_market(raw: dict) -> dict | None:
+    """Extract relevant fields from a Manifold market dict."""
+    if raw.get("isResolved") or raw.get("outcomeType") not in ("BINARY", "MULTIPLE_CHOICE"):
         return None
-    outcomes = _parse_list_field(raw.get("outcomes", []))
-    prices = _parse_list_field(raw.get("outcomePrices", []))
-    outcome_data = [
-        {"name": name, "probability": round(_safe_float(price) * 100, 1)}
-        for name, price in zip(outcomes, prices)
-    ]
-    return {
-        "question": raw.get("question", ""),
-        "outcomes": outcome_data,
-        "volume": _safe_float(raw.get("volume", 0)),
-        "liquidity": _safe_float(raw.get("liquidity", 0)),
-        "end_date": raw.get("endDate", ""),
-    }
 
-
-def _parse_event(raw: dict) -> dict | None:
-    if raw.get("closed") or raw.get("archived"):
-        return None
-    sub_markets = [m for raw_m in raw.get("markets", []) if (m := _parse_sub_market(raw_m))]
-    if not sub_markets:
-        return None
     slug = raw.get("slug", "")
+    url = raw.get("url") or (f"https://manifold.markets/{slug}" if slug else "N/A")
+    outcome_type = raw.get("outcomeType", "BINARY")
+
+    if outcome_type == "BINARY":
+        prob = _safe_float(raw.get("probability"), default=None)
+        outcomes = [
+            {"name": "YES", "probability": round(prob * 100, 1) if prob is not None else None},
+            {"name": "NO", "probability": round((1 - prob) * 100, 1) if prob is not None else None},
+        ]
+    elif outcome_type == "MULTIPLE_CHOICE":
+        answers = raw.get("answers") or []
+        outcomes = [
+            {
+                "name": a.get("text", "?"),
+                "probability": round(_safe_float(a.get("probability")) * 100, 1),
+            }
+            for a in answers
+        ]
+    else:
+        return None
+
     return {
-        "title": raw.get("title", ""),
+        "id": raw.get("id", ""),
+        "question": raw.get("question", ""),
         "slug": slug,
-        "url": f"https://polymarket.com/event/{slug}" if slug else "N/A",
+        "url": url,
+        "outcome_type": outcome_type,
+        "outcomes": outcomes,
         "volume": _safe_float(raw.get("volume", 0)),
-        "liquidity": _safe_float(raw.get("liquidity", 0)),
-        "sub_markets": sub_markets,
+        "liquidity": _safe_float(raw.get("totalLiquidity", 0)),
+        "close_time": raw.get("closeTime"),
     }
 
 
@@ -198,15 +201,15 @@ def _get_openai_client() -> OpenAI:
     return _openai_client
 
 
-def _score_events(question: str, events: list[dict]) -> list[float]:
-    """Single LLM call that rates all candidate events 0–10 for relevance."""
-    if not events:
+def _score_markets(question: str, markets: list[dict]) -> list[float]:
+    """Single LLM call that rates all candidate markets 0–10 for relevance."""
+    if not markets:
         return []
 
-    numbered = "\n".join(f"{i + 1}. {e['title']}" for i, e in enumerate(events))
+    numbered = "\n".join(f"{i + 1}. {m['question']}" for i, m in enumerate(markets))
     prompt = (
         f'Research question: "{question}"\n\n'
-        "Rate each Polymarket prediction market below for relevance to the "
+        "Rate each Manifold Markets prediction market below for relevance to the "
         "research question on a scale of 0–10:\n"
         "  10 = directly measures the same event or outcome\n"
         "   7 = closely related — strong predictive signal\n"
@@ -219,7 +222,7 @@ def _score_events(question: str, events: list[dict]) -> list[float]:
         "Example: [8.5, 3.0, 6.0]"
     )
     response = _get_openai_client().chat.completions.create(
-        model=_POLYMARKET_SCORING_MODEL,
+        model=_MANIFOLD_SCORING_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0,
     )
@@ -228,8 +231,8 @@ def _score_events(question: str, events: list[dict]) -> list[float]:
     if not match:
         raise ValueError(f"Could not parse scores from model response:\n{content}")
     scores = json.loads(match.group())
-    scores = list(scores) + [0.0] * max(0, len(events) - len(scores))
-    return [float(s) for s in scores[: len(events)]]
+    scores = list(scores) + [0.0] * max(0, len(markets) - len(scores))
+    return [float(s) for s in scores[: len(markets)]]
 
 
 # ---------------------------------------------------------------------------
@@ -238,10 +241,10 @@ def _score_events(question: str, events: list[dict]) -> list[float]:
 
 def _fmt_volume(v: float) -> str:
     if v >= 1_000_000:
-        return f"${v / 1_000_000:.1f}M"
+        return f"M{v / 1_000_000:.1f}M"
     if v >= 1_000:
-        return f"${v / 1_000:.1f}K"
-    return f"${v:.0f}"
+        return f"M{v / 1_000:.1f}K"
+    return f"M{v:.0f}"
 
 
 def _fmt_outcomes(outcomes: list[dict]) -> str:
@@ -253,32 +256,27 @@ def _fmt_outcomes(outcomes: list[dict]) -> str:
     )
 
 
-def _format_output(input_question: str, events: list[dict], scores: list[float]) -> str:
+def _format_output(input_question: str, markets: list[dict], scores: list[float]) -> str:
     lines = [
         "=" * 70,
-        "POLYMARKET RESEARCH",
+        "MANIFOLD MARKETS RESEARCH",
         "=" * 70,
-        "Note: Polymarket percentages are real-money crowd-implied probabilities; treat them as a calibrated prior, weighted by volume and liquidity.",
+        "Note: Manifold percentages are play-money crowd-implied probabilities; treat them as a calibrated signal, weighted by volume and liquidity.",
         f'Input question: "{input_question}"',
         "",
-        f"Found {len(events)} relevant market group(s) on Polymarket:\n",
+        f"Found {len(markets)} relevant market(s) on Manifold:\n",
     ]
-    for i, (event, score) in enumerate(zip(events, scores), start=1):
+    for i, (market, score) in enumerate(zip(markets, scores), start=1):
         lines += [
-            f"[{i}] {event['title']}",
+            f"[{i}] {market['question']}",
             f"    Relevance score : {score:.1f} / 10",
-            f"    Total volume    : {_fmt_volume(event['volume'])}",
-            f"    Total liquidity : {_fmt_volume(event['liquidity'])}",
-            f"    URL             : {event['url']}",
+            f"    Type            : {market['outcome_type']}",
+            f"    Volume          : {_fmt_volume(market['volume'])}",
+            f"    Liquidity       : {_fmt_volume(market['liquidity'])}",
+            f"    URL             : {market['url']}",
+            f"    Outcomes        : {_fmt_outcomes(market['outcomes'])}",
             "",
-            "    Active sub-markets:",
         ]
-        for sm in event["sub_markets"]:
-            lines.append(f"      • {sm['question']}")
-            lines.append(f"        Odds: {_fmt_outcomes(sm['outcomes'])}")
-            if sm["volume"] > 0:
-                lines.append(f"        Volume: {_fmt_volume(sm['volume'])}")
-        lines.append("")
     lines.append("=" * 70)
     return "\n".join(lines)
 
@@ -287,32 +285,42 @@ def _format_output(input_question: str, events: list[dict], scores: list[float])
 # Public API
 # ---------------------------------------------------------------------------
 
-def scrape_polymarket(question: str) -> str:
+def scrape_manifold(question: str) -> str:
     """
-    Search Polymarket for events similar to `question`, score by relevance
+    Search Manifold Markets for markets similar to `question`, score by relevance
     using an LLM, and return a formatted research string.
 
     Synchronous — call via asyncio.to_thread() from async contexts.
     """
-    raw_events = _search_events(question)
-    if not raw_events:
-        return f'No Polymarket results found for: "{question}"'
+    raw_markets = _search_markets(question)
+    if not raw_markets:
+        return f'No Manifold Markets results found for: "{question}"'
 
-    parsed = [e for raw in raw_events if (e := _parse_event(raw))]
+    parsed = [m for raw in raw_markets if (m := _parse_market(raw))]
     if not parsed:
-        return f'No active Polymarket events found for: "{question}"'
+        return f'No active Manifold Markets found for: "{question}"'
 
-    scores = _score_events(question, parsed)
+    scores = _score_markets(question, parsed)
     ranked = sorted(zip(parsed, scores), key=lambda x: x[1], reverse=True)
-    top = [(e, s) for e, s in ranked if s >= _MIN_RELEVANCE_SCORE][:_MAX_RESULTS]
+    top = [(m, s) for m, s in ranked if s >= _MIN_RELEVANCE_SCORE][:_MAX_RESULTS]
 
     if not top:
         candidate_lines = "\n".join(
-            f"  {s:4.1f}/10  {e['title']}" for e, s in ranked[:5]
+            f"  {s:4.1f}/10  {m['question']}" for m, s in ranked[:5]
         )
         return (
-            f'No sufficiently relevant Polymarket markets found for: "{question}"\n'
+            f'No sufficiently relevant Manifold markets found for: "{question}"\n'
             f"(threshold: {_MIN_RELEVANCE_SCORE}/10 — top candidates scored:\n{candidate_lines})"
         )
 
-    return _format_output(question, [e for e, _ in top], [s for _, s in top])
+    return _format_output(question, [m for m, _ in top], [s for _, s in top])
+
+
+# ---------------------------------------------------------------------------
+# Quick test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+    q = sys.argv[1] if len(sys.argv) > 1 else "Will Donald Trump be re-elected in 2024?"
+    print(scrape_manifold(q))

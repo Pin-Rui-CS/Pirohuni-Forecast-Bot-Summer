@@ -20,6 +20,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, model_validator
 from asknews_research import call_asknews_rate_limited
 from polymarket_research import scrape_polymarket as _scrape_polymarket
+from manifold_research import scrape_manifold as _scrape_manifold
 
 ######################### CONSTANTS #########################
 # Constants
@@ -494,6 +495,12 @@ async def run_research(question: str) -> str:
         research = f"{research}\n\n{polymarket_data}"
     except Exception as exc:
         print(f"[Polymarket] Research failed: {exc}")
+
+    try:
+        manifold_data = await asyncio.to_thread(_scrape_manifold, question)
+        research = f"{research}\n\n{manifold_data}"
+    except Exception as exc:
+        print(f"[Manifold] Research failed: {exc}")
 
     print(f"########################\nResearch Found:\n{research}\n########################")
     return research
