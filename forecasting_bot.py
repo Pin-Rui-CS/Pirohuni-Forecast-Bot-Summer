@@ -15,6 +15,7 @@ dotenv.load_dotenv()
 
 import forecasting_tools
 import numpy as np
+from scipy import stats
 import httpx
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, model_validator
@@ -25,9 +26,9 @@ from manifold_research import scrape_manifold as _scrape_manifold
 ######################### CONSTANTS #########################
 # Constants
 NUM_RUNS_PER_QUESTION = (
-    8  # The median forecast is taken between NUM_RUNS_PER_QUESTION runs
+    4  # The median forecast is taken between NUM_RUNS_PER_QUESTION runs
 )
-SKIP_PREVIOUSLY_FORECASTED_QUESTIONS = False
+SKIP_PREVIOUSLY_FORECASTED_QUESTIONS = True
 METACULUS_MAX_CONCURRENT_REQUESTS = int(
     os.getenv("METACULUS_MAX_CONCURRENT_REQUESTS", "1")
 )
@@ -456,6 +457,57 @@ def log_prediction_prompt(question_type: str, title: str, prompt: str) -> None:
     )
 
 
+_RUN_TIMESTAMP = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+LLM_RESULTS_DIR = os.path.join(os.path.dirname(__file__), "docs", "LLM results", _RUN_TIMESTAMP)
+
+
+def save_llm_result(
+    question_id: int,
+    post_id: int,
+    title: str,
+    question_type: str,
+    prompt: str,
+    per_run_responses: list[str],
+    final_forecast,
+    forecast_payload: dict,
+) -> None:
+    os.makedirs(LLM_RESULTS_DIR, exist_ok=True)
+    safe_title = re.sub(r'[^\w\s-]', '', title)[:60].strip().replace(' ', '_')
+    filename = f"{question_id}_{safe_title}.txt"
+    filepath = os.path.join(LLM_RESULTS_DIR, filename)
+    sep = "=" * 70
+    lines = [
+        sep,
+        f"Question: {title}",
+        f"Post ID: {post_id}  |  Question ID: {question_id}  |  Type: {question_type}",
+        sep,
+        "",
+        "PROMPT (sent to LLM for each run)",
+        sep,
+        prompt,
+        "",
+        sep,
+        f"LLM RESPONSES ({len(per_run_responses)} runs)",
+        sep,
+    ]
+    for i, response in enumerate(per_run_responses, 1):
+        lines += [f"\n--- Run {i} ---", response]
+    lines += [
+        "",
+        sep,
+        "FINAL PREDICTION (sent to Metaculus)",
+        sep,
+        f"Forecast value: {final_forecast}",
+        "",
+        "Forecast payload (continuous_cdf / probability_yes / per_category):",
+        json.dumps(forecast_payload, indent=2),
+        "",
+    ]
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"  [LLM result saved] {filepath}")
+
+
 async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temperature: float = 0.3) -> str:
     client = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
@@ -620,7 +672,7 @@ def extract_probability_from_response_as_percentage_not_decimal(
 
 async def get_binary_gpt_prediction(
     question_details: dict, num_runs: int,
-) -> tuple[float, str]:
+) -> tuple[float, str, str, list[str]]:
 
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     title = question_details["title"]
@@ -640,7 +692,7 @@ async def get_binary_gpt_prediction(
     )
     log_prediction_prompt("binary", title, content)
 
-    async def get_rationale_and_probability(content: str) -> tuple[float, str]:
+    async def get_rationale_and_probability(content: str) -> tuple[float, str, str]:
         rationale = await call_llm(content)
 
         probability = extract_probability_from_response_as_percentage_not_decimal(
@@ -650,12 +702,13 @@ async def get_binary_gpt_prediction(
             f"Extracted Probability: {probability}%\n\nGPT's Answer: "
             f"{rationale}\n\n\n"
         )
-        return probability, comment
+        return probability, comment, rationale
 
     probability_and_comment_pairs = await asyncio.gather(
         *[get_rationale_and_probability(content) for _ in range(num_runs)]
     )
     comments = [pair[1] for pair in probability_and_comment_pairs]
+    raw_responses = [pair[2] for pair in probability_and_comment_pairs]
     final_comment_sections = [
         f"## Rationale {i+1}\n{comment}" for i, comment in enumerate(comments)
     ]
@@ -704,7 +757,7 @@ async def get_binary_gpt_prediction(
             final_comment_sections
         )
 
-    return median_probability, final_comment
+    return median_probability, final_comment, content, raw_responses
 
 
 ####################### NUMERIC ###############
@@ -733,12 +786,6 @@ Today is {today}.
 {lower_bound_message}
 {upper_bound_message}
 
-
-Formatting Instructions:
-- Please notice the units requested (e.g. whether you represent a number as 1,000,000 or 1m).
-- Never use scientific notation.
-- Always start with a smaller number (more negative if negative) and then increase from there
-
 Before answering you write:
 (a) The time left until the outcome to the question is known.
 (b) The outcome if nothing changed.
@@ -747,94 +794,104 @@ Before answering you write:
 (e) A brief description of an unexpected scenario that results in a low outcome.
 (f) A brief description of an unexpected scenario that results in a high outcome.
 
-You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unkowns.
+You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
 
-The last thing you write is your final answer as:
-"
-Percentile 10: XX
-Percentile 20: XX
-Percentile 40: XX
-Percentile 60: XX
-Percentile 80: XX
-Percentile 90: XX
-"
+**Step 1 — Evidence synthesis**
+Integrate the evidence into a probabilistic view. State your central estimate, the range where most mass sits, and any asymmetry (fatter upper vs lower tail). Explain why the distribution has that shape.
+
+**Step 2 — Distribution specification**
+Choose a parametric form (e.g., mixture of 2–4 Gaussians, a skew-normal, a beta, etc.) that reflects the synthesis. State the parameters explicitly (weights, means, standard deviations). Be concise but calibrated. Anchor on base rates first, then adjust. Flag when you're uncertain about an input vs. when the quantity itself is uncertain. Don't hedge vaguely — put the uncertainty into the distribution shape.
+
+Respond with a single JSON object in this exact schema — no text outside the JSON:
+{{
+  "reasoning": "<your full Steps 1 and 2 analysis as a string>",
+  "distribution": {{
+    "type": "<distribution_type>",
+    "params": {{ ... }}
+  }}
+}}
+
+Supported distribution types and their params:
+- "normal": {{"mean": float, "std": float}}
+- "mixture_normal": {{"weights": [float, ...], "means": [float, ...], "stds": [float, ...]}}
+- "skew_normal": {{"location": float, "scale": float, "alpha": float}}
+- "beta": {{"a": float, "b": float, "lower": float, "upper": float}}
+- "log_normal": {{"mu": float, "sigma": float}}
+- "uniform": {{"lower": float, "upper": float}}
+
+Weights in mixture_normal must sum to 1. Choose whichever type best matches your reasoning.
 """
 
 
-def extract_percentiles_from_response(forecast_text: str) -> dict:
+class MixtureNormal:
+    """Weighted mixture of scipy normal distributions."""
+    def __init__(self, weights, means, stds):
+        self.weights = np.array(weights)
+        self.components = [stats.norm(loc=m, scale=s) for m, s in zip(means, stds)]
 
-    # Helper function that returns a list of tuples with numbers for all lines with Percentile
-    def extract_percentile_numbers(text) -> dict:
-        pattern = r"^.*(?:P|p)ercentile.*$"
-        number_pattern = (
-            r"-\s*(?:[^\d\-]*\s*)?(\d+(?:,\d{3})*(?:\.\d+)?)|(\d+(?:,\d{3})*(?:\.\d+)?)"
-        )
-        results = []
+    def cdf(self, x):
+        return sum(w * c.cdf(x) for w, c in zip(self.weights, self.components))
 
-        for line in text.split("\n"):
-            if re.match(pattern, line):
-                numbers = re.findall(number_pattern, line)
-                numbers_no_commas = [
-                    next(num for num in match if num).replace(",", "")
-                    for match in numbers
-                ]
-                numbers = [
-                    float(num) if "." in num else int(num) for num in numbers_no_commas
-                ]
-                if len(numbers) > 1:
-                    first_number = numbers[0]
-                    last_number = numbers[-1]
-                    # Check if the original line had a negative sign before the last number
-                    if "-" in line.split(":")[-1]:
-                        last_number = -abs(last_number)
-                    results.append((first_number, last_number))
 
-        # Convert results to dictionary
-        percentile_values = {}
-        for first_num, second_num in results:
-            key = first_num
-            percentile_values[key] = second_num
+class ScaledBeta:
+    """Beta distribution scaled to [lower, upper] range."""
+    def __init__(self, a, b, lower, upper):
+        self.beta = stats.beta(a, b)
+        self.lower = lower
+        self.upper = upper
 
-        return percentile_values
+    def cdf(self, x):
+        z = (np.asarray(x) - self.lower) / (self.upper - self.lower)
+        return self.beta.cdf(z)
 
-    percentile_values = extract_percentile_numbers(forecast_text)
+    def pdf(self, x):
+        z = (np.asarray(x) - self.lower) / (self.upper - self.lower)
+        return self.beta.pdf(z) / (self.upper - self.lower)
 
-    if len(percentile_values) > 0:
-        return percentile_values
+
+def build_distribution(spec: dict):
+    """Return a scipy-like object with a .cdf() method from a JSON spec."""
+    t = spec["type"]
+    p = spec.get("params") or {k: v for k, v in spec.items() if k != "type"}
+    if t == "normal":
+        if p["std"] <= 0:
+            raise ValueError(f"normal: std must be > 0, got {p['std']}")
+        return stats.norm(loc=p["mean"], scale=p["std"])
+    elif t == "mixture_normal":
+        if any(s <= 0 for s in p["stds"]):
+            raise ValueError(f"mixture_normal: all stds must be > 0, got {p['stds']}")
+        if abs(sum(p["weights"]) - 1.0) > 1e-6:
+            raise ValueError(f"mixture_normal: weights must sum to 1, got {p['weights']}")
+        return MixtureNormal(p["weights"], p["means"], p["stds"])
+    elif t == "skew_normal":
+        if p["scale"] <= 0:
+            raise ValueError(f"skew_normal: scale must be > 0, got {p['scale']}")
+        return stats.skewnorm(p["alpha"], loc=p["location"], scale=p["scale"])
+    elif t == "beta":
+        if p["a"] <= 0 or p["b"] <= 0:
+            raise ValueError(f"beta: a and b must be > 0, got a={p['a']}, b={p['b']}")
+        if p["upper"] <= p["lower"]:
+            raise ValueError(f"beta: upper must be > lower, got lower={p['lower']}, upper={p['upper']}")
+        return ScaledBeta(p["a"], p["b"], p["lower"], p["upper"])
+    elif t == "log_normal":
+        if p["sigma"] <= 0:
+            raise ValueError(f"log_normal: sigma must be > 0, got {p['sigma']}")
+        return stats.lognorm(s=p["sigma"], scale=np.exp(p["mu"]))
+    elif t == "uniform":
+        lo, hi = p["lower"], p["upper"]
+        if hi <= lo:
+            raise ValueError(f"uniform: upper must be > lower, got lower={lo}, upper={hi}")
+        return stats.uniform(loc=lo, scale=hi - lo)
     else:
-        raise ValueError(f"Could not extract prediction from response: {forecast_text}")
+        raise ValueError(f"Unknown distribution type: {t}")
 
 
-def generate_continuous_cdf(
-    percentile_values: dict,
-    question_type: str,
-    open_upper_bound: bool,
-    open_lower_bound: bool,
-    upper_bound: float,
-    lower_bound: float,
-    zero_point: float | None,
-    cdf_size: int,
-) -> list[float]:
-    """
-    Returns: list[float]: A list of 201 float values representing the CDF.
-    """
-
-    percentiles = []
-    for percentile, value in percentile_values.items():
-        percentiles.append(Percentile(percentile=percentile/100, value=value))
-    numeric_distribution = NumericDistribution(
-        declared_percentiles=percentiles,
-        open_upper_bound=open_upper_bound,
-        open_lower_bound=open_lower_bound,
-        upper_bound=upper_bound,
-        lower_bound=lower_bound,
-        zero_point=zero_point,
-        cdf_size=cdf_size,
-    )
-    cdf_as_objects = numeric_distribution.get_cdf()
-    cdf_as_floats = [percentile.percentile for percentile in cdf_as_objects]
-
-    return cdf_as_floats
+def spec_to_cdf(spec: dict, grid: np.ndarray) -> list[float]:
+    """Evaluate the distribution CDF on a grid and return as a list."""
+    dist = build_distribution(spec)
+    cdf_values = dist.cdf(grid)
+    cdf_values = np.maximum.accumulate(np.clip(cdf_values, 0.0, 1.0))
+    return cdf_values.tolist()
 
 
 class NumericDefaults:
@@ -1328,7 +1385,7 @@ class NumericDistribution(BaseModel):
 
 async def get_numeric_gpt_prediction(
     question_details: dict, num_runs: int,
-) -> tuple[list[float], str]:
+) -> tuple[list[float], str, str, list[str]]:
 
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     title = question_details["title"]
@@ -1337,23 +1394,17 @@ async def get_numeric_gpt_prediction(
     fine_print = question_details["fine_print"]
     question_type = question_details["type"]
     scaling = question_details["scaling"]
-    open_upper_bound = question_details["open_upper_bound"]
-    open_lower_bound = question_details["open_lower_bound"]
-    unit_of_measure = (
-        question_details["unit"]
-        if question_details["unit"]
-        else "Not stated (please infer this)"
-    )
+    open_upper_bound = question_details.get("open_upper_bound", scaling.get("open_upper_bound", False))
+    open_lower_bound = question_details.get("open_lower_bound", scaling.get("open_lower_bound", False))
+    unit_of_measure = question_details.get("unit") or "Not stated (please infer this)"
     upper_bound = scaling["range_max"]
     lower_bound = scaling["range_min"]
-    zero_point = scaling["zero_point"]
     if question_type == "discrete":
-        outcome_count = question_details["scaling"]["inbound_outcome_count"]
+        outcome_count = scaling.get("inbound_outcome_count") or int(upper_bound - lower_bound)
         cdf_size = outcome_count + 1
     else:
         cdf_size = 201
 
-    # Create messages about the bounds that are passed in the LLM prompt
     if open_upper_bound:
         upper_bound_message = ""
     else:
@@ -1363,9 +1414,11 @@ async def get_numeric_gpt_prediction(
     else:
         lower_bound_message = f"The outcome can not be lower than {lower_bound}."
 
+    grid = np.linspace(lower_bound, upper_bound, cdf_size)
+
     summary_report = await run_research(title)
 
-    content = NUMERIC_PROMPT_TEMPLATE.format(
+    reasoning_prompt = NUMERIC_PROMPT_TEMPLATE.format(
         title=title,
         today=today,
         background=background,
@@ -1376,45 +1429,58 @@ async def get_numeric_gpt_prediction(
         upper_bound_message=upper_bound_message,
         units=unit_of_measure,
     )
-    log_prediction_prompt(question_type, title, content)
+    log_prediction_prompt(question_type, title, reasoning_prompt)
 
-    async def ask_llm_to_get_cdf(content: str) -> tuple[list[float], str]:
-        rationale = await call_llm(content)
-        percentile_values = extract_percentiles_from_response(rationale)
+    async def ask_llm_to_get_cdf() -> tuple[list[float], str, str]:
+        response = await call_llm(reasoning_prompt)
 
+        try:
+            parsed = json.loads(response)
+        except json.JSONDecodeError:
+            match = re.search(r'\{.*\}', response, re.DOTALL)
+            if not match:
+                raise ValueError(f"Could not extract JSON from LLM response: {response[:300]}")
+            parsed = json.loads(match.group())
+
+        spec = parsed.get("distribution")
+        if spec is None:
+            raise ValueError(f"LLM response missing 'distribution' key. Keys present: {list(parsed.keys())}")
+        reasoning_text = parsed.get("reasoning", "")
+
+        cdf = spec_to_cdf(spec, grid)
+        dummy = NumericDistribution(
+            declared_percentiles=[
+                Percentile(percentile=0.01, value=lower_bound + 0.001 * (upper_bound - lower_bound)),
+                Percentile(percentile=0.99, value=lower_bound + 0.999 * (upper_bound - lower_bound)),
+            ],
+            open_upper_bound=open_upper_bound,
+            open_lower_bound=open_lower_bound,
+            upper_bound=upper_bound,
+            lower_bound=lower_bound,
+            zero_point=None,
+            cdf_size=None,
+            standardize_cdf=False,
+            strict_validation=False,
+        )
+        cdf = dummy._standardize_cdf(cdf)
         comment = (
-            f"Extracted Percentile_values: {percentile_values}\n\nGPT's Answer: "
-            f"{rationale}\n\n\n"
+            f"Distribution spec: {json.dumps(spec)}\n"
+            f"CDF ({cdf_size} points, first 5: {cdf[:5]})\n\n"
+            f"{reasoning_text}"
         )
+        return cdf, comment, response
 
-        cdf = generate_continuous_cdf(
-            percentile_values,
-            question_type,
-            open_upper_bound,
-            open_lower_bound,
-            upper_bound,
-            lower_bound,
-            zero_point,
-            cdf_size,
-        )
-
-        return cdf, comment
-
-    cdf_and_comment_pairs = await asyncio.gather(
-        *[ask_llm_to_get_cdf(content) for _ in range(num_runs)]
-    )
+    cdf_and_comment_pairs = await asyncio.gather(*[ask_llm_to_get_cdf() for _ in range(num_runs)])
     comments = [pair[1] for pair in cdf_and_comment_pairs]
-    final_comment_sections = [
-        f"## Rationale {i+1}\n{comment}" for i, comment in enumerate(comments)
-    ]
+    raw_responses = [pair[2] for pair in cdf_and_comment_pairs]
+    final_comment_sections = [f"## Rationale {i+1}\n{comment}" for i, comment in enumerate(comments)]
     cdfs: list[list[float]] = [pair[0] for pair in cdf_and_comment_pairs]
     all_cdfs = np.array(cdfs)
-    median_cdf: list[float] = np.median(all_cdfs, axis=0).tolist()
-
-    final_comment = f"Median CDF: `{str(median_cdf)[:100]}...`\n\n" + "\n\n".join(
-        final_comment_sections
-    )
-    return median_cdf, final_comment
+    all_pmfs = np.diff(all_cdfs, prepend=0, axis=1)
+    mean_pmf = np.mean(all_pmfs, axis=0)
+    final_cdf: list[float] = np.cumsum(mean_pmf).tolist()
+    final_comment = f"Aggregated CDF: `{str(final_cdf)[:100]}...`\n\n" + "\n\n".join(final_comment_sections)
+    return final_cdf, final_comment, reasoning_prompt, raw_responses
 
 
 ########################## MULTIPLE CHOICE ###############
@@ -1537,7 +1603,7 @@ def generate_multiple_choice_forecast(options, option_probabilities) -> dict:
 async def get_multiple_choice_gpt_prediction(
     question_details: dict,
     num_runs: int,
-) -> tuple[dict[str, float], str]:
+) -> tuple[dict[str, float], str, str, list[str]]:
 
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     title = question_details["title"]
@@ -1561,7 +1627,7 @@ async def get_multiple_choice_gpt_prediction(
 
     async def ask_llm_for_multiple_choice_probabilities(
         content: str,
-    ) -> tuple[dict[str, float], str]:
+    ) -> tuple[dict[str, float], str, str]:
         rationale = await call_llm(content)
 
         option_probabilities = extract_option_probabilities_from_response(
@@ -1576,12 +1642,13 @@ async def get_multiple_choice_gpt_prediction(
         probability_yes_per_category = generate_multiple_choice_forecast(
             options, option_probabilities
         )
-        return probability_yes_per_category, comment
+        return probability_yes_per_category, comment, rationale
 
     probability_yes_per_category_and_comment_pairs = await asyncio.gather(
         *[ask_llm_for_multiple_choice_probabilities(content) for _ in range(num_runs)]
     )
     comments = [pair[1] for pair in probability_yes_per_category_and_comment_pairs]
+    raw_responses = [pair[2] for pair in probability_yes_per_category_and_comment_pairs]
     final_comment_sections = [
         f"## Rationale {i+1}\n{comment}" for i, comment in enumerate(comments)
     ]
@@ -1601,7 +1668,7 @@ async def get_multiple_choice_gpt_prediction(
         f"Average Probability Yes Per Category: `{average_probability_yes_per_category}`\n\n"
         + "\n\n".join(final_comment_sections)
     )
-    return average_probability_yes_per_category, final_comment
+    return average_probability_yes_per_category, final_comment, content, raw_responses
 
 
 ################### FORECASTING ###################
@@ -1656,15 +1723,15 @@ async def forecast_individual_question(
         return summary_of_forecast
 
     if question_type == "binary":
-        forecast, comment = await get_binary_gpt_prediction(
+        forecast, comment, prompt, raw_responses = await get_binary_gpt_prediction(
             question_details, num_runs_per_question
         )
     elif question_type in ("numeric", "discrete"):
-        forecast, comment = await get_numeric_gpt_prediction(
+        forecast, comment, prompt, raw_responses = await get_numeric_gpt_prediction(
             question_details, num_runs_per_question
         )
     elif question_type == "multiple_choice":
-        forecast, comment = await get_multiple_choice_gpt_prediction(
+        forecast, comment, prompt, raw_responses = await get_multiple_choice_gpt_prediction(
             question_details, num_runs_per_question
         )
     else:
@@ -1683,8 +1750,10 @@ async def forecast_individual_question(
 
     summary_of_forecast += f"Comment:\n```\n{comment[:200]}...\n```\n\n"
 
+    forecast_payload = create_forecast_payload(forecast, question_type)
+    save_llm_result(question_id, post_id, title, question_type, prompt, raw_responses, forecast, forecast_payload)
+
     if submit_prediction == True:
-        forecast_payload = create_forecast_payload(forecast, question_type)
         await post_question_prediction(question_id, forecast_payload)
         await post_question_comment(post_id, comment)
         summary_of_forecast += "Posted: Forecast was posted to Metaculus.\n"

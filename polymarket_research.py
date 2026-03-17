@@ -28,7 +28,7 @@ from openai import OpenAI
 _OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # Cheap/fast model for relevance scoring only — override via env var if needed
-_POLYMARKET_SCORING_MODEL = "anthropic/claude-opus-4.6"
+_POLYMARKET_SCORING_MODEL = "anthropic/claude-sonnet-4.6"
 
 _GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 _MAX_RESULTS = 3              # max markets included in final output

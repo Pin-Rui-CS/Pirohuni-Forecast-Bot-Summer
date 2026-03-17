@@ -29,3 +29,5 @@ experiment.py
 test.py
 forecast_custom_questions.py
 metaculus_research.py
+refined_forecast.py
+debugging_bot.py

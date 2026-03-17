@@ -29,7 +29,7 @@ from openai import OpenAI
 _OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # Cheap/fast model for relevance scoring only — override via env var if needed
-_MANIFOLD_SCORING_MODEL = "anthropic/claude-opus-4.6"
+_MANIFOLD_SCORING_MODEL = "anthropic/claude-sonnet-4.6"
 
 _MANIFOLD_API_BASE = "https://api.manifold.markets/v0"
 _MAX_RESULTS = 3              # max markets included in final output
@@ -144,6 +144,12 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+def _fetch_full_market(market_id: str) -> dict:
+    resp = httpx.get(f"{_MANIFOLD_API_BASE}/market/{market_id}", timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def _parse_market(raw: dict) -> dict | None:
     """Extract relevant fields from a Manifold market dict."""
     if raw.get("isResolved") or raw.get("outcomeType") not in ("BINARY", "MULTIPLE_CHOICE"):
@@ -161,6 +167,12 @@ def _parse_market(raw: dict) -> dict | None:
         ]
     elif outcome_type == "MULTIPLE_CHOICE":
         answers = raw.get("answers") or []
+        if not answers and raw.get("id"):
+            try:
+                full = _fetch_full_market(raw["id"])
+                answers = full.get("answers") or []
+            except Exception:
+                pass
         outcomes = [
             {
                 "name": a.get("text", "?"),
