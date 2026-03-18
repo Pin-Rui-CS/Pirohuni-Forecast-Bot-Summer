@@ -645,13 +645,40 @@ Your research assistant says:
 
 Today is {today}.
 
-Before answering you write:
-(a) The time left until the outcome to the question is known.
-(b) The status quo outcome if nothing changed.
-(c) A brief description of a scenario that results in a No outcome.
-(d) A brief description of a scenario that results in a Yes outcome.
+Follow the following steps when crafting your rationale
+(at the end of each step state clearly the prediction and confidence level from 1/10, with 1 being the lowest and 10 being highest.
+Note that good forecasters hedge against overconfidence as the future is random.
+):
 
-You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
+Step 1: Prioritise betting odds, prediction market data. If none found, construct a synthetic base-rate prior from historical data or market prices.
+
+Step 2: Answer 5 sub-questions:
+(a) How many days remain until the resolution date?
+(b) What is the most likely outcome if nothing changes from the current trajectory?
+(c) How plausible is a change from the current trajectory? What are the relevant year-over-year or historical base rates for such changes?
+(d) COUNTERFACTUAL: What would your estimate be if the time horizon were:
+- 1/4 of the actual remaining time?
+- 4x the actual remaining time?
+(e) How many days would need to remain for the probability to reach 50%?
+After answering all five sub-questions, update your estimate and state changes in the reasoning from Step 1.
+
+Step 3: Integrate the research assistant outputs provided to you.
+- Assess trustworthiness on a scale: official/primary > reputable market data > secondary media > stale or sensational sources
+- Weight evidence proportional to source reliability and relevance
+- Identify the single strongest piece of evidence FOR the most likely outcome
+- Identify the single strongest piece of evidence AGAINST the most likely outcome
+- Make a net directional update based on the balance of evidence
+After integrating the research, update your estimate and state changes in the reasoning from Step 2.
+
+Step 4: Anti-overprediction bias correction
+Use your certainty score from 1–10 (10 = near-certain, 1 = highly uncertain).
+X = min(10 - certainty, 0.2 * estimate)
+final_estimate = estimate - X
+State your certainty score and show the corrected estimate explicitly.
+
+Note that as a good forecaster:
+1. You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
+2. You write your rationale remembering that events are more random further into the future.
 
 The last thing you write is your final answer as: "Probability: ZZ%", 0-100
 """
@@ -1508,12 +1535,44 @@ Your research assistant says:
 
 Today is {today}.
 
-Before answering you write:
-(a) The time left until the outcome to the question is known.
-(b) The status quo outcome if nothing changed.
-(c) A description of an scenario that results in an unexpected outcome.
+Follow the following steps when crafting your rationale
+(at the end of each step state clearly the prediction and confidence level from 1/10, with 1 being the lowest and 10 being highest.
+Note that good forecasters hedge against overconfidence as the future is random.
+):
 
-You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
+Step 1: Prioritise betting odds, prediction market data. If none found, construct a synthetic base-rate prior from historical data or market prices.
+
+Step 2: Answer 5 sub-questions:
+(a) How many days remain until the resolution date?
+(b) What is the most likely outcome if nothing changes from the current trajectory?
+(c) How plausible is a change from the current trajectory? What are the relevant year-over-year or historical base rates for such changes?
+(d) COUNTERFACTUAL: What would your estimate be if the time horizon were:
+- 1/4 of the actual remaining time?
+- 4x the actual remaining time?
+(e) How many days would need to remain for the probability to reach 50%?
+After answering all five sub-questions, update your estimate and state changes in the reasoning from Step 1.
+
+Step 3: Integrate the research assistant outputs provided to you.
+- Assess trustworthiness on a scale: official/primary > reputable market data > secondary media > stale or sensational sources
+- Weight evidence proportional to source reliability and relevance
+- Identify the single strongest piece of evidence FOR the most likely outcome
+- Identify the single strongest piece of evidence AGAINST the most likely outcome
+- Make a net directional update based on the balance of evidence
+After integrating the research, update your estimate and state changes in the reasoning from Step 2.
+
+Step 4: Anti-overprediction bias correction
+Use your certainty score from 1–10 (10 = near-certain, 1 = highly uncertain).
+Let p_max = the probability of your most favored option.
+X = min(10 - certainty, 0.2 * p_max)
+p_max_final = p_max - X
+For each remaining option j:
+  p_j_final = p_j + X * (p_j / (100 - p_max))
+This redistributes the removed mass proportionally across all other options, preserving the sum to 100%.
+State your certainty score and show the adjusted probabilities explicitly.
+
+Note that as a good forecaster:
+1. You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
+2. You write your rationale remembering that events are more random further into the future.
 
 The last thing you write is your final probabilities for the N options in this order {options} as:
 Option_A: Probability_A
