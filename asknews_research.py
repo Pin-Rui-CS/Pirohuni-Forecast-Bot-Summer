@@ -102,14 +102,16 @@ def call_asknews_rate_limited(question: str) -> str:
                 print(f"✓ Got {len(hot_articles) if hot_articles else 0} hot articles")
                 
                 if hot_articles:
-                    hot_articles = [article.__dict__ for article in hot_articles]
+                    hot_articles = [article.model_dump() for article in hot_articles]
                     hot_articles = sorted(hot_articles, key=lambda x: x["pub_date"], reverse=True)
-                    
+
                     for article in hot_articles:
                         pub_date = article["pub_date"].strftime("%B %d, %Y %I:%M %p")
+                        key_points = article.get("key_points") or []
+                        content = "\n".join(f"- {pt}" for pt in key_points) if key_points else article.get("summary", "")
                         formatted_articles += (
                             f"**{article['eng_title']}**\n"
-                            f"{article['summary']}\n"
+                            f"{content}\n"
                             f"Original language: {article['language']}\n"
                             f"Publish date: {pub_date}\n"
                             f"Source:[{article['source_id']}]({article['article_url']})\n\n"
@@ -136,18 +138,20 @@ def call_asknews_rate_limited(question: str) -> str:
                 print(f"✓ Got {len(historical_articles) if historical_articles else 0} historical articles")
                 
                 if historical_articles:
-                    historical_articles = [article.__dict__ for article in historical_articles]
+                    historical_articles = [article.model_dump() for article in historical_articles]
                     historical_articles = sorted(
-                        historical_articles, 
-                        key=lambda x: x["pub_date"], 
+                        historical_articles,
+                        key=lambda x: x["pub_date"],
                         reverse=True
                     )
-                    
+
                     for article in historical_articles:
                         pub_date = article["pub_date"].strftime("%B %d, %Y %I:%M %p")
+                        key_points = article.get("key_points") or []
+                        content = "\n".join(f"- {pt}" for pt in key_points) if key_points else article.get("summary", "")
                         formatted_articles += (
                             f"**{article['eng_title']}**\n"
-                            f"{article['summary']}\n"
+                            f"{content}\n"
                             f"Original language: {article['language']}\n"
                             f"Publish date: {pub_date}\n"
                             f"Source:[{article['source_id']}]({article['article_url']})\n\n"
@@ -230,14 +234,16 @@ def call_asknews_fast(question: str, max_wait: float = 30.0) -> str:
                 return "No recent articles found.\n"
             
             formatted_articles = "Here are the relevant news articles:\n\n"
-            hot_articles = [article.__dict__ for article in hot_articles]
+            hot_articles = [article.model_dump() for article in hot_articles]
             hot_articles = sorted(hot_articles, key=lambda x: x["pub_date"], reverse=True)
-            
+
             for article in hot_articles:
                 pub_date = article["pub_date"].strftime("%B %d, %Y %I:%M %p")
+                key_points = article.get("key_points") or []
+                content = "\n".join(f"- {pt}" for pt in key_points) if key_points else article.get("summary", "")
                 formatted_articles += (
                     f"**{article['eng_title']}**\n"
-                    f"{article['summary']}\n"
+                    f"{content}\n"
                     f"Original language: {article['language']}\n"
                     f"Publish date: {pub_date}\n"
                     f"Source:[{article['source_id']}]({article['article_url']})\n\n"
