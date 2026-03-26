@@ -23,6 +23,7 @@ from asknews_research import call_asknews_fast
 from polymarket_research import scrape_polymarket as _scrape_polymarket
 from manifold_research import scrape_manifold as _scrape_manifold
 from resolution_criteria_scraper import scrape_resolution_sources
+from serp_research import run_serp_research
 
 ######################### CONSTANTS #########################
 # Constants
@@ -47,6 +48,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENAI_API_KEY = os.getenv(
     "OPENAI_API_KEY"
 )  # You'll also need the OpenAI API Key if you want to use the Exa Smart Searcher
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 # The tournament IDs below can be used for testing your bot.
 Q4_2024_AI_BENCHMARKING_ID = 32506
 Q1_2025_AI_BENCHMARKING_ID = 32627
@@ -542,6 +544,13 @@ async def run_research(question: str) -> str:
         research = await call_perplexity(question)
     else:
         research = "No research done"
+
+    try:
+        serp_data = await run_serp_research(question)
+        if serp_data:
+            research = f"{research}\n\n{serp_data}"
+    except Exception as exc:
+        print(f"[SerpAPI] Research failed: {exc}")
 
     try:
         polymarket_data = await asyncio.to_thread(_scrape_polymarket, question)
