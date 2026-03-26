@@ -40,7 +40,8 @@ def _format_markdown(params: dict, response: dict) -> str:
     date_label = params["date"] if params["date"] else "Custom range"
 
     if multi:
-        title = f"## Google Trends Comparison\n\n**Queries:** {', '.join(f'\"{q}\"' for q in queries)}"
+        quoted = ", ".join(f'"{q}"' for q in queries)
+        title = f"## Google Trends Comparison\n\n**Queries:** {quoted}"
     else:
         title = f"## Google Trends: \"{queries[0]}\""
 
