@@ -21,6 +21,9 @@ input_questions/
 question_types/
 test_results/
 
+# Web Scraper outputs
+Web Scraper/results/
+
 # Local files/folders to keep out of commits
 docs/
 forecast_custom_question.py
@@ -31,3 +34,5 @@ forecast_custom_questions.py
 metaculus_research.py
 refined_forecast.py
 debugging_bot.py
+resolution_criteria_scraper.py
+test_resolution_criteria_scraper.py

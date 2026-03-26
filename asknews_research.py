@@ -12,7 +12,9 @@ Rate limits (Metaculus free tier):
 - 1 concurrent request at a time
 """
 
+import json
 import os
+import re
 import time
 import threading
 from datetime import datetime
@@ -20,6 +22,7 @@ from typing import Optional
 from asknews_sdk import AskNewsSDK
 from asknews_sdk.errors import RateLimitExceededError
 import dotenv
+from openai import OpenAI
 
 dotenv.load_dotenv()
 
@@ -27,6 +30,81 @@ dotenv.load_dotenv()
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID")
 ASKNEWS_SECRET = os.getenv("ASKNEWS_SECRET")
 ASKNEWS_MIN_SECONDS_BETWEEN_CALLS = 20.0
+
+# Relevance scoring config
+_OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_ASKNEWS_SCORING_MODEL = "anthropic/claude-sonnet-4.6"
+_MIN_RELEVANCE_SCORE = 5.0  # Lower threshold than Polymarket/Manifold (6.0)
+
+_openai_client: OpenAI | None = None
+
+
+def _get_openai_client() -> OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI(
+            base_url=_OPENROUTER_BASE_URL,
+            api_key=_OPENROUTER_API_KEY,
+        )
+    return _openai_client
+
+
+def _score_articles(question: str, articles: list[dict]) -> list[float]:
+    """Single LLM call that rates all candidate articles 0–10 for relevance."""
+    if not articles:
+        return []
+
+    numbered = "\n".join(
+        f"{i + 1}. {a['eng_title']}" for i, a in enumerate(articles)
+    )
+    prompt = (
+        f'Research question: "{question}"\n\n'
+        "Rate each news article below for relevance to the research question on a scale of 0–10:\n"
+        "  10 = directly reports on the same event or outcome\n"
+        "   7 = closely related — strong informational signal\n"
+        "   4 = tangentially related — weak signal\n"
+        "   0 = completely unrelated\n\n"
+        "Consider shared entities (people, countries, organisations), shared topic, "
+        "and whether the article's content would inform a prediction on the research question.\n\n"
+        f"Articles:\n{numbered}\n\n"
+        "Reply with ONLY a JSON array of numbers, one per article in order. "
+        "Example: [8.5, 3.0, 6.0]"
+    )
+    response = _get_openai_client().chat.completions.create(
+        model=_ASKNEWS_SCORING_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    )
+    content = response.choices[0].message.content.strip()
+    match = re.search(r"\[[\d\s.,]+\]", content)
+    if not match:
+        raise ValueError(f"Could not parse scores from model response:\n{content}")
+    scores = json.loads(match.group())
+    scores = list(scores) + [0.0] * max(0, len(articles) - len(scores))
+    return [float(s) for s in scores[: len(articles)]]
+
+
+def _filter_articles(question: str, articles: list[dict]) -> list[dict]:
+    """Score articles for relevance and return only those at or above the threshold."""
+    if not articles:
+        return []
+    if not _OPENROUTER_API_KEY:
+        return articles  # No scoring possible — pass all through
+    try:
+        scores = _score_articles(question, articles)
+        filtered = [
+            {**a, "_relevance_score": s}
+            for a, s in zip(articles, scores)
+            if s >= _MIN_RELEVANCE_SCORE
+        ]
+        kept = len(filtered)
+        total = len(articles)
+        print(f"🔎 Relevance filter: {kept}/{total} articles passed (threshold {_MIN_RELEVANCE_SCORE}/10)")
+        return filtered
+    except Exception as e:
+        print(f"⚠️  Relevance scoring failed ({e}), including all articles")
+        return articles
 
 # Global variables for rate limiting
 _last_asknews_call_time = None
@@ -104,13 +182,15 @@ def call_asknews_rate_limited(question: str) -> str:
                 if hot_articles:
                     hot_articles = [article.model_dump() for article in hot_articles]
                     hot_articles = sorted(hot_articles, key=lambda x: x["pub_date"], reverse=True)
+                    hot_articles = _filter_articles(question, hot_articles)
 
                     for article in hot_articles:
                         pub_date = article["pub_date"].strftime("%B %d, %Y %I:%M %p")
                         key_points = article.get("key_points") or []
                         content = "\n".join(f"- {pt}" for pt in key_points) if key_points else article.get("summary", "")
+                        score_str = f" (relevance: {article['_relevance_score']:.1f}/10)" if "_relevance_score" in article else ""
                         formatted_articles += (
-                            f"**{article['eng_title']}**\n"
+                            f"**{article['eng_title']}**{score_str}\n"
                             f"{content}\n"
                             f"Original language: {article['language']}\n"
                             f"Publish date: {pub_date}\n"
@@ -144,13 +224,15 @@ def call_asknews_rate_limited(question: str) -> str:
                         key=lambda x: x["pub_date"],
                         reverse=True
                     )
+                    historical_articles = _filter_articles(question, historical_articles)
 
                     for article in historical_articles:
                         pub_date = article["pub_date"].strftime("%B %d, %Y %I:%M %p")
                         key_points = article.get("key_points") or []
                         content = "\n".join(f"- {pt}" for pt in key_points) if key_points else article.get("summary", "")
+                        score_str = f" (relevance: {article['_relevance_score']:.1f}/10)" if "_relevance_score" in article else ""
                         formatted_articles += (
-                            f"**{article['eng_title']}**\n"
+                            f"**{article['eng_title']}**{score_str}\n"
                             f"{content}\n"
                             f"Original language: {article['language']}\n"
                             f"Publish date: {pub_date}\n"
@@ -236,13 +318,18 @@ def call_asknews_fast(question: str, max_wait: float = 30.0) -> str:
             formatted_articles = "Here are the relevant news articles:\n\n"
             hot_articles = [article.model_dump() for article in hot_articles]
             hot_articles = sorted(hot_articles, key=lambda x: x["pub_date"], reverse=True)
+            hot_articles = _filter_articles(question, hot_articles)
+
+            if not hot_articles:
+                return "No relevant articles found after relevance filtering.\n"
 
             for article in hot_articles:
                 pub_date = article["pub_date"].strftime("%B %d, %Y %I:%M %p")
                 key_points = article.get("key_points") or []
                 content = "\n".join(f"- {pt}" for pt in key_points) if key_points else article.get("summary", "")
+                score_str = f" (relevance: {article['_relevance_score']:.1f}/10)" if "_relevance_score" in article else ""
                 formatted_articles += (
-                    f"**{article['eng_title']}**\n"
+                    f"**{article['eng_title']}**{score_str}\n"
                     f"{content}\n"
                     f"Original language: {article['language']}\n"
                     f"Publish date: {pub_date}\n"

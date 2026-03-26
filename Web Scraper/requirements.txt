@@ -1,0 +1,9 @@
+httpx
+crawl4ai
+pdfplumber
+pypdf
+firecrawl-py
+google-search-results
+python-dotenv
+tqdm
+pyyaml

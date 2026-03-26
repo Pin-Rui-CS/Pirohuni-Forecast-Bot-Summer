@@ -19,9 +19,10 @@ from scipy import stats
 import httpx
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, model_validator
-from asknews_research import call_asknews_rate_limited
+from asknews_research import call_asknews_fast
 from polymarket_research import scrape_polymarket as _scrape_polymarket
 from manifold_research import scrape_manifold as _scrape_manifold
+from resolution_criteria_scraper import scrape_resolution_sources
 
 ######################### CONSTANTS #########################
 # Constants
@@ -534,7 +535,7 @@ async def run_research(question: str) -> str:
     """
     research = ""
     if ASKNEWS_CLIENT_ID and ASKNEWS_SECRET:
-        research = await asyncio.to_thread(call_asknews_rate_limited, question)
+        research = await asyncio.to_thread(call_asknews_fast, question)
     elif EXA_API_KEY:
         research = await call_exa_smart_searcher(question)
     elif PERPLEXITY_API_KEY:
@@ -639,6 +640,7 @@ This question's outcome will be determined by the specific criteria below. These
 
 {fine_print}
 
+{resolution_source_data}
 
 Your research assistant says:
 {summary_report}
@@ -707,7 +709,18 @@ async def get_binary_gpt_prediction(
     background = question_details["description"]
     fine_print = question_details["fine_print"]
 
-    summary_report = await run_research(title)
+    summary_report, _scraped = await asyncio.gather(
+        run_research(title),
+        scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
+    )
+    resolution_source_data = (
+        "## Resolution Criteria Source Data\n"
+        "The following data was scraped directly from URLs referenced in the resolution criteria "
+        "at the time of forecasting. Use it as ground truth for the current state of the resolution "
+        "source — it may contain entries, counts, dates, or records that directly determine how "
+        "this question resolves.\n\n"
+        f"{_scraped}"
+    ) if _scraped else ""
 
     content = BINARY_PROMPT_TEMPLATE.format(
         title=title,
@@ -716,6 +729,7 @@ async def get_binary_gpt_prediction(
         resolution_criteria=resolution_criteria,
         fine_print=fine_print,
         summary_report=summary_report,
+        resolution_source_data=resolution_source_data,
     )
     log_prediction_prompt("binary", title, content)
 
@@ -804,6 +818,8 @@ Background:
 {fine_print}
 
 Units for answer: {units}
+
+{resolution_source_data}
 
 Your research assistant says:
 {summary_report}
@@ -1443,7 +1459,18 @@ async def get_numeric_gpt_prediction(
 
     grid = np.linspace(lower_bound, upper_bound, cdf_size)
 
-    summary_report = await run_research(title)
+    summary_report, _scraped = await asyncio.gather(
+        run_research(title),
+        scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
+    )
+    resolution_source_data = (
+        "## Resolution Criteria Source Data\n"
+        "The following data was scraped directly from URLs referenced in the resolution criteria "
+        "at the time of forecasting. Use it as ground truth for the current state of the resolution "
+        "source — it may contain entries, counts, dates, or records that directly determine how "
+        "this question resolves.\n\n"
+        f"{_scraped}"
+    ) if _scraped else ""
 
     reasoning_prompt = NUMERIC_PROMPT_TEMPLATE.format(
         title=title,
@@ -1452,6 +1479,7 @@ async def get_numeric_gpt_prediction(
         resolution_criteria=resolution_criteria,
         fine_print=fine_print,
         summary_report=summary_report,
+        resolution_source_data=resolution_source_data,
         lower_bound_message=lower_bound_message,
         upper_bound_message=upper_bound_message,
         units=unit_of_measure,
@@ -1529,6 +1557,7 @@ Background:
 
 {fine_print}
 
+{resolution_source_data}
 
 Your research assistant says:
 {summary_report}
@@ -1671,7 +1700,18 @@ async def get_multiple_choice_gpt_prediction(
     fine_print = question_details["fine_print"]
     options = question_details["options"]
 
-    summary_report = await run_research(title)
+    summary_report, _scraped = await asyncio.gather(
+        run_research(title),
+        scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
+    )
+    resolution_source_data = (
+        "## Resolution Criteria Source Data\n"
+        "The following data was scraped directly from URLs referenced in the resolution criteria "
+        "at the time of forecasting. Use it as ground truth for the current state of the resolution "
+        "source — it may contain entries, counts, dates, or records that directly determine how "
+        "this question resolves.\n\n"
+        f"{_scraped}"
+    ) if _scraped else ""
 
     content = MULTIPLE_CHOICE_PROMPT_TEMPLATE.format(
         title=title,
@@ -1680,6 +1720,7 @@ async def get_multiple_choice_gpt_prediction(
         resolution_criteria=resolution_criteria,
         fine_print=fine_print,
         summary_report=summary_report,
+        resolution_source_data=resolution_source_data,
         options=options,
     )
     log_prediction_prompt("multiple_choice", title, content)
