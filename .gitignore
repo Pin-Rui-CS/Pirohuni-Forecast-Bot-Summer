@@ -34,5 +34,4 @@ forecast_custom_questions.py
 metaculus_research.py
 refined_forecast.py
 debugging_bot.py
-resolution_criteria_scraper.py
 test_resolution_criteria_scraper.py
