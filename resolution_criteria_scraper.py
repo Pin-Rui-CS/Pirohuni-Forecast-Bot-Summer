@@ -250,7 +250,7 @@ async def scrape_resolution_sources(
     resolution_criteria: str,
     question_text: str = "",
     use_llm_cleaning: bool = False,
-    llm_model: str = "anthropic/claude-sonnet-4-6",
+    llm_model: str = "anthropic/claude-sonnet-4.6",
     max_concurrent: int = 3,
     timeout: int = 30,
 ) -> str:

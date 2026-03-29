@@ -35,3 +35,7 @@ metaculus_research.py
 refined_forecast.py
 debugging_bot.py
 test_resolution_criteria_scraper.py
+newsapi_research.py
+
+# Claude Code local config
+.claude/

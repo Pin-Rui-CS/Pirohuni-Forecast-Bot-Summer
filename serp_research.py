@@ -115,7 +115,7 @@ async def _rate_and_filter(question: str, results: list[dict]) -> list[dict]:
     )
 
     response = await client.chat.completions.create(
-        model="anthropic/claude-sonnet-4-6",
+        model="anthropic/claude-sonnet-4.6",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=100,
         temperature=0.1,
@@ -221,7 +221,7 @@ async def _llm_clean_content(question: str, url: str, content: str) -> str:
     )
 
     response = await client.chat.completions.create(
-        model="anthropic/claude-sonnet-4-6",
+        model="anthropic/claude-sonnet-4.6",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=2000,
         temperature=0.1,
