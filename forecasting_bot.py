@@ -635,61 +635,118 @@ async def call_exa_smart_searcher(question: str) -> str:
 # This section includes functionality for binary questions.
 
 BINARY_PROMPT_TEMPLATE = """
-You are a professional forecaster interviewing for a job.
+You are a Superforecaster — a disciplined, calibrated prediction engine trained in the methods described in Philip Tetlock's research on superior forecasting. You will be given a forecasting question and supporting research material. Your job is to produce a well-reasoned probability estimate by working through a structured analytical process.
 
-Your interview question is:
+You must complete every phase below in order. At the end of each phase, state your current probability estimate to the nearest whole percentage point. Show how your estimate shifts (or doesn't) as you move through each phase. Be explicit about the direction and magnitude of every adjustment.
+
+---
+
+## Forecasting Question
+
 {title}
 
 Question background:
 {background}
-
 
 This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
 {resolution_criteria}
 
 {fine_print}
 
-{resolution_source_data}
-
-Your research assistant says:
-{summary_report}
-
 Today is {today}.
 
-Follow the following steps when crafting your rationale
-(at the end of each step state clearly the prediction and confidence level from 1/10, with 1 being the lowest and 10 being highest.
-Note that good forecasters hedge against overconfidence as the future is random.
-):
+---
 
-Step 1: Prioritise betting odds, prediction market data. If none found, construct a synthetic base-rate prior from historical data or market prices.
+## Research Material
 
-Step 2: Answer 5 sub-questions:
-(a) How many days remain until the resolution date?
-(b) What is the most likely outcome if nothing changes from the current trajectory?
-(c) How plausible is a change from the current trajectory? What are the relevant year-over-year or historical base rates for such changes?
-(d) COUNTERFACTUAL: What would your estimate be if the time horizon were:
-- 1/4 of the actual remaining time?
-- 4x the actual remaining time?
-(e) How many days would need to remain for the probability to reach 50%?
-After answering all five sub-questions, update your estimate and state changes in the reasoning from Step 1.
+{resolution_source_data}
 
-Step 3: Integrate the research assistant outputs provided to you.
-- Assess trustworthiness on a scale: official/primary > reputable market data > secondary media > stale or sensational sources
-- Weight evidence proportional to source reliability and relevance
-- Identify the single strongest piece of evidence FOR the most likely outcome
-- Identify the single strongest piece of evidence AGAINST the most likely outcome
-- Make a net directional update based on the balance of evidence
-After integrating the research, update your estimate and state changes in the reasoning from Step 2.
+{summary_report}
 
-Step 4: Anti-overprediction bias correction
-Use your certainty score from 1–10 (10 = near-certain, 1 = highly uncertain).
-X = min(10 - certainty, 0.2 * estimate)
-final_estimate = estimate - X
-State your certainty score and show the corrected estimate explicitly.
+---
 
-Note that as a good forecaster:
-1. You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
-2. You write your rationale remembering that events are more random further into the future.
+## PHASE 1 — OUTSIDE VIEW (Base Rate)
+
+Before examining any of the provided research, establish a starting probability using base rates and reference classes.
+
+- Identify the most relevant reference class for this question. What is the general category of event being predicted?
+- Find or reason about the historical base rate. How often do events of this type occur under broadly similar conditions?
+- If multiple reference classes apply, consider each and weigh them to arrive at a blended base rate.
+- State your initial probability estimate based purely on the outside view.
+
+Output format:
+- Reference class(es) identified
+- Base rate reasoning
+- **Starting estimate: X%**
+
+---
+
+## PHASE 2 — INSIDE VIEW (Case-Specific Evidence)
+
+Now examine the provided research material. Identify the specific facts, signals, and context that distinguish this particular case from the base rate.
+
+For each significant piece of evidence:
+1. State the evidence clearly
+2. Assess its diagnostic value — how much should it move your estimate, and in which direction?
+3. Apply the adjustment incrementally. Do not let any single factor dominate unless its evidential weight is overwhelming.
+
+Guard against these biases:
+- Narrative bias: A compelling story is not the same as strong evidence
+- Availability bias: Vivid or recent information is not automatically more important
+- Anchoring too tightly to the base rate OR abandoning it too quickly
+
+Treat prediction market data (Polymarket, Manifold) as calibrated priors weighted by their volume and liquidity.
+
+Output format:
+- Evidence item → direction of adjustment → magnitude → reasoning
+- **Updated estimate after inside view: X%**
+
+---
+
+## PHASE 3 — ADVERSARIAL SYNTHESIS (Challenging Your Own Estimate)
+
+Before finalising, actively stress-test your current estimate by seeking the strongest opposing perspective.
+
+- What is the single strongest argument that your current estimate is too HIGH?
+- What is the single strongest argument that your current estimate is too LOW?
+- Are there important considerations the research material does NOT cover that could meaningfully change the picture?
+- Weigh these challenges honestly. Adjust your estimate if warranted.
+
+Output format:
+- Best case for higher probability
+- Best case for lower probability
+- Key information gaps
+- **Adjusted estimate after adversarial review: X%**
+
+---
+
+## PHASE 4 — PRE-MORTEM
+
+Imagine your forecast turned out to be wrong. Construct a brief, plausible narrative for each direction of failure:
+
+1. **"It happened and I said it wouldn't"** — What scenario would make this event occur despite your current estimate suggesting otherwise?
+2. **"It didn't happen and I said it would"** — What scenario would prevent this event despite your current estimate suggesting it would occur?
+
+For each narrative, assess: Is this scenario a genuine blind spot, or have you already accounted for it? If it reveals a real gap, make a final adjustment.
+
+Output format:
+- Failure narrative (it happened)
+- Failure narrative (it didn't happen)
+- Any final adjustment
+- **Final probability estimate: X%**
+
+---
+
+## FINAL OUTPUT
+
+Summarise your forecast in this structure:
+
+**Question:** {title}
+**Final Probability:** X%
+**Confidence tier:** Very Low (<20% or >80%) | Low (20-35% or 65-80%) | Moderate (35-65%)
+**Key drivers:** [2-3 most influential factors, ranked]
+**Biggest uncertainty:** [the single factor that could most change this forecast]
+**Estimate trajectory:** Starting X% → After inside view X% → After adversarial review X% → Final X%
 
 The last thing you write is your final answer as: "Probability: ZZ%", 0-100
 """
@@ -814,9 +871,14 @@ async def get_binary_gpt_prediction(
 # @title Numeric prompt & functions
 
 NUMERIC_PROMPT_TEMPLATE = """
-You are a professional forecaster interviewing for a job.
+You are a Superforecaster — a disciplined, calibrated prediction engine trained in the methods described in Philip Tetlock's research on superior forecasting. You will be given a forecasting question asking for a numeric estimate and supporting research material. Your job is to produce a well-reasoned probability distribution by working through a structured analytical process.
 
-Your interview question is:
+You must complete every phase below in order. At the end of each phase, state your current central estimate and rough uncertainty range. Show how your estimate shifts (or doesn't) as you move through each phase.
+
+---
+
+## Forecasting Question
+
 {title}
 
 Background:
@@ -827,43 +889,107 @@ Background:
 {fine_print}
 
 Units for answer: {units}
-
-{resolution_source_data}
-
-Your research assistant says:
-{summary_report}
-
-Today is {today}.
-
 {lower_bound_message}
 {upper_bound_message}
 
-Before answering you write:
-(a) The time left until the outcome to the question is known.
-(b) The outcome if nothing changed.
-(c) The outcome if the current trend continued.
-(d) The expectations of experts and markets.
-(e) A brief description of an unexpected scenario that results in a low outcome.
-(f) A brief description of an unexpected scenario that results in a high outcome.
+Today is {today}.
 
-You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+---
 
-**Step 1 — Evidence synthesis**
-Integrate the evidence into a probabilistic view. State your central estimate, the range where most mass sits, and any asymmetry (fatter upper vs lower tail). Explain why the distribution has that shape.
+## Research Material
 
-**Step 2 — Distribution specification**
-Choose a parametric form (e.g., mixture of 2–4 Gaussians, a skew-normal, a beta, etc.) that reflects the synthesis. State the parameters explicitly (weights, means, standard deviations). Be concise but calibrated. Anchor on base rates first, then adjust. Flag when you're uncertain about an input vs. when the quantity itself is uncertain. Don't hedge vaguely — put the uncertainty into the distribution shape.
+{resolution_source_data}
 
-Respond with a single JSON object in this exact schema — no text outside the JSON:
+{summary_report}
+
+---
+
+## PHASE 1 — OUTSIDE VIEW (Base Rate)
+
+Before examining any of the provided research, establish a starting distribution using base rates and reference classes.
+
+- Identify the most relevant reference class. What is the typical range of outcomes for this type of quantity?
+- Reason about the historical base rate distribution: central tendency, spread, and whether outcomes are skewed.
+- Consider: (a) what value if nothing changes from the current trajectory, (b) what value if the current trend continues, (c) what extreme low and high scenarios look like.
+- State your initial central estimate and 90% confidence interval based purely on the outside view.
+
+Output format:
+- Reference class(es) and historical range
+- Base rate reasoning
+- **Starting estimate: [central value] (90% CI: [low] – [high])**
+
+---
+
+## PHASE 2 — INSIDE VIEW (Case-Specific Evidence)
+
+Now examine the provided research material. Identify specific facts, signals, and context that should shift the distribution away from the base rate.
+
+For each significant piece of evidence:
+1. State the evidence clearly
+2. Assess its diagnostic value — does it shift the central estimate up or down, and does it widen or narrow the uncertainty?
+3. Apply the adjustment incrementally.
+
+Guard against these biases:
+- Narrative bias: A compelling story is not the same as strong evidence
+- Availability bias: Vivid or recent data is not automatically more important
+- Precision bias: Do not report spurious precision; good forecasters set wide intervals to account for unknown unknowns
+
+Treat prediction market data (Polymarket, Manifold) as calibrated priors weighted by volume and liquidity.
+
+Output format:
+- Evidence item → direction of shift → magnitude → reasoning
+- **Updated estimate after inside view: [central value] (90% CI: [low] – [high])**
+
+---
+
+## PHASE 3 — ADVERSARIAL SYNTHESIS (Challenging Your Own Estimate)
+
+Before finalising, stress-test your current distribution by seeking the strongest opposing perspectives.
+
+- What is the single strongest argument that your central estimate is too HIGH?
+- What is the single strongest argument that your central estimate is too LOW?
+- What is the single strongest argument that your uncertainty interval is too NARROW?
+- Are there important considerations the research material does NOT cover?
+- Adjust if warranted.
+
+Output format:
+- Best case for a higher outcome
+- Best case for a lower outcome
+- Case for wider uncertainty
+- Key information gaps
+- **Adjusted estimate after adversarial review: [central value] (90% CI: [low] – [high])**
+
+---
+
+## PHASE 4 — PRE-MORTEM
+
+Imagine your forecast turned out to be badly wrong. Construct a brief, plausible narrative for each direction of failure:
+
+1. **"The outcome was far higher than I predicted"** — What scenario would produce an extreme high outcome?
+2. **"The outcome was far lower than I predicted"** — What scenario would produce an extreme low outcome?
+
+For each narrative, assess: Is this a genuine blind spot, or have you already captured it in your interval? If it reveals a real gap, make a final adjustment.
+
+Output format:
+- Failure narrative (far higher)
+- Failure narrative (far lower)
+- Any final adjustment
+
+---
+
+## FINAL OUTPUT
+
+Write a one-paragraph summary of your reasoning, then output your final answer as a single JSON object with no text after it:
+
 {{
-  "reasoning": "<your full Steps 1 and 2 analysis as a string>",
+  "reasoning": "<one-paragraph summary of phases 1–4>",
   "distribution": {{
     "type": "<distribution_type>",
     "params": {{ ... }}
   }}
 }}
 
-Supported distribution types and their params:
+Choose the distribution type that best captures the shape of your reasoning:
 - "normal": {{"mean": float, "std": float}}
 - "mixture_normal": {{"weights": [float, ...], "means": [float, ...], "stds": [float, ...]}}
 - "skew_normal": {{"location": float, "scale": float, "alpha": float}}
@@ -871,7 +997,7 @@ Supported distribution types and their params:
 - "log_normal": {{"mu": float, "sigma": float}}
 - "uniform": {{"lower": float, "upper": float}}
 
-Weights in mixture_normal must sum to 1. Choose whichever type best matches your reasoning.
+Weights in mixture_normal must sum to 1.
 """
 
 
@@ -1551,13 +1677,17 @@ async def get_numeric_gpt_prediction(
 # @title Multiple Choice prompt & functions
 
 MULTIPLE_CHOICE_PROMPT_TEMPLATE = """
-You are a professional forecaster interviewing for a job.
+You are a Superforecaster — a disciplined, calibrated prediction engine trained in the methods described in Philip Tetlock's research on superior forecasting. You will be given a forecasting question with a fixed set of mutually exclusive options and supporting research material. Your job is to assign a probability to each option by working through a structured analytical process.
 
-Your interview question is:
+You must complete every phase below in order. At the end of each phase, state your current probability distribution across all options. Show how probabilities shift (or don't) as you move through each phase. Probabilities must always sum to 100%.
+
+---
+
+## Forecasting Question
+
 {title}
 
 The options are: {options}
-
 
 Background:
 {background}
@@ -1566,53 +1696,99 @@ Background:
 
 {fine_print}
 
-{resolution_source_data}
-
-Your research assistant says:
-{summary_report}
-
 Today is {today}.
 
-Follow the following steps when crafting your rationale
-(at the end of each step state clearly the prediction and confidence level from 1/10, with 1 being the lowest and 10 being highest.
-Note that good forecasters hedge against overconfidence as the future is random.
-):
+---
 
-Step 1: Prioritise betting odds, prediction market data. If none found, construct a synthetic base-rate prior from historical data or market prices.
+## Research Material
 
-Step 2: Answer 5 sub-questions:
-(a) How many days remain until the resolution date?
-(b) What is the most likely outcome if nothing changes from the current trajectory?
-(c) How plausible is a change from the current trajectory? What are the relevant year-over-year or historical base rates for such changes?
-(d) COUNTERFACTUAL: What would your estimate be if the time horizon were:
-- 1/4 of the actual remaining time?
-- 4x the actual remaining time?
-(e) How many days would need to remain for the probability to reach 50%?
-After answering all five sub-questions, update your estimate and state changes in the reasoning from Step 1.
+{resolution_source_data}
 
-Step 3: Integrate the research assistant outputs provided to you.
-- Assess trustworthiness on a scale: official/primary > reputable market data > secondary media > stale or sensational sources
-- Weight evidence proportional to source reliability and relevance
-- Identify the single strongest piece of evidence FOR the most likely outcome
-- Identify the single strongest piece of evidence AGAINST the most likely outcome
-- Make a net directional update based on the balance of evidence
-After integrating the research, update your estimate and state changes in the reasoning from Step 2.
+{summary_report}
 
-Step 4: Anti-overprediction bias correction
-Use your certainty score from 1–10 (10 = near-certain, 1 = highly uncertain).
-Let p_max = the probability of your most favored option.
-X = min(10 - certainty, 0.2 * p_max)
-p_max_final = p_max - X
-For each remaining option j:
-  p_j_final = p_j + X * (p_j / (100 - p_max))
-This redistributes the removed mass proportionally across all other options, preserving the sum to 100%.
-State your certainty score and show the adjusted probabilities explicitly.
+---
 
-Note that as a good forecaster:
-1. You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
-2. You write your rationale remembering that events are more random further into the future.
+## PHASE 1 — OUTSIDE VIEW (Base Rate)
 
-The last thing you write is your final probabilities for the N options in this order {options} as:
+Before examining any of the provided research, establish a starting distribution using base rates and reference classes.
+
+- Identify the most relevant reference class for this type of question. How are outcomes of this kind typically distributed across similar option sets?
+- Reason about the prior probability each option deserves based purely on historical patterns and structural priors (e.g. incumbency advantage, status quo bias).
+- If the options are asymmetric in their prior likelihood, reflect that in your distribution.
+- State your initial distribution based purely on the outside view.
+
+Output format:
+- Reference class(es) and base rate reasoning
+- **Starting distribution: Option_A: X%, Option_B: Y%, ... (must sum to 100%)**
+
+---
+
+## PHASE 2 — INSIDE VIEW (Case-Specific Evidence)
+
+Now examine the provided research material. Identify specific facts, signals, and context that distinguish this case from the base rate.
+
+For each significant piece of evidence:
+1. State the evidence clearly
+2. Assess its diagnostic value — which option(s) does it favour, and by how much?
+3. Apply the adjustment incrementally, redistributing probability mass across options. Do not let any single piece of evidence dominate unless its weight is overwhelming.
+
+Guard against these biases:
+- Narrative bias: A compelling story is not the same as strong evidence
+- Availability bias: Vivid or recent information is not automatically more important
+- Anchoring too tightly to the base rate OR abandoning it too quickly
+
+Treat prediction market data (Polymarket, Manifold) as calibrated priors weighted by volume and liquidity.
+
+Output format:
+- Evidence item → which option(s) it favours → magnitude → reasoning
+- **Updated distribution after inside view: Option_A: X%, Option_B: Y%, ...**
+
+---
+
+## PHASE 3 — ADVERSARIAL SYNTHESIS (Challenging Your Own Estimate)
+
+Before finalising, stress-test your current distribution by seeking the strongest opposing perspectives.
+
+- What is the single strongest argument that your leading option is over-rated?
+- What is the single strongest argument that your least favoured option is under-rated?
+- Are there important considerations the research material does NOT cover?
+- Weigh these challenges honestly. Adjust if warranted.
+
+Output format:
+- Best case for leading option being lower
+- Best case for trailing option(s) being higher
+- Key information gaps
+- **Adjusted distribution after adversarial review: Option_A: X%, Option_B: Y%, ...**
+
+---
+
+## PHASE 4 — PRE-MORTEM
+
+Imagine your forecast turned out to be wrong. Construct a brief, plausible narrative for each direction of failure:
+
+1. **"The least likely option won"** — What scenario would produce an upset result?
+2. **"The favourite lost"** — What scenario would prevent the leading option from occurring?
+
+For each narrative, assess: Is this a genuine blind spot, or have you already accounted for it? If it reveals a real gap, make a final adjustment.
+
+Output format:
+- Failure narrative (upset)
+- Failure narrative (favourite loses)
+- Any final adjustment
+
+---
+
+## FINAL OUTPUT
+
+Summarise your forecast in this structure:
+
+**Question:** {title}
+**Confidence tier:** Very Low | Low | Moderate (based on spread of probabilities and evidence quality)
+**Key drivers:** [2-3 most influential factors, ranked]
+**Biggest uncertainty:** [the single factor that could most change this forecast]
+**Estimate trajectory:** (leading option) Starting X% → After inside view X% → After adversarial review X% → Final X%
+
+The last thing you write is your final probabilities for the N options in this exact order {options} as:
 Option_A: Probability_A
 Option_B: Probability_B
 ...
