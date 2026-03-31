@@ -22,10 +22,10 @@ providers:
   - name: pdf          # Direct download + text extraction for PDF URLs
     enabled: true
 
-  - name: crawl4ai     # Headless Chromium — catches JS-heavy SPAs
+  - name: jina         # Free, fast — handles ~70% of static/simple sites
     enabled: true
 
-  - name: jina         # Free, fast — handles ~70% of static/simple sites
+  - name: crawl4ai     # Headless Chromium — catches JS-heavy SPAs
     enabled: true
 
   - name: firecrawl    # Paid API — last resort for bot-protected sites

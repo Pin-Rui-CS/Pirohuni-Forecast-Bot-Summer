@@ -89,36 +89,51 @@ _BOILERPLATE_PATTERNS = [
 ]
 
 _FRONTMATTER = re.compile(r'^---\n.*?\n---\n', re.DOTALL)
-# Strips URLs from inline markdown links, keeping only the visible text.
-# Images are removed entirely; regular links keep their label.
-# Must run BEFORE boilerplate filtering so that content like
-# [Grand Chamber Judgment](url) survives as plain text rather than
-# being caught by the bare-markdown-link boilerplate pattern.
-_MD_LINK = re.compile(r'!\[[^\]]*\]\([^)]*\)|\[([^\]]+)\]\([^)]*\)')
+# Matches markdown links/images — two variants depending on whether we need
+# to capture the URL.
+# Group layout for _MD_LINK_KEEP_URL: group(1)=label, group(2)=url
+_MD_LINK_STRIP = re.compile(r'!\[[^\]]*\]\([^)]*\)|\[([^\]]+)\]\([^)]*\)')
+_MD_LINK_KEEP  = re.compile(r'!\[[^\]]*\]\([^)]*\)|\[([^\]]+)\]\(([^)]*)\)')
 
 
 def _strip_md_links(content: str) -> str:
     """Convert [text](url) → text and remove ![img](url) entirely."""
     def _replace(m: re.Match) -> str:
         if m.group(0).startswith('!'):
-            return ''       # image → remove
-        return m.group(1)   # link → keep label text only
-    return _MD_LINK.sub(_replace, content)
+            return ''
+        return m.group(1)
+    return _MD_LINK_STRIP.sub(_replace, content)
 
 
-def _clean_content(content: str, max_chars: int = _MAX_CONTENT_CHARS) -> str:
+def _inline_md_links(content: str) -> str:
+    """Convert [text](url) → text (url) and remove ![img](url) entirely.
+
+    Preserves the URL as plain text so the LLM can identify follow-up links,
+    while still removing markdown syntax so the boilerplate filter (which
+    matches raw [text](url) lines) does not accidentally drop useful entries.
+    """
+    def _replace(m: re.Match) -> str:
+        if m.group(0).startswith('!'):
+            return ''
+        url = (m.group(2) or "").strip()
+        return f"{m.group(1)} ({url})" if url else m.group(1)
+    return _MD_LINK_KEEP.sub(_replace, content)
+
+
+def _clean_content(content: str, max_chars: int = _MAX_CONTENT_CHARS, keep_urls: bool = False) -> str:
     """Heuristic cleanup of scraped markdown:
 
     1. Strip YAML frontmatter (added by the scraper's save_result helper).
-    2. Convert markdown links to plain text ([text](url) → text) so that
-       content labels like "Grand Chamber Judgment" survive as searchable
-       plain text and aren't discarded by the bare-link boilerplate filter.
+    2. Handle markdown links:
+       - keep_urls=False (default): [text](url) → text  (URL discarded)
+       - keep_urls=True:            [text](url) → text (url)  (URL kept as plain text)
+       Images are removed in both modes.
     3. Drop obvious boilerplate lines (cookie notices, bare nav links, etc.).
     4. Collapse runs of blank lines to at most two.
     5. Truncate to max_chars with a notice.
     """
     content = _FRONTMATTER.sub("", content).strip()
-    content = _strip_md_links(content)
+    content = _inline_md_links(content) if keep_urls else _strip_md_links(content)
 
     lines = [
         line for line in content.splitlines()
@@ -198,6 +213,19 @@ def _build_summary_prompt(
         "**4. KEY AMBIGUITY:** Is there any mismatch between what the resolution criteria "
         "require (exact labels, specific page, date ranges) and what the source actually "
         "displays? Flag any labeling, formatting, or scoping issues.\n\n"
+        "### Step 3: IDENTIFY FOLLOW-UP LINKS\n"
+        "If this page appears to be an index, table of contents, or search results page "
+        "that links to more detailed sub-pages containing the actual historical data "
+        "(rather than containing the data directly), identify up to 10 relevant linked "
+        "URLs from the page content. Include ALL historical data links (e.g. every "
+        "weekly report listed) — older entries matter as much as recent ones for "
+        "establishing a pattern. Only include absolute HTTP/HTTPS URLs present in the "
+        "page content. If the page already contains the data directly, omit this section.\n\n"
+        "If follow-up links are warranted, append them at the very end of your response "
+        "in this exact format (nothing after it):\n\n"
+        "## FOLLOW_UP_LINKS\n"
+        "- https://example.com/relevant-page-1\n"
+        "- https://example.com/relevant-page-2\n\n"
         "## IMPORTANT RULES\n"
         "- Base your summary ONLY on what is actually present in the web page content "
         "provided above.\n"
@@ -243,7 +271,92 @@ async def _llm_summarize(
 
 
 # ===========================================================================
-# 4. Main pipeline
+# 4. Follow-up link extraction and compilation
+# ===========================================================================
+
+_FOLLOW_UP_SECTION = re.compile(
+    r'##\s*FOLLOW_UP_LINKS\s*\n((?:\s*-\s*https?://[^\s]+\s*\n?)+)',
+    re.IGNORECASE,
+)
+
+
+def _extract_follow_up_links(llm_response: str) -> tuple[str, list[str]]:
+    """Parse the FOLLOW_UP_LINKS section from an LLM response.
+
+    Returns (cleaned_response, list_of_urls) where cleaned_response has the
+    section stripped out.
+    """
+    match = _FOLLOW_UP_SECTION.search(llm_response)
+    if not match:
+        return llm_response, []
+
+    urls: list[str] = []
+    for line in match.group(1).splitlines():
+        line = line.strip().lstrip("- ").strip()
+        if line.startswith("http"):
+            # Apply the same domain exclusions as extract_urls
+            domain = urlparse(line).netloc.lower().removeprefix("www.")
+            if not any(excl in domain for excl in _EXCLUDED_DOMAINS):
+                urls.append(line)
+
+    cleaned = llm_response[: match.start()].rstrip()
+    return cleaned, urls
+
+
+def _build_compile_prompt(
+    question_text: str,
+    resolution_criteria: str,
+    summaries: list[tuple[str, str]],
+) -> str:
+    summaries_text = "\n\n---\n\n".join(
+        f"### Source: {url}\n{summary}" for url, summary in summaries
+    )
+    return (
+        "You are a research assistant helping a forecaster. "
+        "You have been given summaries from multiple web pages relevant to a forecast "
+        "question. Compile them into a single coherent report.\n\n"
+        f"## Forecast Question\n{question_text}\n\n"
+        f"## Resolution Criteria\n{resolution_criteria}\n\n"
+        f"## Individual Page Summaries\n\n{summaries_text}\n\n"
+        "## Task\n"
+        "Synthesize all of the above into a single structured report using exactly "
+        "these four sections:\n\n"
+        "**1. CURRENT STATE:** What do the sources collectively show? Combine the most "
+        "recent relevant entries across all sources with their dates and labels.\n\n"
+        "**2. GAP TO RESOLUTION:** What exactly would need to appear/change for this "
+        "question to resolve Yes? Has any part of the criteria already been met?\n\n"
+        "**3. HISTORICAL PATTERN:** Combine the historical patterns across all sources. "
+        "Note cadence, gaps, and how long it has been since the last qualifying entry.\n\n"
+        "**4. KEY AMBIGUITY:** Note any conflicts between sources, or gaps in coverage.\n\n"
+        "Base your report only on the summaries provided. Do not speculate beyond them."
+    )
+
+
+async def _compile_summaries(
+    question_text: str,
+    resolution_criteria: str,
+    summaries: list[tuple[str, str]],
+    model: str,
+) -> str:
+    """Ask the LLM to compile multiple page summaries into one coherent report."""
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ["OPENROUTER_API_KEY"],
+    )
+    prompt = _build_compile_prompt(question_text, resolution_criteria, summaries)
+    response = await client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2000,
+        temperature=0.1,
+    )
+    return response.choices[0].message.content.strip()
+
+
+# ===========================================================================
+# 5. Main pipeline
 # ===========================================================================
 
 async def scrape_resolution_sources(
@@ -280,6 +393,9 @@ async def scrape_resolution_sources(
     results = await scrape_batch(urls, max_concurrent=max_concurrent, timeout=timeout)
 
     sections: list[str] = []
+    # Accumulates (url, summary) pairs for the final compilation step.
+    all_summaries: list[tuple[str, str]] = []
+
     for result in results:
         if not result.success:
             logger.warning("Failed to scrape %s: %s", result.url, result.error)
@@ -289,9 +405,10 @@ async def scrape_resolution_sources(
             continue
 
         # When LLM cleaning is enabled, defer char truncation to the LLM's own
-        # input limit so the LLM sees as much of the page as possible.
+        # input limit so the LLM sees as much of the page as possible, and
+        # preserve URLs so the LLM can identify follow-up links.
         heuristic_max = _LLM_MAX_INPUT if use_llm_cleaning else _MAX_CONTENT_CHARS
-        cleaned = _clean_content(result.content, max_chars=heuristic_max)
+        cleaned = _clean_content(result.content, max_chars=heuristic_max, keep_urls=use_llm_cleaning)
 
         if not cleaned.strip():
             sections.append(
@@ -299,25 +416,109 @@ async def scrape_resolution_sources(
             )
             continue
 
+        follow_up_urls: list[str] = []
+
         if use_llm_cleaning:
             try:
-                cleaned = await _llm_summarize(
+                raw_summary = await _llm_summarize(
                     url=result.url,
                     content=cleaned,
                     question_text=question_text,
                     resolution_criteria=resolution_criteria,
                     model=llm_model,
                 )
+                cleaned, follow_up_urls = _extract_follow_up_links(raw_summary)
+                if follow_up_urls:
+                    logger.info(
+                        "LLM identified %d follow-up link(s) from %s: %s",
+                        len(follow_up_urls), result.url, follow_up_urls,
+                    )
             except Exception as exc:
-                logger.warning("LLM cleaning failed for %s: %s — using heuristic output", result.url, exc)
+                logger.warning(
+                    "LLM cleaning failed for %s: %s — using heuristic output",
+                    result.url, exc,
+                )
 
+        all_summaries.append((result.url, cleaned))
         sections.append(
             f"## Source: {result.url}\n"
             f"_Scraped via {result.provider_used}_\n\n"
             f"{cleaned}"
         )
 
+        # ------------------------------------------------------------------
+        # Follow-up scraping: scrape each link the LLM identified, summarize
+        # each one, and collect for the final compilation step.
+        # ------------------------------------------------------------------
+        if follow_up_urls:
+            follow_up_results = await scrape_batch(
+                follow_up_urls, max_concurrent=max_concurrent, timeout=timeout,
+            )
+            for fu_result in follow_up_results:
+                if not fu_result.success:
+                    logger.warning(
+                        "Failed to scrape follow-up %s: %s", fu_result.url, fu_result.error,
+                    )
+                    sections.append(
+                        f"## Follow-up Source: {fu_result.url}\n"
+                        f"_Scrape failed: {fu_result.error}_"
+                    )
+                    continue
+
+                fu_cleaned = _clean_content(fu_result.content, max_chars=_LLM_MAX_INPUT, keep_urls=False)
+                if not fu_cleaned.strip():
+                    sections.append(
+                        f"## Follow-up Source: {fu_result.url}\n"
+                        f"_No usable content extracted._"
+                    )
+                    continue
+
+                try:
+                    fu_summary = await _llm_summarize(
+                        url=fu_result.url,
+                        content=fu_cleaned,
+                        question_text=question_text,
+                        resolution_criteria=resolution_criteria,
+                        model=llm_model,
+                    )
+                    # Strip any follow-up links the LLM might add (no recursion)
+                    fu_summary, _ = _extract_follow_up_links(fu_summary)
+                except Exception as exc:
+                    logger.warning(
+                        "LLM cleaning failed for follow-up %s: %s — using heuristic output",
+                        fu_result.url, exc,
+                    )
+                    fu_summary = fu_cleaned
+
+                all_summaries.append((fu_result.url, fu_summary))
+                sections.append(
+                    f"## Follow-up Source: {fu_result.url}\n"
+                    f"_Scraped via {fu_result.provider_used}_\n\n"
+                    f"{fu_summary}"
+                )
+
     if not sections:
         return ""
+
+    # If we have multiple summaries (original + follow-ups), ask the LLM to
+    # compile them into one coherent report.
+    if use_llm_cleaning and len(all_summaries) > 1:
+        try:
+            compiled = await _compile_summaries(
+                question_text=question_text,
+                resolution_criteria=resolution_criteria,
+                summaries=all_summaries,
+                model=llm_model,
+            )
+            return (
+                "# Resolution Criteria Sources\n\n"
+                "## Compiled Report\n\n"
+                f"{compiled}\n\n"
+                "---\n\n"
+                "## Individual Source Summaries\n\n"
+                + "\n\n---\n\n".join(sections)
+            )
+        except Exception as exc:
+            logger.warning("Compilation step failed: %s — returning individual summaries", exc)
 
     return "# Resolution Criteria Sources\n\n" + "\n\n---\n\n".join(sections)
