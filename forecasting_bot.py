@@ -558,13 +558,13 @@ async def run_research(
         print(f"[SerpAPI] Research failed: {exc}")
 
     try:
-        polymarket_data = await asyncio.to_thread(_scrape_polymarket, question)
+        polymarket_data = await asyncio.to_thread(_scrape_polymarket, title)
         research = f"{research}\n\n{polymarket_data}"
     except Exception as exc:
         print(f"[Polymarket] Research failed: {exc}")
 
     try:
-        manifold_data = await asyncio.to_thread(_scrape_manifold, question)
+        manifold_data = await asyncio.to_thread(_scrape_manifold, title)
         research = f"{research}\n\n{manifold_data}"
     except Exception as exc:
         print(f"[Manifold] Research failed: {exc}")
@@ -932,7 +932,7 @@ Now examine the provided research material. Identify specific facts, signals, an
 For each significant piece of evidence:
 1. State the evidence clearly
 2. Assess its diagnostic value — does it shift the central estimate up or down, and does it widen or narrow the uncertainty?
-3. Apply the adjustment incrementally.
+3. Apply the adjustment incrementally by considering the weightage of the evidence.
 
 Guard against these biases:
 - Narrative bias: A compelling story is not the same as strong evidence
@@ -1735,7 +1735,7 @@ Now examine the provided research material. Identify specific facts, signals, an
 For each significant piece of evidence:
 1. State the evidence clearly
 2. Assess its diagnostic value — which option(s) does it favour, and by how much?
-3. Apply the adjustment incrementally, redistributing probability mass across options. Do not let any single piece of evidence dominate unless its weight is overwhelming.
+3. Apply the adjustment incrementally, redistributing probability mass across options. Consider the weightage of the evidence. Do not let a piece of evidence dominate unless its weight is overwhelming.
 
 Guard against these biases:
 - Narrative bias: A compelling story is not the same as strong evidence

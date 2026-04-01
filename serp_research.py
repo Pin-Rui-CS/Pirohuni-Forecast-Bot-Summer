@@ -95,8 +95,11 @@ async def _generate_search_queries(
         temperature=0.3,
     )
 
-    raw = response.choices[0].message.content.strip()
-    queries: list[str] = json.loads(raw)
+    raw = response.choices[0].message.content or ""
+    start, end = raw.find("["), raw.rfind("]")
+    if start == -1 or end <= start:
+        return []
+    queries: list[str] = json.loads(raw[start:end + 1])
     return [q.strip() for q in queries if q.strip()]
 
 
@@ -208,8 +211,11 @@ async def _rate_and_filter(
         temperature=0.1,
     )
 
-    scores_text = response.choices[0].message.content.strip()
-    scores: list[int] = json.loads(scores_text)
+    raw_scores = response.choices[0].message.content or ""
+    start, end = raw_scores.find("["), raw_scores.rfind("]")
+    if start == -1 or end <= start:
+        return []
+    scores: list[int] = json.loads(raw_scores[start:end + 1])
 
     for i, result in enumerate(results):
         result["score"] = scores[i] if i < len(scores) else 0
