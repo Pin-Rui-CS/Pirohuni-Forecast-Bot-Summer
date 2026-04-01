@@ -47,14 +47,67 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 _SERP_NUM_RESULTS = 10
 
 
-async def _search_serpapi(question: str) -> list[dict]:
-    """Query Google via SerpAPI and return a list of organic results.
+async def _generate_search_queries(
+    title: str,
+    resolution_criteria: str,
+    background: str,
+    fine_print: str,
+) -> list[str]:
+    """Use an LLM to generate 3-5 unique, non-overlapping Google search queries.
+
+    Each query targets a different angle of the forecasting question so that
+    the combined result set gives broad, non-redundant coverage.
+    """
+    client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ["OPENROUTER_API_KEY"],
+    )
+
+    context_parts = [f"Title: {title}"]
+    if resolution_criteria:
+        context_parts.append(f"Resolution criteria: {resolution_criteria}")
+    if background:
+        context_parts.append(f"Background: {background}")
+    if fine_print:
+        context_parts.append(f"Fine print: {fine_print}")
+    context = "\n\n".join(context_parts)
+
+    prompt = (
+        "You are helping a forecaster research a prediction question. "
+        "Generate 3 to 5 Google search queries that together give comprehensive, "
+        "non-overlapping coverage of the question.\n\n"
+        "Guidelines:\n"
+        "  - Each query should target a DIFFERENT angle: e.g. recent news, "
+        "historical base rates, expert opinion, official data sources, related events\n"
+        "  - Queries should be specific enough to return useful results but not so "
+        "narrow that they miss relevant pages\n"
+        "  - Avoid overlap — if one query covers recent news, another should cover "
+        "something different like statistics or policy context\n"
+        "  - Write queries as a person would type them into Google (no boolean syntax)\n\n"
+        f"Forecasting question context:\n{context}\n\n"
+        'Respond with ONLY a JSON array of strings. Example: ["query one", "query two", "query three"]'
+    )
+
+    response = await client.chat.completions.create(
+        model="anthropic/claude-sonnet-4.6",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=200,
+        temperature=0.3,
+    )
+
+    raw = response.choices[0].message.content.strip()
+    queries: list[str] = json.loads(raw)
+    return [q.strip() for q in queries if q.strip()]
+
+
+async def _search_serpapi(query: str) -> list[dict]:
+    """Query Google via SerpAPI for a single query string.
 
     Each item has keys: title, url, date (may be empty string).
     """
     params = {
         "engine": "google",
-        "q": question,
+        "q": query,
         "api_key": SERPAPI_API_KEY,
         "num": _SERP_NUM_RESULTS,
     }
@@ -77,15 +130,40 @@ async def _search_serpapi(question: str) -> list[dict]:
     return results
 
 
+async def _multi_search_serpapi(queries: list[str]) -> list[dict]:
+    """Run all queries in parallel and return deduplicated results by URL."""
+    search_tasks = [_search_serpapi(q) for q in queries]
+    per_query_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+    seen_urls: set[str] = set()
+    merged: list[dict] = []
+    for result in per_query_results:
+        if isinstance(result, Exception):
+            logger.warning("[SerpAPI] A search query failed: %s", result)
+            continue
+        for item in result:
+            url = item.get("url", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                merged.append(item)
+    return merged
+
+
 # ===========================================================================
 # 2. LLM relevance scoring
 # ===========================================================================
 
 _MIN_RELEVANCE_SCORE = 7
-_TOP_N = 3
+_TOP_N = 5
 
 
-async def _rate_and_filter(question: str, results: list[dict]) -> list[dict]:
+async def _rate_and_filter(
+    title: str,
+    resolution_criteria: str,
+    background: str,
+    fine_print: str,
+    results: list[dict],
+) -> list[dict]:
     """Score each result for relevance to the question using a single LLM call.
 
     Returns the subset with score >= _MIN_RELEVANCE_SCORE, sorted descending,
@@ -96,6 +174,15 @@ async def _rate_and_filter(question: str, results: list[dict]) -> list[dict]:
         api_key=os.environ["OPENROUTER_API_KEY"],
     )
 
+    context_parts = [f"Title: {title}"]
+    if resolution_criteria:
+        context_parts.append(f"Resolution criteria: {resolution_criteria}")
+    if background:
+        context_parts.append(f"Background: {background}")
+    if fine_print:
+        context_parts.append(f"Fine print: {fine_print}")
+    context = "\n\n".join(context_parts)
+
     numbered_results = "\n".join(
         f"{i + 1}. Title: {r['title']}\n   URL: {r['url']}\n   Date: {r['date'] or 'unknown'}"
         for i, r in enumerate(results)
@@ -103,7 +190,7 @@ async def _rate_and_filter(question: str, results: list[dict]) -> list[dict]:
 
     prompt = (
         "You are evaluating web search results for relevance to a forecasting question.\n\n"
-        f"Question: {question}\n\n"
+        f"Forecasting question:\n{context}\n\n"
         f"Search Results:\n{numbered_results}\n\n"
         "For each result, assign a relevance score from 0 to 10:\n"
         "  10 = directly and specifically addresses the question with likely current data\n"
@@ -117,7 +204,7 @@ async def _rate_and_filter(question: str, results: list[dict]) -> list[dict]:
     response = await client.chat.completions.create(
         model="anthropic/claude-sonnet-4.6",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=100,
+        max_tokens=200,
         temperature=0.1,
     )
 
@@ -278,20 +365,32 @@ async def _scrape_url(url: str, allow_firecrawl: bool, timeout: int = 30) -> Scr
 # 5. Main pipeline
 # ===========================================================================
 
-async def run_serp_research(question: str) -> str:
+async def run_serp_research(
+    title: str,
+    resolution_criteria: str = "",
+    background: str = "",
+    fine_print: str = "",
+) -> str:
     """Full SerpAPI research pipeline.
 
-    Searches Google, scores results for relevance, scrapes the top URLs, and
-    returns a formatted string suitable for appending to an LLM prompt.
+    Generates 3-5 targeted search queries from the full question context,
+    searches Google for each in parallel, deduplicates by URL, scores results
+    for relevance, scrapes the top URLs, and returns a formatted string
+    suitable for appending to an LLM prompt.
     Returns an empty string if no results pass the relevance threshold.
     Firecrawl is used only for results with score >= 9.
     """
-    results = await _search_serpapi(question)
-    if not results:
-        logger.info("[SerpAPI] No organic results returned for: %s", question)
+    queries = await _generate_search_queries(title, resolution_criteria, background, fine_print)
+    if not queries:
+        logger.warning("[SerpAPI] Query generation returned no queries for: %s", title)
         return ""
 
-    top = await _rate_and_filter(question, results)
+    results = await _multi_search_serpapi(queries)
+    if not results:
+        logger.info("[SerpAPI] No organic results returned for: %s", title)
+        return ""
+
+    top = await _rate_and_filter(title, resolution_criteria, background, fine_print, results)
     if not top:
         logger.info("[SerpAPI] No results met the relevance threshold.")
         return ""
@@ -317,7 +416,7 @@ async def run_serp_research(question: str) -> str:
         return ""
 
     llm_results = await asyncio.gather(*[
-        _llm_clean_content(question, meta["url"], heuristic)
+        _llm_clean_content(title, meta["url"], heuristic)
         for _, meta, heuristic in to_llm_clean
     ], return_exceptions=True)
 

@@ -36,6 +36,8 @@ refined_forecast.py
 debugging_bot.py
 test_resolution_criteria_scraper.py
 newsapi_research.py
+run_custom_forecast.py
+scrape_inspect_fluview.py
 
 # Claude Code local config
 .claude/

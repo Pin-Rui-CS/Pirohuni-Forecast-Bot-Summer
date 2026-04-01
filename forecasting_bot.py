@@ -28,7 +28,7 @@ from serp_research import run_serp_research
 ######################### CONSTANTS #########################
 # Constants
 NUM_RUNS_PER_QUESTION = (
-    4  # The median forecast is taken between NUM_RUNS_PER_QUESTION runs
+    3  # The median forecast is taken between NUM_RUNS_PER_QUESTION runs
 )
 SKIP_PREVIOUSLY_FORECASTED_QUESTIONS = True
 METACULUS_MAX_CONCURRENT_REQUESTS = int(
@@ -529,24 +529,29 @@ async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temper
         return answer
 
 
-async def run_research(question: str) -> str:
+async def run_research(
+    title: str,
+    resolution_criteria: str = "",
+    background: str = "",
+    fine_print: str = "",
+) -> str:
     """
     Run research using AskNews, Exa/SmartSearcher, or Perplexity, then append
-    Polymarket crowd probabilities for any matching markets.
+    SerpAPI web research, Polymarket, and Manifold crowd probabilities.
     This function is async-safe and will run blocking SDK calls in a thread.
     """
     research = ""
     if ASKNEWS_CLIENT_ID and ASKNEWS_SECRET:
-        research = await asyncio.to_thread(call_asknews_fast, question)
+        research = await asyncio.to_thread(call_asknews_fast, title)
     elif EXA_API_KEY:
-        research = await call_exa_smart_searcher(question)
+        research = await call_exa_smart_searcher(title)
     elif PERPLEXITY_API_KEY:
-        research = await call_perplexity(question)
+        research = await call_perplexity(title)
     else:
         research = "No research done"
 
     try:
-        serp_data = await run_serp_research(question)
+        serp_data = await run_serp_research(title, resolution_criteria, background, fine_print)
         if serp_data:
             research = f"{research}\n\n{serp_data}"
     except Exception as exc:
@@ -776,7 +781,7 @@ async def get_binary_gpt_prediction(
     fine_print = question_details["fine_print"]
 
     summary_report, _scraped = await asyncio.gather(
-        run_research(title),
+        run_research(title, resolution_criteria, background, fine_print),
         scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
     )
     resolution_source_data = (
@@ -1595,7 +1600,7 @@ async def get_numeric_gpt_prediction(
     grid = np.linspace(lower_bound, upper_bound, cdf_size)
 
     summary_report, _scraped = await asyncio.gather(
-        run_research(title),
+        run_research(title, resolution_criteria, background, fine_print),
         scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
     )
     resolution_source_data = (
@@ -1886,7 +1891,7 @@ async def get_multiple_choice_gpt_prediction(
     options = question_details["options"]
 
     summary_report, _scraped = await asyncio.gather(
-        run_research(title),
+        run_research(title, resolution_criteria, background, fine_print),
         scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
     )
     resolution_source_data = (
