@@ -4,7 +4,8 @@ Takes the resolution criteria text of a forecast question, extracts any URLs
 embedded in it, scrapes those URLs, and returns clean formatted content ready
 for an LLM to read when making a forecast.
 
-NOT integrated into the main pipeline yet — test with test_resolution_criteria_scraper.py first.
+Integrated into forecasting_bot.py (imported at module level, called with use_llm_cleaning=True
+for binary, numeric, and multiple-choice question types).
 
 Usage:
     import asyncio

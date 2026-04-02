@@ -41,9 +41,9 @@ Web Scraper/
 │       ├── base.py        # UrlAdapter ABC
 │       └── google_trends.py  # trends.google.com → SerpAPI
 ├── config.yaml            # Enable/disable/reorder providers and adapters here
+├── pyproject.toml
 ├── requirements.txt
 ├── .env.example
-├── example.py
 └── results/               # Created automatically — one .md file per scraped URL
 ```
 
