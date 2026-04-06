@@ -38,6 +38,24 @@ from scraper import scrape_batch  # noqa: E402  (path inserted above)
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Import the Jina Crawler by file path to avoid naming collision.
+# Both Web Scraper and Jina Crawler expose a module named 'scraper', so
+# sys.path cannot be used — we load it under a unique alias instead.
+# ---------------------------------------------------------------------------
+import importlib.util as _importlib_util
+
+_jina_scraper = None
+try:
+    _jina_spec = _importlib_util.spec_from_file_location(
+        "jina_crawler_scraper",
+        Path(__file__).parent / "Jina Crawler" / "scraper.py",
+    )
+    _jina_scraper = _importlib_util.module_from_spec(_jina_spec)
+    _jina_spec.loader.exec_module(_jina_scraper)
+except Exception as _jina_import_err:
+    logger.warning("Jina Crawler could not be imported: %s — will skip it", _jina_import_err)
+
 
 # ===========================================================================
 # 1. URL extraction
@@ -357,7 +375,41 @@ async def _compile_summaries(
 
 
 # ===========================================================================
-# 5. Main pipeline
+# 5. Jina Crawler integration
+# ===========================================================================
+
+async def _try_jina_crawler(
+    url: str,
+    question_text: str,
+    resolution_criteria: str,
+    model: str,
+    max_pages: int = 20,
+) -> str | None:
+    """Try scraping a URL with the Jina Crawler's LLM-driven crawl.
+
+    Returns an already-formatted synthesis string on success, or None if the
+    crawl fails or finds nothing relevant. The caller should fall back to the
+    Web Scraper pipeline on None.
+    """
+    if _jina_scraper is None:
+        return None
+    try:
+        result = await _jina_scraper.scrape_for_forecast(
+            url=url,
+            question=question_text,
+            focus=resolution_criteria,
+            analysis_model=model,
+            synthesis_model=model,
+            max_pages=max_pages,
+        )
+        return result if result.strip() else None
+    except Exception as exc:
+        logger.warning("Jina Crawler failed for %s: %s — will fall back to Web Scraper", url, exc)
+        return None
+
+
+# ===========================================================================
+# 6. Main pipeline
 # ===========================================================================
 
 async def scrape_resolution_sources(
@@ -391,112 +443,146 @@ async def scrape_resolution_sources(
 
     logger.info("Found %d URL(s) in resolution criteria: %s", len(urls), urls)
 
-    results = await scrape_batch(urls, max_concurrent=max_concurrent, timeout=timeout)
-
     sections: list[str] = []
     # Accumulates (url, summary) pairs for the final compilation step.
     all_summaries: list[tuple[str, str]] = []
 
-    for result in results:
-        if not result.success:
-            logger.warning("Failed to scrape %s: %s", result.url, result.error)
-            sections.append(
-                f"## Source: {result.url}\n_Scrape failed: {result.error}_"
+    # ------------------------------------------------------------------
+    # Step 1: Jina Crawler (use_llm_cleaning only)
+    # Try each URL with the LLM-driven crawl. URLs it handles are added
+    # directly — their output is already formatted, no further cleaning
+    # or summarization needed. Failed URLs are queued for Web Scraper.
+    # ------------------------------------------------------------------
+    web_scraper_urls: list[str] = []
+
+    if use_llm_cleaning:
+        for url in urls:
+            logger.info("Trying Jina Crawler for %s", url)
+            jina_result = await _try_jina_crawler(
+                url=url,
+                question_text=question_text,
+                resolution_criteria=resolution_criteria,
+                model=llm_model,
             )
-            continue
-
-        # When LLM cleaning is enabled, defer char truncation to the LLM's own
-        # input limit so the LLM sees as much of the page as possible, and
-        # preserve URLs so the LLM can identify follow-up links.
-        heuristic_max = _LLM_MAX_INPUT if use_llm_cleaning else _MAX_CONTENT_CHARS
-        cleaned = _clean_content(result.content, max_chars=heuristic_max, keep_urls=use_llm_cleaning)
-
-        if not cleaned.strip():
-            sections.append(
-                f"## Source: {result.url}\n_No usable content extracted._"
-            )
-            continue
-
-        follow_up_urls: list[str] = []
-
-        if use_llm_cleaning:
-            try:
-                raw_summary = await _llm_summarize(
-                    url=result.url,
-                    content=cleaned,
-                    question_text=question_text,
-                    resolution_criteria=resolution_criteria,
-                    model=llm_model,
+            if jina_result:
+                all_summaries.append((url, jina_result))
+                sections.append(
+                    f"## Source: {url}\n"
+                    f"_Scraped via Jina Crawler_\n\n"
+                    f"{jina_result}"
                 )
-                cleaned, follow_up_urls = _extract_follow_up_links(raw_summary)
-                if follow_up_urls:
-                    logger.info(
-                        "LLM identified %d follow-up link(s) from %s: %s",
-                        len(follow_up_urls), result.url, follow_up_urls,
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "LLM cleaning failed for %s: %s — using heuristic output",
-                    result.url, exc,
+            else:
+                logger.info("Jina Crawler returned nothing for %s — queuing for Web Scraper", url)
+                web_scraper_urls.append(url)
+    else:
+        web_scraper_urls = list(urls)
+
+    # ------------------------------------------------------------------
+    # Step 2: Web Scraper fallback for any URLs Jina Crawler didn't handle
+    # ------------------------------------------------------------------
+    if web_scraper_urls:
+        results = await scrape_batch(web_scraper_urls, max_concurrent=max_concurrent, timeout=timeout)
+
+        for result in results:
+            if not result.success:
+                logger.warning("Failed to scrape %s: %s", result.url, result.error)
+                sections.append(
+                    f"## Source: {result.url}\n_Scrape failed: {result.error}_"
                 )
+                continue
 
-        all_summaries.append((result.url, cleaned))
-        sections.append(
-            f"## Source: {result.url}\n"
-            f"_Scraped via {result.provider_used}_\n\n"
-            f"{cleaned}"
-        )
+            # When LLM cleaning is enabled, defer char truncation to the LLM's own
+            # input limit so the LLM sees as much of the page as possible, and
+            # preserve URLs so the LLM can identify follow-up links.
+            heuristic_max = _LLM_MAX_INPUT if use_llm_cleaning else _MAX_CONTENT_CHARS
+            cleaned = _clean_content(result.content, max_chars=heuristic_max, keep_urls=use_llm_cleaning)
 
-        # ------------------------------------------------------------------
-        # Follow-up scraping: scrape each link the LLM identified, summarize
-        # each one, and collect for the final compilation step.
-        # ------------------------------------------------------------------
-        if follow_up_urls:
-            follow_up_results = await scrape_batch(
-                follow_up_urls, max_concurrent=max_concurrent, timeout=timeout,
-            )
-            for fu_result in follow_up_results:
-                if not fu_result.success:
-                    logger.warning(
-                        "Failed to scrape follow-up %s: %s", fu_result.url, fu_result.error,
-                    )
-                    sections.append(
-                        f"## Follow-up Source: {fu_result.url}\n"
-                        f"_Scrape failed: {fu_result.error}_"
-                    )
-                    continue
+            if not cleaned.strip():
+                sections.append(
+                    f"## Source: {result.url}\n_No usable content extracted._"
+                )
+                continue
 
-                fu_cleaned = _clean_content(fu_result.content, max_chars=_LLM_MAX_INPUT, keep_urls=False)
-                if not fu_cleaned.strip():
-                    sections.append(
-                        f"## Follow-up Source: {fu_result.url}\n"
-                        f"_No usable content extracted._"
-                    )
-                    continue
+            follow_up_urls: list[str] = []
 
+            if use_llm_cleaning:
                 try:
-                    fu_summary = await _llm_summarize(
-                        url=fu_result.url,
-                        content=fu_cleaned,
+                    raw_summary = await _llm_summarize(
+                        url=result.url,
+                        content=cleaned,
                         question_text=question_text,
                         resolution_criteria=resolution_criteria,
                         model=llm_model,
                     )
-                    # Strip any follow-up links the LLM might add (no recursion)
-                    fu_summary, _ = _extract_follow_up_links(fu_summary)
+                    cleaned, follow_up_urls = _extract_follow_up_links(raw_summary)
+                    if follow_up_urls:
+                        logger.info(
+                            "LLM identified %d follow-up link(s) from %s: %s",
+                            len(follow_up_urls), result.url, follow_up_urls,
+                        )
                 except Exception as exc:
                     logger.warning(
-                        "LLM cleaning failed for follow-up %s: %s — using heuristic output",
-                        fu_result.url, exc,
+                        "LLM cleaning failed for %s: %s — using heuristic output",
+                        result.url, exc,
                     )
-                    fu_summary = fu_cleaned
 
-                all_summaries.append((fu_result.url, fu_summary))
-                sections.append(
-                    f"## Follow-up Source: {fu_result.url}\n"
-                    f"_Scraped via {fu_result.provider_used}_\n\n"
-                    f"{fu_summary}"
+            all_summaries.append((result.url, cleaned))
+            sections.append(
+                f"## Source: {result.url}\n"
+                f"_Scraped via {result.provider_used}_\n\n"
+                f"{cleaned}"
+            )
+
+            # ------------------------------------------------------------------
+            # Follow-up scraping: scrape each link the LLM identified, summarize
+            # each one, and collect for the final compilation step.
+            # ------------------------------------------------------------------
+            if follow_up_urls:
+                follow_up_results = await scrape_batch(
+                    follow_up_urls, max_concurrent=max_concurrent, timeout=timeout,
                 )
+                for fu_result in follow_up_results:
+                    if not fu_result.success:
+                        logger.warning(
+                            "Failed to scrape follow-up %s: %s", fu_result.url, fu_result.error,
+                        )
+                        sections.append(
+                            f"## Follow-up Source: {fu_result.url}\n"
+                            f"_Scrape failed: {fu_result.error}_"
+                        )
+                        continue
+
+                    fu_cleaned = _clean_content(fu_result.content, max_chars=_LLM_MAX_INPUT, keep_urls=False)
+                    if not fu_cleaned.strip():
+                        sections.append(
+                            f"## Follow-up Source: {fu_result.url}\n"
+                            f"_No usable content extracted._"
+                        )
+                        continue
+
+                    try:
+                        fu_summary = await _llm_summarize(
+                            url=fu_result.url,
+                            content=fu_cleaned,
+                            question_text=question_text,
+                            resolution_criteria=resolution_criteria,
+                            model=llm_model,
+                        )
+                        # Strip any follow-up links the LLM might add (no recursion)
+                        fu_summary, _ = _extract_follow_up_links(fu_summary)
+                    except Exception as exc:
+                        logger.warning(
+                            "LLM cleaning failed for follow-up %s: %s — using heuristic output",
+                            fu_result.url, exc,
+                        )
+                        fu_summary = fu_cleaned
+
+                    all_summaries.append((fu_result.url, fu_summary))
+                    sections.append(
+                        f"## Follow-up Source: {fu_result.url}\n"
+                        f"_Scraped via {fu_result.provider_used}_\n\n"
+                        f"{fu_summary}"
+                    )
 
     if not sections:
         return ""

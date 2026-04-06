@@ -23,7 +23,9 @@ from asknews_research import call_asknews_fast
 from polymarket_research import scrape_polymarket as _scrape_polymarket
 from manifold_research import scrape_manifold as _scrape_manifold
 from resolution_criteria_scraper import scrape_resolution_sources
+from fine_print_scraper import scrape_fine_print_sources
 from serp_research import run_serp_research
+from tavily_research import run_tavily_research
 
 ######################### CONSTANTS #########################
 # Constants
@@ -49,6 +51,7 @@ OPENAI_API_KEY = os.getenv(
     "OPENAI_API_KEY"
 )  # You'll also need the OpenAI API Key if you want to use the Exa Smart Searcher
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 # The tournament IDs below can be used for testing your bot.
 Q4_2024_AI_BENCHMARKING_ID = 32506
 Q1_2025_AI_BENCHMARKING_ID = 32627
@@ -550,12 +553,21 @@ async def run_research(
     else:
         research = "No research done"
 
-    try:
-        serp_data = await run_serp_research(title, resolution_criteria, background, fine_print)
-        if serp_data:
-            research = f"{research}\n\n{serp_data}"
-    except Exception as exc:
-        print(f"[SerpAPI] Research failed: {exc}")
+    web_search_data = ""
+    if SERPAPI_API_KEY:
+        try:
+            web_search_data = await run_serp_research(title, resolution_criteria, background, fine_print)
+        except Exception as exc:
+            print(f"[SerpAPI] Research failed: {exc}")
+
+    if not web_search_data and TAVILY_API_KEY:
+        try:
+            web_search_data = await run_tavily_research(title, resolution_criteria, background, fine_print)
+        except Exception as exc:
+            print(f"[Tavily] Research failed: {exc}")
+
+    if web_search_data:
+        research = f"{research}\n\n{web_search_data}"
 
     try:
         polymarket_data = await asyncio.to_thread(_scrape_polymarket, title)
@@ -665,6 +677,8 @@ Today is {today}.
 ## Research Material
 
 {resolution_source_data}
+
+{fine_print_source_data}
 
 {summary_report}
 
@@ -780,9 +794,10 @@ async def get_binary_gpt_prediction(
     background = question_details["description"]
     fine_print = question_details["fine_print"]
 
-    summary_report, _scraped = await asyncio.gather(
+    summary_report, _scraped, _fp_scraped = await asyncio.gather(
         run_research(title, resolution_criteria, background, fine_print),
         scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
+        scrape_fine_print_sources(fine_print, title, use_llm_cleaning=True),
     )
     resolution_source_data = (
         "## Resolution Criteria Source Data\n"
@@ -792,6 +807,12 @@ async def get_binary_gpt_prediction(
         "this question resolves.\n\n"
         f"{_scraped}"
     ) if _scraped else ""
+    fine_print_source_data = (
+        "## Fine Print Source Data\n"
+        "The following data was scraped from URLs referenced in the fine print "
+        "at the time of forecasting.\n\n"
+        f"{_fp_scraped}"
+    ) if _fp_scraped else ""
 
     content = BINARY_PROMPT_TEMPLATE.format(
         title=title,
@@ -801,6 +822,7 @@ async def get_binary_gpt_prediction(
         fine_print=fine_print,
         summary_report=summary_report,
         resolution_source_data=resolution_source_data,
+        fine_print_source_data=fine_print_source_data,
     )
     log_prediction_prompt("binary", title, content)
 
@@ -904,6 +926,8 @@ Today is {today}.
 ## Research Material
 
 {resolution_source_data}
+
+{fine_print_source_data}
 
 {summary_report}
 
@@ -1599,9 +1623,10 @@ async def get_numeric_gpt_prediction(
 
     grid = np.linspace(lower_bound, upper_bound, cdf_size)
 
-    summary_report, _scraped = await asyncio.gather(
+    summary_report, _scraped, _fp_scraped = await asyncio.gather(
         run_research(title, resolution_criteria, background, fine_print),
         scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
+        scrape_fine_print_sources(fine_print, title, use_llm_cleaning=True),
     )
     resolution_source_data = (
         "## Resolution Criteria Source Data\n"
@@ -1611,6 +1636,12 @@ async def get_numeric_gpt_prediction(
         "this question resolves.\n\n"
         f"{_scraped}"
     ) if _scraped else ""
+    fine_print_source_data = (
+        "## Fine Print Source Data\n"
+        "The following data was scraped from URLs referenced in the fine print "
+        "at the time of forecasting.\n\n"
+        f"{_fp_scraped}"
+    ) if _fp_scraped else ""
 
     reasoning_prompt = NUMERIC_PROMPT_TEMPLATE.format(
         title=title,
@@ -1620,6 +1651,7 @@ async def get_numeric_gpt_prediction(
         fine_print=fine_print,
         summary_report=summary_report,
         resolution_source_data=resolution_source_data,
+        fine_print_source_data=fine_print_source_data,
         lower_bound_message=lower_bound_message,
         upper_bound_message=upper_bound_message,
         units=unit_of_measure,
@@ -1708,6 +1740,8 @@ Today is {today}.
 ## Research Material
 
 {resolution_source_data}
+
+{fine_print_source_data}
 
 {summary_report}
 
@@ -1890,9 +1924,10 @@ async def get_multiple_choice_gpt_prediction(
     fine_print = question_details["fine_print"]
     options = question_details["options"]
 
-    summary_report, _scraped = await asyncio.gather(
+    summary_report, _scraped, _fp_scraped = await asyncio.gather(
         run_research(title, resolution_criteria, background, fine_print),
         scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
+        scrape_fine_print_sources(fine_print, title, use_llm_cleaning=True),
     )
     resolution_source_data = (
         "## Resolution Criteria Source Data\n"
@@ -1902,6 +1937,12 @@ async def get_multiple_choice_gpt_prediction(
         "this question resolves.\n\n"
         f"{_scraped}"
     ) if _scraped else ""
+    fine_print_source_data = (
+        "## Fine Print Source Data\n"
+        "The following data was scraped from URLs referenced in the fine print "
+        "at the time of forecasting.\n\n"
+        f"{_fp_scraped}"
+    ) if _fp_scraped else ""
 
     content = MULTIPLE_CHOICE_PROMPT_TEMPLATE.format(
         title=title,
@@ -1911,6 +1952,7 @@ async def get_multiple_choice_gpt_prediction(
         fine_print=fine_print,
         summary_report=summary_report,
         resolution_source_data=resolution_source_data,
+        fine_print_source_data=fine_print_source_data,
         options=options,
     )
     log_prediction_prompt("multiple_choice", title, content)

@@ -1,0 +1,21 @@
+# Jina Scraper Configuration
+
+url      = "https://www.realclearpolling.com/polls/approval/donald-trump/approval-rating"
+question = "Will Donald Trump's approval rating in the RealClearPolitics poll average fall strictly below 39.0% before May 1, 2026?"
+focus    = "rating, approval, historical data, trends"
+output   = "output.md"
+
+# How many pages to visit at most (LLM may stop earlier if it has enough evidence)
+max_pages = 20
+
+# Technical
+concurrency = 5
+verbose     = false
+
+# AI models via OpenRouter (requires OPENROUTER_API_KEY in .env)
+# analysis_model: called once per page — use a fast/cheap model
+# synthesis_model: called once at the end — use the most capable model
+analysis_model  = "anthropic/claude-sonnet-4-6"
+synthesis_model = "anthropic/claude-sonnet-4-6"
+
+# target_selector = "article, .main-content"  # uncomment to restrict content area

@@ -3,31 +3,25 @@ name: Forecast on new AI tournament questions
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
+    - cron: "0 * * * *" # runs every hour
 
-# Add concurrency group to prevent parallel runs
+# Prevent parallel runs
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
-  
-# Daily job to run the simple forecast bot
-# Daily job to run the simple forecast bot
+
 jobs:
   forecast_job:
     runs-on: ubuntu-latest
-
     steps:
-      # Checkout repo
       - name: Check out repository
         uses: actions/checkout@v3
 
-      # Setup Python
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      # Install Poetry
       - name: Install Poetry
         uses: snok/install-poetry@v1
         with:
@@ -35,23 +29,41 @@ jobs:
           virtualenvs-in-project: true
           installer-parallel: true
 
-      # (Optional but recommended) Cache the virtualenv
       - name: Load cached venv
         uses: actions/cache@v4
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
 
-      # Install dependencies
-      - name: Install dependencies
-        run: |
-          poetry install --no-interaction --no-root
-          poetry run pip install -r "Web Scraper/requirements.txt"
+      - name: Install Python dependencies (Poetry)
+        run: poetry install --no-interaction --no-root
 
-      # Run the bot
-      - name: Run bot
-        run: poetry run python forecasting_bot.py --mode tournament --tournament spring-2026-ai minibench
+      - name: Install Web Scraper dependencies
+        run: poetry run pip install -r "Web Scraper/requirements.txt"
+
+      - name: Verify secrets are configured
+        run: |
+          echo "=== API Key Configuration ==="
+          echo "METACULUS_TOKEN:      $([ -n '${{ secrets.METACULUS_TOKEN }}'      ] && echo 'SET' || echo 'MISSING')"
+          echo "OPENROUTER_API_KEY:   $([ -n '${{ secrets.OPENROUTER_API_KEY }}'   ] && echo 'SET' || echo 'MISSING')"
+          echo "ASKNEWS_CLIENT_ID:    $([ -n '${{ secrets.ASKNEWS_CLIENT_ID }}'    ] && echo 'SET' || echo 'MISSING')"
+          echo "ASKNEWS_SECRET:       $([ -n '${{ secrets.ASKNEWS_SECRET }}'       ] && echo 'SET' || echo 'MISSING')"
+          echo "EXA_API_KEY:          $([ -n '${{ secrets.EXA_API_KEY }}'          ] && echo 'SET' || echo 'MISSING')"
+          echo "PERPLEXITY_API_KEY:   $([ -n '${{ secrets.PERPLEXITY_API_KEY }}'   ] && echo 'SET' || echo 'MISSING')"
+          echo "SERPAPI_API_KEY:      $([ -n '${{ secrets.SERPAPI_API_KEY }}'      ] && echo 'SET' || echo 'MISSING')"
+          echo "TAVILY_API_KEY:       $([ -n '${{ secrets.TAVILY_API_KEY }}'       ] && echo 'SET' || echo 'MISSING')"
+          echo "FIRECRAWL_API_KEY:    $([ -n '${{ secrets.FIRECRAWL_API_KEY }}'    ] && echo 'SET' || echo 'MISSING')"
+          echo "JINA_API_KEY:         $([ -n '${{ secrets.JINA_API_KEY }}'         ] && echo 'SET' || echo 'MISSING')"
+
+      - name: Run forecasting bot
+        run: |
+          poetry run python forecasting_bot.py \
+            --mode tournament \
+            --tournament spring-2026-ai minibench \
+            2>&1 | tee bot_run.log
         env:
+          PYTHONUNBUFFERED: "1"      # stream Python output in real time
+          PYTHONFAULTHANDLER: "1"    # print traceback on crashes / segfaults
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
@@ -62,4 +74,14 @@ jobs:
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
+          JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
+
+      - name: Upload bot log as artifact
+        if: always()  # upload even if the bot step failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-run-log-${{ github.run_id }}
+          path: bot_run.log
+          retention-days: 14

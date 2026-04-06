@@ -258,7 +258,7 @@ def _format_output(input_question: str, events: list[dict], scores: list[float])
         "=" * 70,
         "POLYMARKET RESEARCH",
         "=" * 70,
-        "Note: Polymarket percentages are real-money crowd-implied probabilities; treat them as a calibrated prior, weighted by volume and liquidity.",
+        "Polymarket percentages are real-money crowd-implied probabilities. Use them as a calibrated prior, but weight their relevance by the market's trading volume and liquidity: high-volume, liquid markets produce more reliable signals; thin or illiquid markets should be discounted accordingly.",
         f'Input question: "{input_question}"',
         "",
         f"Found {len(events)} relevant market group(s) on Polymarket:\n",

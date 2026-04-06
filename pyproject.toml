@@ -15,6 +15,7 @@ dependencies = [
     "asknews>=0.13.10,<0.14.0",
     "forecasting-tools>=0.2.85,<0.3.0",
     "httpx>=0.24.0",
+    "aiohttp (>=3.13.5,<4.0.0)",
 ]
 
 

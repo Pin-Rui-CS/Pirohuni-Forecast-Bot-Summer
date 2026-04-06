@@ -45,6 +45,70 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 # ===========================================================================
 
 _SERP_NUM_RESULTS = 10
+_BASE_RATE_TOP_N = 3
+
+
+async def _generate_base_rate_query(
+    title: str,
+    resolution_criteria: str,
+    background: str,
+    fine_print: str,
+) -> str:
+    """Use an LLM to generate a single Google search query targeting historical base rate data.
+
+    The query is designed to surface past occurrences, historical frequencies, statistics,
+    or precedents that a forecaster would use to establish a prior probability.
+    Returns an empty string if generation fails.
+    """
+    client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ["OPENROUTER_API_KEY"],
+    )
+
+    context_parts = [f"Title: {title}"]
+    if resolution_criteria:
+        context_parts.append(f"Resolution criteria: {resolution_criteria}")
+    if background:
+        context_parts.append(f"Background: {background}")
+    if fine_print:
+        context_parts.append(f"Fine print: {fine_print}")
+    context = "\n\n".join(context_parts)
+
+    prompt = (
+        "You are helping a forecaster establish a base rate for a prediction question.\n\n"
+        "A base rate is the historical frequency with which similar events have occurred. "
+        "For example:\n"
+        "  - If the question is about an election outcome → search for past election results "
+        "in that country or region\n"
+        "  - If the question is about an economic indicator crossing a threshold → search for "
+        "historical data or statistics on that indicator\n"
+        "  - If the question is about a country defaulting on debt → search for historical "
+        "sovereign default rates\n"
+        "  - If the question is about a bill passing in a legislature → search for historical "
+        "passage rates for similar legislation\n\n"
+        "Your task: generate a SINGLE Google search query that would return pages with "
+        "historical data, past occurrences, or statistical records useful for estimating a "
+        "base rate for the forecasting question below.\n\n"
+        "Guidelines:\n"
+        "  - Focus on history and frequency, not the current event itself\n"
+        "  - Think about what category of event this is, and what historical record would "
+        "be most informative\n"
+        "  - Prefer queries that target lists of past outcomes, statistics, or academic/official "
+        "data sources\n"
+        "  - Write the query as a person would type it into Google\n\n"
+        f"Forecasting question context:\n{context}\n\n"
+        'Respond with ONLY the query string, no quotes, no explanation.'
+    )
+
+    response = await client.chat.completions.create(
+        model="anthropic/claude-sonnet-4.6",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=80,
+        temperature=0.3,
+    )
+
+    query = (response.choices[0].message.content or "").strip().strip('"').strip("'")
+    return query
 
 
 async def _generate_search_queries(
@@ -386,12 +450,27 @@ async def run_serp_research(
     Returns an empty string if no results pass the relevance threshold.
     Firecrawl is used only for results with score >= 9.
     """
-    queries = await _generate_search_queries(title, resolution_criteria, background, fine_print)
+    # Generate main queries and base rate query in parallel
+    queries, base_rate_query = await asyncio.gather(
+        _generate_search_queries(title, resolution_criteria, background, fine_print),
+        _generate_base_rate_query(title, resolution_criteria, background, fine_print),
+    )
+
     if not queries:
         logger.warning("[SerpAPI] Query generation returned no queries for: %s", title)
         return ""
 
-    results = await _multi_search_serpapi(queries)
+    # Search main queries (plus the raw title) and base rate query in parallel
+    main_search = _multi_search_serpapi([*queries, title])
+    async def _empty() -> list:
+        return []
+    base_rate_search = _search_serpapi(base_rate_query) if base_rate_query else _empty()
+    results, base_rate_results = await asyncio.gather(main_search, base_rate_search)
+
+    # Drop Metaculus URLs — they link to other questions, not source data
+    results = [r for r in results if "metaculus.com" not in r.get("url", "")]
+    base_rate_results = [r for r in base_rate_results if "metaculus.com" not in r.get("url", "")]
+
     if not results:
         logger.info("[SerpAPI] No organic results returned for: %s", title)
         return ""
@@ -401,33 +480,49 @@ async def run_serp_research(
         logger.info("[SerpAPI] No results met the relevance threshold.")
         return ""
 
+    # Score base rate results (reuse same scorer, different result pool)
+    if base_rate_results:
+        top_base_rate = await _rate_and_filter(
+            title, resolution_criteria, background, fine_print,
+            base_rate_results,
+        )
+        top_base_rate = top_base_rate[:_BASE_RATE_TOP_N]
+    else:
+        top_base_rate = []
+
+    # Scrape all URLs (main + base rate) in parallel
+    all_to_scrape = [
+        (meta, "main") for meta in top
+    ] + [
+        (meta, "base_rate") for meta in top_base_rate
+    ]
     scrape_tasks = [
         _scrape_url(meta["url"], allow_firecrawl=(meta["score"] >= _FIRECRAWL_MIN_SCORE))
-        for meta in top
+        for meta, _ in all_to_scrape
     ]
     scraped = await asyncio.gather(*scrape_tasks)
 
-    # Heuristic-clean each successful scrape (with expanded limit for LLM input),
-    # then run LLM cleaning for all pages in parallel.
-    to_llm_clean: list[tuple[int, dict, str]] = []  # (index, meta, heuristic_content)
-    for i, (meta, scrape_result) in enumerate(zip(top, scraped)):
+    # Heuristic-clean then LLM-clean all scraped pages in parallel
+    to_llm_clean: list[tuple[dict, str, str]] = []  # (meta, section_type, heuristic_content)
+    for (meta, section_type), scrape_result in zip(all_to_scrape, scraped):
         if not scrape_result.success:
             logger.warning("[SerpAPI] Scrape failed for %s", meta["url"])
             continue
         heuristic = _clean_content(scrape_result.content, max_chars=_LLM_MAX_INPUT)
         if heuristic.strip():
-            to_llm_clean.append((i, meta, heuristic))
+            to_llm_clean.append((meta, section_type, heuristic))
 
     if not to_llm_clean:
         return ""
 
     llm_results = await asyncio.gather(*[
         _llm_clean_content(title, meta["url"], heuristic)
-        for _, meta, heuristic in to_llm_clean
+        for meta, _, heuristic in to_llm_clean
     ], return_exceptions=True)
 
-    sections: list[str] = []
-    for (_, meta, heuristic), llm_result in zip(to_llm_clean, llm_results):
+    main_sections: list[str] = []
+    base_rate_sections: list[str] = []
+    for (meta, section_type, heuristic), llm_result in zip(to_llm_clean, llm_results):
         if isinstance(llm_result, Exception):
             logger.warning("[SerpAPI] LLM cleaning failed for %s: %s — using heuristic", meta["url"], llm_result)
             final_content = heuristic[:_MAX_CONTENT_CHARS]
@@ -438,14 +533,26 @@ async def run_serp_research(
             continue
 
         date_str = f" ({meta['date']})" if meta["date"] else ""
-        sections.append(
+        entry = (
             f"### {meta['title']}{date_str}\n"
             f"URL: {meta['url']}\n"
             f"_Relevance: {meta['score']}/10_\n\n"
             f"{final_content}"
         )
+        if section_type == "base_rate":
+            base_rate_sections.append(entry)
+        else:
+            main_sections.append(entry)
 
-    if not sections:
-        return ""
+    output_parts: list[str] = []
+    if main_sections:
+        output_parts.append("## Web Research (SerpAPI)\n\n" + "\n\n---\n\n".join(main_sections))
+    if base_rate_sections:
+        query_note = f"_Query: {base_rate_query}_\n\n" if base_rate_query else ""
+        output_parts.append(
+            "## Base Rate Research (SerpAPI)\n\n"
+            + query_note
+            + "\n\n---\n\n".join(base_rate_sections)
+        )
 
-    return "## Web Research (SerpAPI)\n\n" + "\n\n---\n\n".join(sections)
+    return "\n\n".join(output_parts)
