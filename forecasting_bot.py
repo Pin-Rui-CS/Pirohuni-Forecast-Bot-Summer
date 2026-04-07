@@ -8,6 +8,9 @@ from email.utils import parsedate_to_datetime
 import json
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import time
 import dotenv
 
@@ -22,8 +25,8 @@ from pydantic import BaseModel, Field, model_validator
 from asknews_research import call_asknews_fast
 from polymarket_research import scrape_polymarket as _scrape_polymarket
 from manifold_research import scrape_manifold as _scrape_manifold
-from resolution_criteria_scraper import scrape_resolution_sources
-from fine_print_scraper import scrape_fine_print_sources
+from resolution_criteria_scraper import scrape_resolution_sources, extract_urls as extract_rc_urls
+from fine_print_scraper import scrape_fine_print_sources, extract_urls as extract_fp_urls
 from serp_research import run_serp_research
 from tavily_research import run_tavily_research
 
@@ -514,22 +517,141 @@ def save_llm_result(
     print(f"  [LLM result saved] {filepath}")
 
 
-async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temperature: float = 0.3) -> str:
+RUN_PYTHON_CODE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run_python_code",
+        "description": (
+            "Execute Python code locally and return stdout/stderr. "
+            "Use this for ALL math, statistics, probability calculations, and data analysis — "
+            "never do mental arithmetic. "
+            "numpy, scipy, pandas, scikit-learn, and statsmodels are available. "
+            "Print results explicitly; the return value is ignored."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Valid Python 3.12 code to execute.",
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "Brief explanation of what this code computes and why.",
+                },
+            },
+            "required": ["code"],
+        },
+    },
+}
+
+
+def execute_python_code(code: str) -> str:
+    """Write code to a temp file and run it; return combined stdout/stderr (30 s timeout)."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(code)
+        tmp_path = f.name
+    try:
+        result = subprocess.run(
+            [sys.executable, tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = result.stdout
+        if result.stderr:
+            output += f"\n[stderr]\n{result.stderr}"
+        return output.strip() if output.strip() else "(no output)"
+    except subprocess.TimeoutExpired:
+        return "[error] Code execution timed out after 30 seconds."
+    except Exception as exc:
+        return f"[error] {exc}"
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temperature: float = 0.3, use_tools: bool = False) -> str:
     client = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
     )
-    async with llm_rate_limiter:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            stream=False,
-        )
+    if not use_tools:
+        async with llm_rate_limiter:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                stream=False,
+            )
         answer = response.choices[0].message.content
         if answer is None:
             raise ValueError("No answer returned from LLM")
         return answer
+
+    # Agentic tool-use loop (max 10 iterations)
+    # Rate limiter is acquired per API call only, not across tool executions.
+    messages: list[dict] = [{"role": "user", "content": prompt}]
+    for _ in range(10):
+        async with llm_rate_limiter:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                stream=False,
+                tools=[RUN_PYTHON_CODE_TOOL],
+                tool_choice="auto",
+            )
+        choice = response.choices[0]
+
+        if choice.finish_reason != "tool_calls":
+            # Final text response
+            answer = choice.message.content
+            if answer is None:
+                raise ValueError("No answer returned from LLM")
+            return answer
+
+        # Append the assistant's tool-call message
+        tool_calls = choice.message.tool_calls or []
+        messages.append({
+            "role": "assistant",
+            "content": choice.message.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ],
+        })
+
+        # Execute each tool call and append results
+        for tc in tool_calls:
+            if tc.function.name == "run_python_code":
+                args = json.loads(tc.function.arguments)
+                code = args.get("code", "")
+                reasoning = args.get("reasoning", "")
+                if reasoning:
+                    print(f"[tool] run_python_code — {reasoning}")
+                print(f"[tool] executing:\n{code}")
+                result = await asyncio.to_thread(execute_python_code, code)
+                print(f"[tool] result:\n{result}")
+            else:
+                result = f"[error] Unknown tool: {tc.function.name}"
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            })
+
+    raise ValueError("call_llm: reached maximum tool-use iterations (10) without a final response")
 
 
 async def run_research(
@@ -537,11 +659,15 @@ async def run_research(
     resolution_criteria: str = "",
     background: str = "",
     fine_print: str = "",
+    skip_urls: set[str] | None = None,
 ) -> str:
     """
     Run research using AskNews, Exa/SmartSearcher, or Perplexity, then append
     SerpAPI web research, Polymarket, and Manifold crowd probabilities.
     This function is async-safe and will run blocking SDK calls in a thread.
+
+    skip_urls: URLs already scraped by the resolution/fine-print scrapers.
+               Passed to Tavily/SERP so they don't re-scrape the same pages.
     """
     research = ""
     if ASKNEWS_CLIENT_ID and ASKNEWS_SECRET:
@@ -556,13 +682,13 @@ async def run_research(
     web_search_data = ""
     if SERPAPI_API_KEY:
         try:
-            web_search_data = await run_serp_research(title, resolution_criteria, background, fine_print)
+            web_search_data = await run_serp_research(title, resolution_criteria, background, fine_print, skip_urls=skip_urls)
         except Exception as exc:
             print(f"[SerpAPI] Research failed: {exc}")
 
     if not web_search_data and TAVILY_API_KEY:
         try:
-            web_search_data = await run_tavily_research(title, resolution_criteria, background, fine_print)
+            web_search_data = await run_tavily_research(title, resolution_criteria, background, fine_print, skip_urls=skip_urls)
         except Exception as exc:
             print(f"[Tavily] Research failed: {exc}")
 
@@ -658,6 +784,14 @@ You must complete every phase below in order. At the end of each phase, state yo
 
 ---
 
+## TOOLS
+
+You have access to a `run_python_code` tool that executes Python 3.12 locally. numpy, scipy, pandas, scikit-learn, and statsmodels are available.
+
+**ALWAYS use this tool for any math, statistics, or probability calculation — never do mental arithmetic.** Choose the appropriate statistical model yourself. Write the code, run it, and report the verified numerical result. You MUST use this tool in Phase 1 to compute your base rate.
+
+---
+
 ## Forecasting Question
 
 {title}
@@ -691,11 +825,13 @@ Before examining any of the provided research, establish a starting probability 
 - Identify the most relevant reference class for this question. What is the general category of event being predicted?
 - Find or reason about the historical base rate. How often do events of this type occur under broadly similar conditions?
 - If multiple reference classes apply, consider each and weigh them to arrive at a blended base rate.
+- **Use the `run_python_code` tool to compute your base rate numerically.** Choose an appropriate statistical model (e.g. beta-binomial, binomial proportion with confidence interval, weighted average of reference classes). Hard-code the reference class counts or rates you have identified, run the calculation, and use the printed result as your starting estimate.
 - State your initial probability estimate based purely on the outside view.
 
 Output format:
 - Reference class(es) identified
 - Base rate reasoning
+- Python tool call with calculation
 - **Starting estimate: X%**
 
 ---
@@ -794,8 +930,9 @@ async def get_binary_gpt_prediction(
     background = question_details["description"]
     fine_print = question_details["fine_print"]
 
+    skip_urls: set[str] = set(extract_rc_urls(resolution_criteria) + extract_fp_urls(fine_print))
     summary_report, _scraped, _fp_scraped = await asyncio.gather(
-        run_research(title, resolution_criteria, background, fine_print),
+        run_research(title, resolution_criteria, background, fine_print, skip_urls=skip_urls),
         scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
         scrape_fine_print_sources(fine_print, title, use_llm_cleaning=True),
     )
@@ -827,7 +964,7 @@ async def get_binary_gpt_prediction(
     log_prediction_prompt("binary", title, content)
 
     async def get_rationale_and_probability(content: str) -> tuple[float, str, str]:
-        rationale = await call_llm(content)
+        rationale = await call_llm(content, use_tools=True)
 
         probability = extract_probability_from_response_as_percentage_not_decimal(
             rationale
@@ -904,6 +1041,14 @@ You must complete every phase below in order. At the end of each phase, state yo
 
 ---
 
+## TOOLS
+
+You have access to a `run_python_code` tool that executes Python 3.12 locally. numpy, scipy, pandas, scikit-learn, and statsmodels are available.
+
+**ALWAYS use this tool for any math, statistics, or probability calculation — never do mental arithmetic.** Choose the appropriate statistical model yourself. Write the code, run it, and report the verified numerical result. You MUST use this tool in Phase 1 to compute your base rate distribution.
+
+---
+
 ## Forecasting Question
 
 {title}
@@ -940,11 +1085,13 @@ Before examining any of the provided research, establish a starting distribution
 - Identify the most relevant reference class. What is the typical range of outcomes for this type of quantity?
 - Reason about the historical base rate distribution: central tendency, spread, and whether outcomes are skewed.
 - Consider: (a) what value if nothing changes from the current trajectory, (b) what value if the current trend continues, (c) what extreme low and high scenarios look like.
+- **Use the `run_python_code` tool to compute your base rate distribution numerically.** Choose an appropriate statistical model (e.g. fit a normal/lognormal to historical data, compute mean ± std from reference class values, or use scipy to derive a 90% CI). Hard-code the reference class data you have identified, run the calculation, and use the printed result as your starting estimate.
 - State your initial central estimate and 90% confidence interval based purely on the outside view.
 
 Output format:
 - Reference class(es) and historical range
 - Base rate reasoning
+- Python tool call with calculation
 - **Starting estimate: [central value] (90% CI: [low] – [high])**
 
 ---
@@ -1623,8 +1770,9 @@ async def get_numeric_gpt_prediction(
 
     grid = np.linspace(lower_bound, upper_bound, cdf_size)
 
+    skip_urls: set[str] = set(extract_rc_urls(resolution_criteria) + extract_fp_urls(fine_print))
     summary_report, _scraped, _fp_scraped = await asyncio.gather(
-        run_research(title, resolution_criteria, background, fine_print),
+        run_research(title, resolution_criteria, background, fine_print, skip_urls=skip_urls),
         scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
         scrape_fine_print_sources(fine_print, title, use_llm_cleaning=True),
     )
@@ -1659,7 +1807,7 @@ async def get_numeric_gpt_prediction(
     log_prediction_prompt(question_type, title, reasoning_prompt)
 
     async def ask_llm_to_get_cdf() -> tuple[list[float], str, str]:
-        response = await call_llm(reasoning_prompt)
+        response = await call_llm(reasoning_prompt, use_tools=True)
 
         try:
             parsed = json.loads(response)
@@ -1720,6 +1868,14 @@ You must complete every phase below in order. At the end of each phase, state yo
 
 ---
 
+## TOOLS
+
+You have access to a `run_python_code` tool that executes Python 3.12 locally. numpy, scipy, pandas, scikit-learn, and statsmodels are available.
+
+**ALWAYS use this tool for any math, statistics, or probability calculation — never do mental arithmetic.** Choose the appropriate statistical model yourself. Write the code, run it, and report the verified numerical result. You MUST use this tool in Phase 1 to compute your base rate distribution across options.
+
+---
+
 ## Forecasting Question
 
 {title}
@@ -1754,10 +1910,12 @@ Before examining any of the provided research, establish a starting distribution
 - Identify the most relevant reference class for this type of question. How are outcomes of this kind typically distributed across similar option sets?
 - Reason about the prior probability each option deserves based purely on historical patterns and structural priors (e.g. incumbency advantage, status quo bias).
 - If the options are asymmetric in their prior likelihood, reflect that in your distribution.
+- **Use the `run_python_code` tool to compute your base rate distribution numerically.** Hard-code the reference class frequencies or priors you have identified (e.g. historical win rates, Dirichlet concentration parameters), run the calculation with numpy/scipy, and use the printed result as your starting distribution. Ensure probabilities are normalised to sum to 100%.
 - State your initial distribution based purely on the outside view.
 
 Output format:
 - Reference class(es) and base rate reasoning
+- Python tool call with calculation
 - **Starting distribution: Option_A: X%, Option_B: Y%, ... (must sum to 100%)**
 
 ---
@@ -1924,8 +2082,9 @@ async def get_multiple_choice_gpt_prediction(
     fine_print = question_details["fine_print"]
     options = question_details["options"]
 
+    skip_urls: set[str] = set(extract_rc_urls(resolution_criteria) + extract_fp_urls(fine_print))
     summary_report, _scraped, _fp_scraped = await asyncio.gather(
-        run_research(title, resolution_criteria, background, fine_print),
+        run_research(title, resolution_criteria, background, fine_print, skip_urls=skip_urls),
         scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
         scrape_fine_print_sources(fine_print, title, use_llm_cleaning=True),
     )
@@ -1960,7 +2119,7 @@ async def get_multiple_choice_gpt_prediction(
     async def ask_llm_for_multiple_choice_probabilities(
         content: str,
     ) -> tuple[dict[str, float], str, str]:
-        rationale = await call_llm(content)
+        rationale = await call_llm(content, use_tools=True)
 
         option_probabilities = extract_option_probabilities_from_response(
             rationale, options

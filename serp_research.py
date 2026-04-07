@@ -440,6 +440,7 @@ async def run_serp_research(
     resolution_criteria: str = "",
     background: str = "",
     fine_print: str = "",
+    skip_urls: set[str] | None = None,
 ) -> str:
     """Full SerpAPI research pipeline.
 
@@ -489,6 +490,11 @@ async def run_serp_research(
         top_base_rate = top_base_rate[:_BASE_RATE_TOP_N]
     else:
         top_base_rate = []
+
+    # Drop URLs already scraped by the resolution/fine-print scrapers
+    if skip_urls:
+        top = [r for r in top if r.get("url", "") not in skip_urls]
+        top_base_rate = [r for r in top_base_rate if r.get("url", "") not in skip_urls]
 
     # Scrape all URLs (main + base rate) in parallel
     all_to_scrape = [

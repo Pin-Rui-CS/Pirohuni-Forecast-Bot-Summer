@@ -44,7 +44,7 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 # ===========================================================================
 
 _TAVILY_NUM_RESULTS = 10
-_TAVILY_MIN_SCORE = 0.4   # Filter threshold on Tavily's 0–1 relevance score
+_TAVILY_MIN_SCORE = 0.6   # Filter threshold on Tavily's 0–1 relevance score
 _TAVILY_SEARCH_DEPTH = "advanced"
 
 
@@ -124,6 +124,7 @@ async def run_tavily_research(
     resolution_criteria: str = "",
     background: str = "",
     fine_print: str = "",
+    skip_urls: set[str] | None = None,
 ) -> str:
     """Full Tavily research pipeline.
 
@@ -167,6 +168,11 @@ async def run_tavily_research(
         return ""
 
     top_base_rate = _filter_by_score(base_rate_results, top_n=_BASE_RATE_TOP_N) if base_rate_results else []
+
+    # Drop URLs already scraped by the resolution/fine-print scrapers
+    if skip_urls:
+        top = [r for r in top if r.get("url", "") not in skip_urls]
+        top_base_rate = [r for r in top_base_rate if r.get("url", "") not in skip_urls]
 
     # Tavily scores are 0–1; map Firecrawl gate to the same 0–1 scale
     _tavily_firecrawl_min = _FIRECRAWL_MIN_SCORE / 10  # 9/10 → 0.9
