@@ -21,6 +21,7 @@ import re
 
 import httpx
 from openai import OpenAI
+from llm_logging import log_llm_call
 
 # ---------------------------------------------------------------------------
 # Config
@@ -78,6 +79,7 @@ def _generate_search_queries(question: str) -> list[str]:
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
         )
+        log_llm_call("manifold/query-gen", _MANIFOLD_SCORING_MODEL, response.usage, prompt=prompt)
         content = response.choices[0].message.content.strip()
         match = re.search(r"\[.*?\]", content, re.DOTALL)
         if match:
@@ -238,6 +240,7 @@ def _score_markets(question: str, markets: list[dict]) -> list[float]:
         messages=[{"role": "user", "content": prompt}],
         temperature=0,
     )
+    log_llm_call("manifold/relevance-scoring", _MANIFOLD_SCORING_MODEL, response.usage, prompt=prompt)
     content = response.choices[0].message.content.strip()
     match = re.search(r"\[[\d\s.,]+\]", content)
     if not match:

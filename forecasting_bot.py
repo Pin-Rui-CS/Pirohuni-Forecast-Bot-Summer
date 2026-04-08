@@ -29,6 +29,7 @@ from resolution_criteria_scraper import scrape_resolution_sources, extract_urls 
 from fine_print_scraper import scrape_fine_print_sources, extract_urls as extract_fp_urls
 from serp_research import run_serp_research
 from tavily_research import run_tavily_research
+from llm_logging import log_llm_call, print_token_summary
 
 ######################### CONSTANTS #########################
 # Constants
@@ -338,14 +339,13 @@ async def post_question_prediction(question_id: int, forecast_payload: dict) -> 
     Post a forecast on a question.
     """
     url = f"{API_BASE_URL}/questions/forecast/"
+    full_payload = [{"question": question_id, **forecast_payload}]
+    print(f"::group::[PAYLOAD] Metaculus forecast submission for question {question_id}")
+    print(json.dumps(full_payload, indent=2))
+    print("::endgroup::")
     response = await _metaculus_async_post_with_retries(
         url,
-        json_payload=[
-            {
-                "question": question_id,
-                **forecast_payload,
-            },
-        ],
+        json_payload=full_payload,
         request_label=f"post_question_prediction(question_id={question_id})",
     )
     print(f"Prediction Post status code: {response.status_code}")
@@ -455,6 +455,7 @@ async def get_post_details(post_id: int) -> dict:
 
 CONCURRENT_REQUESTS_LIMIT = 5
 llm_rate_limiter = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
+# Token logging is handled by llm_logging.py (imported above)
 
 
 def log_prediction_prompt(question_type: str, title: str, prompt: str) -> None:
@@ -573,12 +574,19 @@ def execute_python_code(code: str) -> str:
             pass
 
 
-async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temperature: float = 0.3, use_tools: bool = False) -> str:
+async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temperature: float = 0.3, use_tools: bool = False, _label: str = "forecast") -> str:
+    """Call the LLM via OpenRouter.
+
+    _label is a short tag used in log output (e.g. 'binary-forecast', 'numeric-forecast').
+    It is an internal parameter not exposed at call sites that don't care about it.
+    """
     client = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
     )
     if not use_tools:
+        print(f"::group::[LLM CALL] {_label} | model={model}")
+        print(f"[PROMPT]\n{prompt}\n[/PROMPT]")
         async with llm_rate_limiter:
             response = await client.chat.completions.create(
                 model=model,
@@ -587,14 +595,20 @@ async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temper
                 stream=False,
             )
         answer = response.choices[0].message.content
+        log_llm_call(_label, model, response.usage, prompt=prompt, response_text=answer or "")
+        print(f"[RESPONSE]\n{answer}\n[/RESPONSE]")
+        print("::endgroup::")
         if answer is None:
             raise ValueError("No answer returned from LLM")
         return answer
 
     # Agentic tool-use loop (max 10 iterations)
     # Rate limiter is acquired per API call only, not across tool executions.
+    print(f"::group::[LLM CALL] {_label} (tool-use) | model={model}")
+    print(f"[PROMPT]\n{prompt}\n[/PROMPT]")
     messages: list[dict] = [{"role": "user", "content": prompt}]
-    for _ in range(10):
+    iteration = 0
+    for iteration in range(10):
         async with llm_rate_limiter:
             response = await client.chat.completions.create(
                 model=model,
@@ -604,6 +618,14 @@ async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temper
                 tools=[RUN_PYTHON_CODE_TOOL],
                 tool_choice="auto",
             )
+        iter_label = f"{_label}/iter{iteration + 1}"
+        # For tool iterations log against the original prompt only on iteration 0
+        log_llm_call(
+            iter_label,
+            model,
+            response.usage,
+            prompt=prompt if iteration == 0 else "",
+        )
         choice = response.choices[0]
 
         if choice.finish_reason != "tool_calls":
@@ -611,6 +633,8 @@ async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temper
             answer = choice.message.content
             if answer is None:
                 raise ValueError("No answer returned from LLM")
+            print(f"[RESPONSE]\n{answer}\n[/RESPONSE]")
+            print("::endgroup::")
             return answer
 
         # Append the assistant's tool-call message
@@ -651,6 +675,7 @@ async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temper
                 "content": result,
             })
 
+    print("::endgroup::")
     raise ValueError("call_llm: reached maximum tool-use iterations (10) without a final response")
 
 
@@ -964,7 +989,7 @@ async def get_binary_gpt_prediction(
     log_prediction_prompt("binary", title, content)
 
     async def get_rationale_and_probability(content: str) -> tuple[float, str, str]:
-        rationale = await call_llm(content, use_tools=True)
+        rationale = await call_llm(content, use_tools=True, _label="binary-forecast")
 
         probability = extract_probability_from_response_as_percentage_not_decimal(
             rationale
@@ -1011,7 +1036,7 @@ async def get_binary_gpt_prediction(
             f"[TIEBREAKER] High variance detected for binary question (spread: {prob_spread:.0f}pp, "
             f"values: {probabilities}). Sending tiebreaker prompt to LLM."
         )
-        final_rationale = await call_llm(tiebreaker_prompt)
+        final_rationale = await call_llm(tiebreaker_prompt, _label="binary-tiebreaker")
         final_probability = extract_probability_from_response_as_percentage_not_decimal(
             final_rationale
         )
@@ -1807,7 +1832,7 @@ async def get_numeric_gpt_prediction(
     log_prediction_prompt(question_type, title, reasoning_prompt)
 
     async def ask_llm_to_get_cdf() -> tuple[list[float], str, str]:
-        response = await call_llm(reasoning_prompt, use_tools=True)
+        response = await call_llm(reasoning_prompt, use_tools=True, _label="numeric-forecast")
 
         try:
             parsed = json.loads(response)
@@ -2119,7 +2144,7 @@ async def get_multiple_choice_gpt_prediction(
     async def ask_llm_for_multiple_choice_probabilities(
         content: str,
     ) -> tuple[dict[str, float], str, str]:
-        rationale = await call_llm(content, use_tools=True)
+        rationale = await call_llm(content, use_tools=True, _label="mc-forecast")
 
         option_probabilities = extract_option_probabilities_from_response(
             rationale, options
@@ -2429,3 +2454,4 @@ if __name__ == "__main__":
             SKIP_PREVIOUSLY_FORECASTED_QUESTIONS,
         )
     )
+    print_token_summary()

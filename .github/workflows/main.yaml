@@ -43,7 +43,7 @@ jobs:
 
       - name: Verify secrets are configured
         run: |
-          echo "=== API Key Configuration ==="
+          echo "::group::API Key Configuration"
           echo "METACULUS_TOKEN:      $([ -n '${{ secrets.METACULUS_TOKEN }}'      ] && echo 'SET' || echo 'MISSING')"
           echo "OPENROUTER_API_KEY:   $([ -n '${{ secrets.OPENROUTER_API_KEY }}'   ] && echo 'SET' || echo 'MISSING')"
           echo "ASKNEWS_CLIENT_ID:    $([ -n '${{ secrets.ASKNEWS_CLIENT_ID }}'    ] && echo 'SET' || echo 'MISSING')"
@@ -54,6 +54,7 @@ jobs:
           echo "TAVILY_API_KEY:       $([ -n '${{ secrets.TAVILY_API_KEY }}'       ] && echo 'SET' || echo 'MISSING')"
           echo "FIRECRAWL_API_KEY:    $([ -n '${{ secrets.FIRECRAWL_API_KEY }}'    ] && echo 'SET' || echo 'MISSING')"
           echo "JINA_API_KEY:         $([ -n '${{ secrets.JINA_API_KEY }}'         ] && echo 'SET' || echo 'MISSING')"
+          echo "::endgroup::"
 
       - name: Run forecasting bot
         run: |

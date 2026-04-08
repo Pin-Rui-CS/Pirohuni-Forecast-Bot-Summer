@@ -35,6 +35,7 @@ if str(_SCRAPER_ROOT) not in sys.path:
     sys.path.insert(0, str(_SCRAPER_ROOT))
 
 from scraper import scrape_batch  # noqa: E402  (path inserted above)
+from llm_logging import log_llm_call  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -286,6 +287,7 @@ async def _llm_summarize(
         max_tokens=2000,
         temperature=0.1,
     )
+    log_llm_call("resolution-scraper/page-summary", model, response.usage, prompt=prompt)
     return response.choices[0].message.content.strip()
 
 
@@ -371,6 +373,7 @@ async def _compile_summaries(
         max_tokens=2000,
         temperature=0.1,
     )
+    log_llm_call("resolution-scraper/compile-summaries", model, response.usage, prompt=prompt)
     return response.choices[0].message.content.strip()
 
 

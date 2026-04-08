@@ -22,6 +22,7 @@ from pathlib import Path
 
 import httpx
 from openai import AsyncOpenAI
+from llm_logging import log_llm_call
 
 # ---------------------------------------------------------------------------
 # Make the Web Scraper importable (sibling directory, not installed as package)
@@ -106,6 +107,7 @@ async def _generate_base_rate_query(
         max_tokens=80,
         temperature=0.3,
     )
+    log_llm_call("serp/base-rate-query-gen", "anthropic/claude-sonnet-4.6", response.usage, prompt=prompt)
 
     query = (response.choices[0].message.content or "").strip().strip('"').strip("'")
     return query
@@ -158,6 +160,7 @@ async def _generate_search_queries(
         max_tokens=200,
         temperature=0.3,
     )
+    log_llm_call("serp/query-gen", "anthropic/claude-sonnet-4.6", response.usage, prompt=prompt)
 
     raw = response.choices[0].message.content or ""
     start, end = raw.find("["), raw.rfind("]")
@@ -274,6 +277,7 @@ async def _rate_and_filter(
         max_tokens=200,
         temperature=0.1,
     )
+    log_llm_call("serp/relevance-scoring", "anthropic/claude-sonnet-4.6", response.usage, prompt=prompt)
 
     raw_scores = response.choices[0].message.content or ""
     start, end = raw_scores.find("["), raw_scores.rfind("]")
@@ -383,6 +387,7 @@ async def _llm_clean_content(question: str, url: str, content: str) -> str:
         max_tokens=2000,
         temperature=0.1,
     )
+    log_llm_call("serp/content-extract", "anthropic/claude-sonnet-4.6", response.usage, prompt=prompt)
     return response.choices[0].message.content.strip()
 
 
