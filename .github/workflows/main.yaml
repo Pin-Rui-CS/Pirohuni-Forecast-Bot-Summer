@@ -60,11 +60,11 @@ jobs:
         run: |
           poetry run python forecasting_bot.py \
             --mode tournament \
-            --tournament spring-2026-ai minibench \
+            --tournament summer-2026-ai minibench \
             2>&1 | tee bot_run.log
         env:
-          PYTHONUNBUFFERED: "1"      # stream Python output in real time
-          PYTHONFAULTHANDLER: "1"    # print traceback on crashes / segfaults
+          PYTHONUNBUFFERED: "1" # stream Python output in real time
+          PYTHONFAULTHANDLER: "1" # print traceback on crashes / segfaults
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
@@ -80,7 +80,7 @@ jobs:
           JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
 
       - name: Upload bot log as artifact
-        if: always()  # upload even if the bot step failed
+        if: always() # upload even if the bot step failed
         uses: actions/upload-artifact@v4
         with:
           name: bot-run-log-${{ github.run_id }}
