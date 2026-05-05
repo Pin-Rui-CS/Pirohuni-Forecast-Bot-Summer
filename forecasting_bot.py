@@ -16,23 +16,14 @@ import dotenv
 
 dotenv.load_dotenv()
 
-import forecasting_tools
+import forecasting_tools  # reserved — used by research implementations
 import numpy as np
 from scipy import stats
 import httpx
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, model_validator
-from asknews_research import call_asknews_fast
-from polymarket_research import scrape_polymarket as _scrape_polymarket
-from manifold_research import scrape_manifold as _scrape_manifold
-from resolution_criteria_scraper import scrape_resolution_sources, extract_urls as extract_rc_urls
-from fine_print_scraper import scrape_fine_print_sources, extract_urls as extract_fp_urls
-from serp_research import run_serp_research
-from tavily_research import run_tavily_research
-from llm_logging import log_llm_call, print_token_summary
 
 ######################### CONSTANTS #########################
-# Constants
 NUM_RUNS_PER_QUESTION = (
     3  # The median forecast is taken between NUM_RUNS_PER_QUESTION runs
 )
@@ -44,19 +35,17 @@ METACULUS_API_RATE_LIMITER = asyncio.Semaphore(METACULUS_MAX_CONCURRENT_REQUESTS
 METACULUS_REQUEST_INTERVAL = float(os.getenv("METACULUS_REQUEST_INTERVAL", "3.0"))
 
 # Environment variables
-# You only need *either* Exa or Perplexity or AskNews keys for online research
 METACULUS_TOKEN = os.getenv("METACULUS_TOKEN")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID")
 ASKNEWS_SECRET = os.getenv("ASKNEWS_SECRET")
 EXA_API_KEY = os.getenv("EXA_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENAI_API_KEY = os.getenv(
-    "OPENAI_API_KEY"
-)  # You'll also need the OpenAI API Key if you want to use the Exa Smart Searcher
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-# The tournament IDs below can be used for testing your bot.
+
+# Tournament IDs
 Q4_2024_AI_BENCHMARKING_ID = 32506
 Q1_2025_AI_BENCHMARKING_ID = 32627
 FALL_2025_AI_BENCHMARKING_ID = "fall-aib-2025"
@@ -66,15 +55,13 @@ CURRENT_MINIBENCH_ID = "minibench"
 
 Q4_2024_QUARTERLY_CUP_ID = 3672
 Q1_2025_QUARTERLY_CUP_ID = 32630
-CURRENT_METACULUS_CUP_ID = 'metaculus-cup-spring-2026' # TBD (Use the slug from the Metaculus Cup URL)
+CURRENT_METACULUS_CUP_ID = 'metaculus-cup-spring-2026'
 
 AXC_2025_TOURNAMENT_ID = 32564
 AI_2027_TOURNAMENT_ID = "ai-2027"
 
-# Default tournament ID
 DEFAULT_TOURNAMENT_ID = CURRENT_METACULUS_CUP_ID
 
-# Tournament name to ID mapping
 TOURNAMENT_MAPPING = {
     "q4-2024-ai": Q4_2024_AI_BENCHMARKING_ID,
     "q1-2025-ai": Q1_2025_AI_BENCHMARKING_ID,
@@ -89,7 +76,6 @@ TOURNAMENT_MAPPING = {
     "ai-2027": AI_2027_TOURNAMENT_ID,
 }
 
-# The example questions can be used for testing your bot. (note that question and post id are not always the same)
 EXAMPLE_QUESTIONS = [  # (question_id, post_id)
     (
         578,
@@ -111,7 +97,6 @@ EXAMPLE_QUESTIONS = [  # (question_id, post_id)
 
 ######################### HELPER FUNCTIONS #########################
 
-# @title Helper functions
 AUTH_HEADERS = {"Authorization": f"Token {METACULUS_TOKEN}"}
 API_BASE_URL = "https://www.metaculus.com/api"
 MAX_API_GET_RETRIES = 3
@@ -426,7 +411,6 @@ def get_open_question_ids_from_tournament(tournament_id: int | str = DEFAULT_TOU
     post_dict = dict()
     for post in posts["results"]:
         if question := post.get("question"):
-            # single question post
             post_dict[post["id"]] = [question]
 
     open_question_id_post_id = []  # [(question_id, post_id)]
@@ -457,7 +441,6 @@ async def get_post_details(post_id: int) -> dict:
 
 CONCURRENT_REQUESTS_LIMIT = 5
 llm_rate_limiter = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
-# Token logging is handled by llm_logging.py (imported above)
 
 
 def log_prediction_prompt(question_type: str, title: str, prompt: str) -> None:
@@ -577,11 +560,7 @@ def execute_python_code(code: str) -> str:
 
 
 async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temperature: float = 0.3, use_tools: bool = False, _label: str = "forecast") -> str:
-    """Call the LLM via OpenRouter.
-
-    _label is a short tag used in log output (e.g. 'binary-forecast', 'numeric-forecast').
-    It is an internal parameter not exposed at call sites that don't care about it.
-    """
+    """Call the LLM via OpenRouter."""
     client = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
@@ -597,7 +576,6 @@ async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temper
                 stream=False,
             )
         answer = response.choices[0].message.content
-        log_llm_call(_label, model, response.usage, prompt=prompt, response_text=answer or "")
         print(f"[RESPONSE]\n{answer}\n[/RESPONSE]")
         print("::endgroup::")
         if answer is None:
@@ -605,7 +583,6 @@ async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temper
         return answer
 
     # Agentic tool-use loop (max 10 iterations)
-    # Rate limiter is acquired per API call only, not across tool executions.
     print(f"::group::[LLM CALL] {_label} (tool-use) | model={model}")
     print(f"[PROMPT]\n{prompt}\n[/PROMPT]")
     messages: list[dict] = [{"role": "user", "content": prompt}]
@@ -620,18 +597,9 @@ async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temper
                 tools=[RUN_PYTHON_CODE_TOOL],
                 tool_choice="auto",
             )
-        iter_label = f"{_label}/iter{iteration + 1}"
-        # For tool iterations log against the original prompt only on iteration 0
-        log_llm_call(
-            iter_label,
-            model,
-            response.usage,
-            prompt=prompt if iteration == 0 else "",
-        )
         choice = response.choices[0]
 
         if choice.finish_reason != "tool_calls":
-            # Final text response
             answer = choice.message.content
             if answer is None:
                 raise ValueError("No answer returned from LLM")
@@ -639,7 +607,6 @@ async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temper
             print("::endgroup::")
             return answer
 
-        # Append the assistant's tool-call message
         tool_calls = choice.message.tool_calls or []
         messages.append({
             "role": "assistant",
@@ -657,7 +624,6 @@ async def call_llm(prompt: str, model: str = "anthropic/claude-opus-4.6", temper
             ],
         })
 
-        # Execute each tool call and append results
         for tc in tool_calls:
             if tc.function.name == "run_python_code":
                 args = json.loads(tc.function.arguments)
@@ -686,123 +652,11 @@ async def run_research(
     resolution_criteria: str = "",
     background: str = "",
     fine_print: str = "",
-    skip_urls: set[str] | None = None,
 ) -> str:
-    """
-    Run research using AskNews, Exa/SmartSearcher, or Perplexity, then append
-    SerpAPI web research, Polymarket, and Manifold crowd probabilities.
-    This function is async-safe and will run blocking SDK calls in a thread.
-
-    skip_urls: URLs already scraped by the resolution/fine-print scrapers.
-               Passed to Tavily/SERP so they don't re-scrape the same pages.
-    """
-    research = ""
-    if ASKNEWS_CLIENT_ID and ASKNEWS_SECRET:
-        research = await asyncio.to_thread(call_asknews_fast, title)
-    elif EXA_API_KEY:
-        research = await call_exa_smart_searcher(title)
-    elif PERPLEXITY_API_KEY:
-        research = await call_perplexity(title)
-    else:
-        research = "No research done"
-
-    web_search_data = ""
-    if SERPAPI_API_KEY:
-        try:
-            web_search_data = await run_serp_research(title, resolution_criteria, background, fine_print, skip_urls=skip_urls)
-        except Exception as exc:
-            print(f"[SerpAPI] Research failed: {exc}")
-
-    if not web_search_data and TAVILY_API_KEY:
-        try:
-            web_search_data = await run_tavily_research(title, resolution_criteria, background, fine_print, skip_urls=skip_urls)
-        except Exception as exc:
-            print(f"[Tavily] Research failed: {exc}")
-
-    if web_search_data:
-        research = f"{research}\n\n{web_search_data}"
-
-    try:
-        polymarket_data = await asyncio.to_thread(_scrape_polymarket, title)
-        research = f"{research}\n\n{polymarket_data}"
-    except Exception as exc:
-        print(f"[Polymarket] Research failed: {exc}")
-
-    try:
-        manifold_data = await asyncio.to_thread(_scrape_manifold, title)
-        research = f"{research}\n\n{manifold_data}"
-    except Exception as exc:
-        print(f"[Manifold] Research failed: {exc}")
-
-    print(f"########################\nResearch Found:\n{research}\n########################")
-    return research
-
-
-async def call_perplexity(question: str) -> str:
-    url = "https://api.perplexity.ai/chat/completions"
-    api_key = PERPLEXITY_API_KEY
-    headers = {
-        "accept": "application/json",
-        "authorization": f"Bearer {api_key}",
-        "content-type": "application/json",
-    }
-    payload = {
-        "model": "llama-3.1-sonar-huge-128k-online",
-        "messages": [
-            {
-                "role": "system",
-                "content": """
-                You are an assistant to a superforecaster.
-                The superforecaster will give you a question they intend to forecast on.
-                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-                You do not produce forecasts yourself.
-                """,
-            },
-            {"role": "user", "content": question},
-        ],
-    }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url=url, json=payload, headers=headers, timeout=60.0)
-    if response.status_code >= 400:
-        raise Exception(response.text)
-    content = response.json()["choices"][0]["message"]["content"]
-    return content
-
-
-async def call_exa_smart_searcher(question: str) -> str:
-    # Many forecasting_tools searchers are synchronous; run blocking calls in a thread
-    if OPENAI_API_KEY is None:
-        searcher = forecasting_tools.ExaSearcher(include_highlights=True, num_results=10)
-        highlights = await asyncio.to_thread(searcher.invoke_for_highlights_in_relevance_order, question)
-        prioritized_highlights = highlights[:10]
-        combined_highlights = ""
-        for i, highlight in enumerate(prioritized_highlights):
-            combined_highlights += f'[Highlight {i+1}]:\nTitle: {highlight.source.title}\nURL: {highlight.source.url}\nText: "{highlight.highlight_text}"\n\n'
-        response = combined_highlights
-    else:
-        searcher = forecasting_tools.SmartSearcher(
-            temperature=0,
-            num_searches_to_run=2,
-            num_sites_per_search=10,
-        )
-        prompt = (
-            "You are an assistant to a superforecaster. The superforecaster will give"
-            "you a question they intend to forecast on. To be a great assistant, you generate"
-            "a concise but detailed rundown of the most relevant news, including if the question"
-            "would resolve Yes or No based on current information. You do not produce forecasts yourself."
-            f"\n\nThe question is: {question}"
-        )
-        response = await asyncio.to_thread(searcher.invoke, prompt)
-        assert response is not None
-
-    return response
-
+    return ""
 
 
 ############### BINARY ###############
-# @title Binary prompt & functions
-
-# This section includes functionality for binary questions.
 
 BINARY_PROMPT_TEMPLATE = """
 You are a Superforecaster — a disciplined, calibrated prediction engine trained in the methods described in Philip Tetlock's research on superior forecasting. You will be given a forecasting question and supporting research material. Your job is to produce a well-reasoned probability estimate by working through a structured analytical process.
@@ -836,10 +690,6 @@ Today is {today}.
 ---
 
 ## Research Material
-
-{resolution_source_data}
-
-{fine_print_source_data}
 
 {summary_report}
 
@@ -939,9 +789,8 @@ def extract_probability_from_response_as_percentage_not_decimal(
 ) -> float:
     matches = re.findall(r"(\d+)%", forecast_text)
     if matches:
-        # Return the last number found before a '%'
         number = int(matches[-1])
-        number = min(99, max(1, number))  # clamp the number between 1 and 99
+        number = min(99, max(1, number))
         return number
     else:
         raise ValueError(f"Could not extract prediction from response: {forecast_text}")
@@ -957,26 +806,7 @@ async def get_binary_gpt_prediction(
     background = question_details["description"]
     fine_print = question_details["fine_print"]
 
-    skip_urls: set[str] = set(extract_rc_urls(resolution_criteria) + extract_fp_urls(fine_print))
-    summary_report, _scraped, _fp_scraped = await asyncio.gather(
-        run_research(title, resolution_criteria, background, fine_print, skip_urls=skip_urls),
-        scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
-        scrape_fine_print_sources(fine_print, title, use_llm_cleaning=True),
-    )
-    resolution_source_data = (
-        "## Resolution Criteria Source Data\n"
-        "The following data was scraped directly from URLs referenced in the resolution criteria "
-        "at the time of forecasting. Use it as ground truth for the current state of the resolution "
-        "source — it may contain entries, counts, dates, or records that directly determine how "
-        "this question resolves.\n\n"
-        f"{_scraped}"
-    ) if _scraped else ""
-    fine_print_source_data = (
-        "## Fine Print Source Data\n"
-        "The following data was scraped from URLs referenced in the fine print "
-        "at the time of forecasting.\n\n"
-        f"{_fp_scraped}"
-    ) if _fp_scraped else ""
+    summary_report = await run_research(title, resolution_criteria, background, fine_print)
 
     content = BINARY_PROMPT_TEMPLATE.format(
         title=title,
@@ -985,8 +815,6 @@ async def get_binary_gpt_prediction(
         resolution_criteria=resolution_criteria,
         fine_print=fine_print,
         summary_report=summary_report,
-        resolution_source_data=resolution_source_data,
-        fine_print_source_data=fine_print_source_data,
     )
     log_prediction_prompt("binary", title, content)
 
@@ -1012,11 +840,10 @@ async def get_binary_gpt_prediction(
     ]
     probabilities = [pair[0] for pair in probability_and_comment_pairs]
 
-    SPREAD_THRESHOLD = 30  # percentage points — if range exceeds this, use tiebreaker
+    SPREAD_THRESHOLD = 30
     prob_spread = max(probabilities) - min(probabilities)
 
     if prob_spread >= SPREAD_THRESHOLD:
-        # High variance — compile everything and ask LLM for a single final judgment
         rationale_blocks = "\n\n".join(
             f"Run {i+1} (predicted {probabilities[i]}%):\n{comments[i]}"
             for i in range(len(probabilities))
@@ -1059,7 +886,6 @@ async def get_binary_gpt_prediction(
 
 
 ####################### NUMERIC ###############
-# @title Numeric prompt & functions
 
 NUMERIC_PROMPT_TEMPLATE = """
 You are a Superforecaster — a disciplined, calibrated prediction engine trained in the methods described in Philip Tetlock's research on superior forecasting. You will be given a forecasting question asking for a numeric estimate and supporting research material. Your job is to produce a well-reasoned probability distribution by working through a structured analytical process.
@@ -1096,10 +922,6 @@ Today is {today}.
 ---
 
 ## Research Material
-
-{resolution_source_data}
-
-{fine_print_source_data}
 
 {summary_report}
 
@@ -1286,7 +1108,6 @@ class NumericDefaults:
     def get_max_pmf_value(
         cls, cdf_size: int, include_wiggle_room: bool = True
     ) -> float:
-        # cap depends on inboundOutcomeCount (0.2 if it is the default 200)
         inbound_outcome_count = cdf_size - 1
         normal_cap = cls.MAX_NUMERIC_PMF_VALUE * (
             cls.DEFAULT_INBOUND_OUTCOME_COUNT / inbound_outcome_count
@@ -1402,7 +1223,7 @@ class NumericDistribution(BaseModel):
             if not repeated_value:
                 final_percentiles.append(percentile)
             elif value_in_bounds:
-                greater_epsilon = 1e-6  # TODO: Figure out why normal epsilon doesn't work. Could cause brittle behavior.
+                greater_epsilon = 1e-6
                 modification = (1 - percentile.percentile) * greater_epsilon
                 final_percentiles.append(
                     Percentile(
@@ -1435,7 +1256,6 @@ class NumericDistribution(BaseModel):
     def _check_too_far_from_bounds(self, percentiles: list[Percentile]) -> None:
         max_to_min_range = self.upper_bound - self.lower_bound
 
-        # TODO: Better handle log scaled questions (a fixed wiggle room percentage doesn't work well for them)
         wiggle_percent = 0.25
         wiggle_room = max_to_min_range * wiggle_percent
         upper_bound_plus_wiggle_room = self.upper_bound + wiggle_room
@@ -1510,13 +1330,6 @@ class NumericDistribution(BaseModel):
         Turns a list of percentiles into a full distribution (201 points, if numeric, otherwise based on discrete values)
         between upper and lower bound (taking into account probability assigned above and below the bounds)
         that is compatible with Metaculus questions.
-
-        cdf stands for 'continuous distribution function'
-
-        At Metaculus CDFs are often represented with 201 points. Each point has:
-        - percentile ("X% of values are below this point". This is the y axis of the cdf graph)
-        - 'value' or 'nominal location' (The real world number that answers the question)
-        - cdf location (a number between 0 and 1 representing where the point is on the cdf x axis, where 0 is range min, and 1 is range max)
         """
 
         cdf_size = self.cdf_size or NumericDefaults.DEFAULT_CDF_SIZE
@@ -1580,16 +1393,12 @@ class NumericDistribution(BaseModel):
         range_size = abs(range_max - range_min)
         buffer = 1 if range_size > 100 else 0.01 * range_size
 
-        # Adjust any values that are exactly at the bounds
         for percentile, value in list(return_percentiles.items()):
-            # TODO: Handle this more gracefully for log scaled questions
-            #  (where buffer could be quite a bit on the lower bound side)
             if not open_lower_bound and value <= range_min + buffer:
                 return_percentiles[percentile] = range_min + buffer
             if not open_upper_bound and value >= range_max - buffer:
                 return_percentiles[percentile] = range_max - buffer
 
-        # Set cdf values outside range
         if open_upper_bound:
             if range_max > return_percentiles[percentile_max]:
                 halfway_between_max_and_100th_percentile = 100 - (
@@ -1599,7 +1408,6 @@ class NumericDistribution(BaseModel):
         else:
             return_percentiles[100] = range_max
 
-        # Set cdf values outside range
         if open_lower_bound:
             if range_min < return_percentiles[percentile_min]:
                 halfway_between_min_and_0th_percentile = 0.5 * percentile_min
@@ -1615,21 +1423,13 @@ class NumericDistribution(BaseModel):
         return return_list
 
     def _nominal_location_to_cdf_location(self, nominal_value: float) -> float:
-        """
-        Takes the real world value (like $17k - that would answer the forecasting question)
-        and converts it to a cdf location between 0 and 1 depending on
-        how far it is between the upper and lower bound
-        (it can go over 1 or below 0 if beyond the bounds)
-        """
         range_max = self.upper_bound
         range_min = self.lower_bound
         zero_point = self.zero_point
 
         if zero_point is not None:
-            # logarithmically scaled question
             deriv_ratio = (range_max - zero_point) / (range_min - zero_point)
             if nominal_value == zero_point:
-                # If nominal = zero point, then you would take the log of 0. Add a small epsilon to avoid this.
                 nominal_value += 1e-10
             unscaled_location = (
                 np.log(
@@ -1639,16 +1439,10 @@ class NumericDistribution(BaseModel):
                 - np.log(range_max - range_min)
             ) / np.log(deriv_ratio)
         else:
-            # linearly scaled question
             unscaled_location = (nominal_value - range_min) / (range_max - range_min)
         return float(unscaled_location)
 
     def _get_cdf_at(self, cdf_location: float) -> float:
-        """
-        Helper function that takes a cdf location and returns
-        the height (percentile) of the cdf at that location, linearly
-        interpolating between values
-        """
         bounded_percentiles = self._add_explicit_upper_lower_bound_percentiles(
             self.declared_percentiles
         )
@@ -1675,30 +1469,17 @@ class NumericDistribution(BaseModel):
         """
         See documentation: https://metaculus.com/api/#:~:text=CDF%20generation%20details in the
             "CDF generation details and examples" section
-
-        Takes a cdf and returns a standardized version of it
-
-        - assigns no mass outside of closed bounds (scales accordingly)
-        - assigns at least a minimum amount of mass outside of open bounds
-        - increasing by at least the minimum amount (0.01 / 200 = 0.0005)
-        - caps the maximum growth to 0.2
-
-        Note, thresholds change with different `inbound_outcome_count`s
         """
 
         lower_open = self.open_lower_bound
         upper_open = self.open_upper_bound
 
-        # apply lower bound & enforce boundary values
         scale_lower_to = 0 if lower_open else cdf[0]
         scale_upper_to = 1.0 if upper_open else cdf[-1]
         rescaled_inbound_mass = scale_upper_to - scale_lower_to
 
         def apply_minimum(F: float, location: float) -> float:
-            # `F` is the height of the cdf at `location` (in range [0, 1])
-            # rescale
             rescaled_F = (F - scale_lower_to) / rescaled_inbound_mass
-            # offset
             if lower_open and upper_open:
                 return 0.988 * rescaled_F + 0.01 * location + 0.001
             elif lower_open:
@@ -1710,8 +1491,6 @@ class NumericDistribution(BaseModel):
         for i, value in enumerate(cdf):
             cdf[i] = apply_minimum(value, i / (len(cdf) - 1))
 
-        # apply upper bound
-        # operate in PMF space
         pmf = np.diff(cdf, prepend=0, append=1)
         cap = NumericDefaults.get_max_pmf_value(len(cdf))
 
@@ -1723,11 +1502,9 @@ class NumericDistribution(BaseModel):
         def capped_sum(scale: float) -> float:
             return float(cap_pmf(scale).sum())
 
-        # find the appropriate scale search space
         lo = hi = scale = 1.0
         while capped_sum(hi) < 1.0:
             hi *= 1.2
-        # hone in on scale value that makes capped sum 1
         for _ in range(100):
             scale = 0.5 * (lo + hi)
             s = capped_sum(scale)
@@ -1737,13 +1514,10 @@ class NumericDistribution(BaseModel):
                 hi = scale
             if s == 1.0 or (hi - lo) < 2e-5:
                 break
-        # apply scale and renormalize
         pmf = cap_pmf(scale)
         pmf[1:-1] *= (cdf[-1] - cdf[0]) / pmf[1:-1].sum()
-        # back to CDF space
         cdf = np.cumsum(pmf)[:-1]
 
-        # round to minimize floating point errors
         cdf = np.round(cdf, 10)
         return cdf.tolist()
 
@@ -1797,26 +1571,7 @@ async def get_numeric_gpt_prediction(
 
     grid = np.linspace(lower_bound, upper_bound, cdf_size)
 
-    skip_urls: set[str] = set(extract_rc_urls(resolution_criteria) + extract_fp_urls(fine_print))
-    summary_report, _scraped, _fp_scraped = await asyncio.gather(
-        run_research(title, resolution_criteria, background, fine_print, skip_urls=skip_urls),
-        scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
-        scrape_fine_print_sources(fine_print, title, use_llm_cleaning=True),
-    )
-    resolution_source_data = (
-        "## Resolution Criteria Source Data\n"
-        "The following data was scraped directly from URLs referenced in the resolution criteria "
-        "at the time of forecasting. Use it as ground truth for the current state of the resolution "
-        "source — it may contain entries, counts, dates, or records that directly determine how "
-        "this question resolves.\n\n"
-        f"{_scraped}"
-    ) if _scraped else ""
-    fine_print_source_data = (
-        "## Fine Print Source Data\n"
-        "The following data was scraped from URLs referenced in the fine print "
-        "at the time of forecasting.\n\n"
-        f"{_fp_scraped}"
-    ) if _fp_scraped else ""
+    summary_report = await run_research(title, resolution_criteria, background, fine_print)
 
     reasoning_prompt = NUMERIC_PROMPT_TEMPLATE.format(
         title=title,
@@ -1825,8 +1580,6 @@ async def get_numeric_gpt_prediction(
         resolution_criteria=resolution_criteria,
         fine_print=fine_print,
         summary_report=summary_report,
-        resolution_source_data=resolution_source_data,
-        fine_print_source_data=fine_print_source_data,
         lower_bound_message=lower_bound_message,
         upper_bound_message=upper_bound_message,
         units=unit_of_measure,
@@ -1886,7 +1639,6 @@ async def get_numeric_gpt_prediction(
 
 
 ########################## MULTIPLE CHOICE ###############
-# @title Multiple Choice prompt & functions
 
 MULTIPLE_CHOICE_PROMPT_TEMPLATE = """
 You are a Superforecaster — a disciplined, calibrated prediction engine trained in the methods described in Philip Tetlock's research on superior forecasting. You will be given a forecasting question with a fixed set of mutually exclusive options and supporting research material. Your job is to assign a probability to each option by working through a structured analytical process.
@@ -1921,10 +1673,6 @@ Today is {today}.
 ---
 
 ## Research Material
-
-{resolution_source_data}
-
-{fine_print_source_data}
 
 {summary_report}
 
@@ -2022,24 +1770,17 @@ Option_N: Probability_N
 
 def extract_option_probabilities_from_response(forecast_text: str, options) -> float:
 
-    # Helper function that returns a list of tuples with numbers for all lines with Percentile
     def extract_option_probabilities(text):
-
-        # Number extraction pattern
         number_pattern = r"-?\d+(?:,\d{3})*(?:\.\d+)?"
 
         results = []
 
-        # Iterate through each line in the text
         for line in text.split("\n"):
-            # Extract all numbers from the line
             numbers = re.findall(number_pattern, line)
             numbers_no_commas = [num.replace(",", "") for num in numbers]
-            # Convert strings to float or int
             numbers = [
                 float(num) if "." in num else int(num) for num in numbers_no_commas
             ]
-            # Add the tuple of numbers to results
             if len(numbers) >= 1:
                 last_number = numbers[-1]
                 results.append(last_number)
@@ -2051,7 +1792,6 @@ def extract_option_probabilities_from_response(forecast_text: str, options) -> f
     NUM_OPTIONS = len(options)
 
     if len(option_probabilities) > 0:
-        # return the last NUM_OPTIONS items
         return option_probabilities[-NUM_OPTIONS:]
     else:
         raise ValueError(f"Could not extract prediction from response: {forecast_text}")
@@ -2062,30 +1802,20 @@ def generate_multiple_choice_forecast(options, option_probabilities) -> dict:
     Returns: dict corresponding to the probabilities of each option.
     """
 
-    # confirm that there is a probability for each option
     if len(options) != len(option_probabilities):
         raise ValueError(
             f"Number of options ({len(options)}) does not match number of probabilities ({len(option_probabilities)})"
         )
 
-    # Ensure we are using decimals
     total_sum = sum(option_probabilities)
     decimal_list = [x / total_sum for x in option_probabilities]
 
     def normalize_list(float_list):
-        # Step 1: Clamp values
         clamped_list = [max(min(x, 0.99), 0.01) for x in float_list]
-
-        # Step 2: Calculate the sum of all elements
         total_sum = sum(clamped_list)
-
-        # Step 3: Normalize the list so that all elements add up to 1
         normalized_list = [x / total_sum for x in clamped_list]
-
-        # Step 4: Adjust for any small floating-point errors
         adjustment = 1.0 - sum(normalized_list)
         normalized_list[-1] += adjustment
-
         return normalized_list
 
     normalized_option_probabilities = normalize_list(decimal_list)
@@ -2109,26 +1839,7 @@ async def get_multiple_choice_gpt_prediction(
     fine_print = question_details["fine_print"]
     options = question_details["options"]
 
-    skip_urls: set[str] = set(extract_rc_urls(resolution_criteria) + extract_fp_urls(fine_print))
-    summary_report, _scraped, _fp_scraped = await asyncio.gather(
-        run_research(title, resolution_criteria, background, fine_print, skip_urls=skip_urls),
-        scrape_resolution_sources(resolution_criteria, title, use_llm_cleaning=True),
-        scrape_fine_print_sources(fine_print, title, use_llm_cleaning=True),
-    )
-    resolution_source_data = (
-        "## Resolution Criteria Source Data\n"
-        "The following data was scraped directly from URLs referenced in the resolution criteria "
-        "at the time of forecasting. Use it as ground truth for the current state of the resolution "
-        "source — it may contain entries, counts, dates, or records that directly determine how "
-        "this question resolves.\n\n"
-        f"{_scraped}"
-    ) if _scraped else ""
-    fine_print_source_data = (
-        "## Fine Print Source Data\n"
-        "The following data was scraped from URLs referenced in the fine print "
-        "at the time of forecasting.\n\n"
-        f"{_fp_scraped}"
-    ) if _fp_scraped else ""
+    summary_report = await run_research(title, resolution_criteria, background, fine_print)
 
     content = MULTIPLE_CHOICE_PROMPT_TEMPLATE.format(
         title=title,
@@ -2137,8 +1848,6 @@ async def get_multiple_choice_gpt_prediction(
         resolution_criteria=resolution_criteria,
         fine_print=fine_print,
         summary_report=summary_report,
-        resolution_source_data=resolution_source_data,
-        fine_print_source_data=fine_print_source_data,
         options=options,
     )
     log_prediction_prompt("multiple_choice", title, content)
@@ -2335,7 +2044,7 @@ Examples:
   poetry run python forecasting_bot --mode tournament --no-submit --tournament q1-2025-ai
         """
     )
-    
+
     parser.add_argument(
         "--mode",
         type=str,
@@ -2343,7 +2052,7 @@ Examples:
         default="tournament",
         help="Mode to run the bot in. 'tournament' for tournament questions, 'examples' for example questions (default: tournament)",
     )
-    
+
     parser.add_argument(
         "--tournament",
         type=str,
@@ -2351,49 +2060,47 @@ Examples:
         default=None,
         help=f"Tournament ID(s) or name(s) to forecast on. Available tournaments: {', '.join(TOURNAMENT_MAPPING.keys())}. If not specified, defaults to: {DEFAULT_TOURNAMENT_ID}. Can specify multiple: --tournament metaculus-cup minibench",
     )
-    
+
     parser.add_argument(
         "--no-submit",
         action="store_true",
         help="Run the bot without submitting predictions to Metaculus (useful for testing)",
     )
-    
+
     parser.add_argument(
         "--num-runs",
         type=int,
         default=NUM_RUNS_PER_QUESTION,
         help=f"Number of LLM runs per question for median aggregation (default: {NUM_RUNS_PER_QUESTION})",
     )
-    
+
     return parser.parse_args()
 
 
 def get_tournament_ids(tournament_args: list[str] | None) -> list[int | str]:
     """
     Resolve tournament arguments to tournament IDs.
-    
+
     Args:
         tournament_args: List of tournament names/IDs from CLI or None
-        
+
     Returns:
         List of tournament IDs (int or str)
-        
+
     Raises:
         ValueError: If any tournament name is invalid
     """
     if tournament_args is None:
         print(f"No tournament specified. Using default: {DEFAULT_TOURNAMENT_ID}")
         return [DEFAULT_TOURNAMENT_ID]
-    
+
     tournament_ids = []
     for tournament_arg in tournament_args:
-        # Check if it's a known tournament name
         if tournament_arg.lower() in TOURNAMENT_MAPPING:
             tournament_id = TOURNAMENT_MAPPING[tournament_arg.lower()]
             print(f"Added tournament: {tournament_arg} (ID: {tournament_id})")
             tournament_ids.append(tournament_id)
         else:
-            # Try to use it as a direct ID
             try:
                 tournament_id = int(tournament_arg)
                 print(f"Added tournament ID: {tournament_id}")
@@ -2403,51 +2110,46 @@ def get_tournament_ids(tournament_args: list[str] | None) -> list[int | str]:
                     f"Invalid tournament: '{tournament_arg}'. "
                     f"Available tournaments: {', '.join(TOURNAMENT_MAPPING.keys())}"
                 )
-    
+
     return tournament_ids
 
 
 ######################## FINAL RUN #########################
 if __name__ == "__main__":
     args = parse_arguments()
-    
+
     all_questions: list[tuple[int, int]] = []
-    
-    # Determine which questions to forecast
+
     if args.mode == "examples":
         print("Running in EXAMPLE mode...")
         all_questions = EXAMPLE_QUESTIONS
     else:  # mode == "tournament"
         print("Running in TOURNAMENT mode...")
         tournament_ids = get_tournament_ids(args.tournament)
-        
+
         print(f"\nFetching questions from {len(tournament_ids)} tournament(s)...\n")
-        
-        # Collect questions from all specified tournaments
-        seen_questions = set()  # Track questions to avoid duplicates
+
+        seen_questions = set()
         for tournament_id in tournament_ids:
             questions = get_open_question_ids_from_tournament(tournament_id)
             for question_id, post_id in questions:
-                # Only add if we haven't seen this question before
                 if question_id not in seen_questions:
                     all_questions.append((question_id, post_id))
                     seen_questions.add(question_id)
-        
+
         if not all_questions:
             print("No open questions found in any of the specified tournaments.")
             exit(0)
-        
+
         print(f"\nTotal unique questions to forecast: {len(all_questions)}\n")
-    
-    # Determine submission behavior
+
     submit_prediction = not args.no_submit
     if not submit_prediction:
-        print("⚠️  Running in TEST mode - predictions will NOT be submitted to Metaculus")
-    
+        print("Running in TEST mode - predictions will NOT be submitted to Metaculus")
+
     print(f"Using {args.num_runs} runs per question")
     print(f"Skip previously forecasted: {SKIP_PREVIOUSLY_FORECASTED_QUESTIONS}\n")
 
-    # Run the forecasting
     asyncio.run(
         forecast_questions(
             all_questions,
@@ -2456,4 +2158,3 @@ if __name__ == "__main__":
             SKIP_PREVIOUSLY_FORECASTED_QUESTIONS,
         )
     )
-    print_token_summary()
