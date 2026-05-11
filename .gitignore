@@ -1,12 +1,16 @@
 # Secrets
 .env
 .env.*
+!.env.example
 
 # Python cache/build
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*.egg-info/
+dist/
+build/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -14,30 +18,17 @@ __pycache__/
 # Virtualenvs
 .venv/
 venv/
+env/
 
 # Local generated outputs
 forecast_types/
 input_questions/
 question_types/
 test_results/
+docs/LLM results/
+sounds/
 
-# Web Scraper outputs
-Web Scraper/results/
-
-# Local files/folders to keep out of commits
-docs/
-forecast_custom_question.py
-inspect_bot.py
-experiment.py
-test.py
-forecast_custom_questions.py
-metaculus_research.py
-refined_forecast.py
-debugging_bot.py
-test_resolution_criteria_scraper.py
-newsapi_research.py
-run_custom_forecast.py
-scrape_inspect_fluview.py
+testasknews.py
 
 # Claude Code local config
 .claude/

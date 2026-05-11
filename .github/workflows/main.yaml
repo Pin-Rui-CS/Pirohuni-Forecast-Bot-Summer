@@ -38,9 +38,6 @@ jobs:
       - name: Install Python dependencies (Poetry)
         run: poetry install --no-interaction --no-root
 
-      - name: Install Web Scraper dependencies
-        run: poetry run pip install -r "Web Scraper/requirements.txt"
-
       - name: Verify secrets are configured
         run: |
           echo "::group::API Key Configuration"
@@ -48,16 +45,12 @@ jobs:
           echo "OPENROUTER_API_KEY:   $([ -n '${{ secrets.OPENROUTER_API_KEY }}'   ] && echo 'SET' || echo 'MISSING')"
           echo "ASKNEWS_CLIENT_ID:    $([ -n '${{ secrets.ASKNEWS_CLIENT_ID }}'    ] && echo 'SET' || echo 'MISSING')"
           echo "ASKNEWS_SECRET:       $([ -n '${{ secrets.ASKNEWS_SECRET }}'       ] && echo 'SET' || echo 'MISSING')"
-          echo "EXA_API_KEY:          $([ -n '${{ secrets.EXA_API_KEY }}'          ] && echo 'SET' || echo 'MISSING')"
-          echo "PERPLEXITY_API_KEY:   $([ -n '${{ secrets.PERPLEXITY_API_KEY }}'   ] && echo 'SET' || echo 'MISSING')"
-          echo "SERPAPI_API_KEY:      $([ -n '${{ secrets.SERPAPI_API_KEY }}'      ] && echo 'SET' || echo 'MISSING')"
-          echo "TAVILY_API_KEY:       $([ -n '${{ secrets.TAVILY_API_KEY }}'       ] && echo 'SET' || echo 'MISSING')"
-          echo "FIRECRAWL_API_KEY:    $([ -n '${{ secrets.FIRECRAWL_API_KEY }}'    ] && echo 'SET' || echo 'MISSING')"
-          echo "JINA_API_KEY:         $([ -n '${{ secrets.JINA_API_KEY }}'         ] && echo 'SET' || echo 'MISSING')"
+          echo "ASKNEWS_API_KEY:      $([ -n '${{ secrets.ASKNEWS_API_KEY }}'      ] && echo 'SET' || echo 'MISSING')"
           echo "::endgroup::"
 
       - name: Run forecasting bot
         run: |
+          set -o pipefail
           poetry run python forecasting_bot.py \
             --mode tournament \
             --tournament summer-2026-ai minibench \
@@ -66,18 +59,10 @@ jobs:
           PYTHONUNBUFFERED: "1" # stream Python output in real time
           PYTHONFAULTHANDLER: "1" # print traceback on crashes / segfaults
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
-          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
-          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
-          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
-          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
-          FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
-          JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
 
       - name: Upload bot log as artifact
         if: always() # upload even if the bot step failed
