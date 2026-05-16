@@ -1,0 +1,182 @@
+name: Test one Metaculus Cup question
+
+on:
+  workflow_dispatch:
+    inputs:
+      question_id:
+        description: "Optional Metaculus question ID. Leave blank to test the first open Metaculus Cup question."
+        required: false
+        type: string
+      post_id:
+        description: "Optional post ID. If provided with question_id, skips tournament lookup."
+        required: false
+        type: string
+      submit:
+        description: "Submit forecast and comment to Metaculus"
+        required: true
+        default: false
+        type: boolean
+      num_runs:
+        description: "LLM runs for this test question"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+      skip_previously_forecasted:
+        description: "Skip if this account has already forecasted the question"
+        required: true
+        default: false
+        type: boolean
+      cost_limit:
+        description: "OpenRouter cost hard limit in USD. 0 tracks only."
+        required: true
+        default: "0"
+        type: string
+
+concurrency:
+  group: test-one-metaculus-cup-question
+  cancel-in-progress: false
+
+jobs:
+  test_one_question:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+
+      - name: Load cached venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
+
+      - name: Install Python dependencies
+        run: poetry install --no-interaction --no-root
+
+      - name: Verify secrets are configured
+        run: |
+          echo "::group::API Key Configuration"
+          echo "METACULUS_TOKEN:      $([ -n '${{ secrets.METACULUS_TOKEN }}'      ] && echo 'SET' || echo 'MISSING')"
+          echo "OPENROUTER_API_KEY:   $([ -n '${{ secrets.OPENROUTER_API_KEY }}'   ] && echo 'SET' || echo 'MISSING')"
+          echo "ASKNEWS_CLIENT_ID:    $([ -n '${{ secrets.ASKNEWS_CLIENT_ID }}'    ] && echo 'SET' || echo 'MISSING')"
+          echo "ASKNEWS_SECRET:       $([ -n '${{ secrets.ASKNEWS_SECRET }}'       ] && echo 'SET' || echo 'MISSING')"
+          echo "ASKNEWS_API_KEY:      $([ -n '${{ secrets.ASKNEWS_API_KEY }}'      ] && echo 'SET' || echo 'MISSING')"
+          echo "JINA_API_KEY:         $([ -n '${{ secrets.JINA_API_KEY }}'         ] && echo 'SET' || echo 'MISSING')"
+          echo "::endgroup::"
+
+      - name: Run one-question test
+        run: |
+          set -o pipefail
+          poetry run python - <<'PY' 2>&1 | tee bot_run.log
+          import asyncio
+          import os
+
+          from config import CURRENT_METACULUS_CUP_ID
+          from forecasting_bot import validate_runtime_configuration
+          from metaculus_client import get_open_question_ids_from_tournament
+          from orchestrator import forecast_questions
+
+
+          def parse_bool(value: str) -> bool:
+              return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+          def parse_optional_int(name: str) -> int | None:
+              value = os.getenv(name, "").strip()
+              return int(value) if value else None
+
+
+          validate_runtime_configuration()
+
+          question_id = parse_optional_int("QUESTION_ID")
+          post_id = parse_optional_int("POST_ID")
+          submit_prediction = parse_bool(os.getenv("SUBMIT_PREDICTION", "false"))
+          skip_previously_forecasted = parse_bool(os.getenv("SKIP_PREVIOUSLY_FORECASTED", "false"))
+          num_runs = int(os.getenv("NUM_RUNS", "1"))
+          cost_limit = float(os.getenv("COST_LIMIT", "0"))
+
+          if post_id is not None and question_id is None:
+              raise RuntimeError("post_id was provided without question_id.")
+
+          if question_id is not None and post_id is not None:
+              selected_questions = [(question_id, post_id)]
+          else:
+              cup_questions = get_open_question_ids_from_tournament(CURRENT_METACULUS_CUP_ID)
+              if question_id is None:
+                  if not cup_questions:
+                      raise RuntimeError("No open Metaculus Cup questions found.")
+                  selected_questions = [cup_questions[0]]
+              else:
+                  selected_questions = [
+                      (candidate_question_id, candidate_post_id)
+                      for candidate_question_id, candidate_post_id in cup_questions
+                      if candidate_question_id == question_id
+                  ]
+                  if not selected_questions:
+                      raise RuntimeError(
+                          f"Question {question_id} was not found among open Metaculus Cup questions. "
+                          "Provide post_id as well to test it directly."
+                      )
+
+          selected_question_id, selected_post_id = selected_questions[0]
+          print(
+              "Running one-question Metaculus Cup test: "
+              f"question_id={selected_question_id}, post_id={selected_post_id}, "
+              f"submit={submit_prediction}, num_runs={num_runs}, "
+              f"skip_previously_forecasted={skip_previously_forecasted}, "
+              f"cost_limit=${cost_limit:.2f}"
+          )
+
+          asyncio.run(
+              forecast_questions(
+                  selected_questions,
+                  submit_prediction,
+                  num_runs,
+                  skip_previously_forecasted,
+                  cost_limit,
+              )
+          )
+          PY
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONFAULTHANDLER: "1"
+          QUESTION_ID: ${{ inputs.question_id }}
+          POST_ID: ${{ inputs.post_id }}
+          SUBMIT_PREDICTION: ${{ inputs.submit }}
+          NUM_RUNS: ${{ inputs.num_runs }}
+          SKIP_PREVIOUSLY_FORECASTED: ${{ inputs.skip_previously_forecasted }}
+          COST_LIMIT: ${{ inputs.cost_limit }}
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+          JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
+          METACULUS_MAX_CONCURRENT_REQUESTS: ${{ vars.METACULUS_MAX_CONCURRENT_REQUESTS || '1' }}
+          METACULUS_REQUEST_INTERVAL: ${{ vars.METACULUS_REQUEST_INTERVAL || '3.0' }}
+          INITIAL_API_GET_RETRY_WAIT_SECONDS: ${{ vars.INITIAL_API_GET_RETRY_WAIT_SECONDS || '3.0' }}
+          ASKNEWS_CACHE_MODE: ${{ vars.ASKNEWS_CACHE_MODE || 'no_cache' }}
+          OPENROUTER_COST_HARD_LIMIT_USD: ${{ vars.OPENROUTER_COST_HARD_LIMIT_USD || '0' }}
+
+      - name: Upload bot log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: one-question-test-log-${{ github.run_id }}
+          path: bot_run.log
+          retention-days: 14

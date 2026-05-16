@@ -12,6 +12,7 @@ import tempfile
 from openai import AsyncOpenAI
 
 from config import OPENROUTER_API_KEY, llm_rate_limiter
+from monetary_cost_manager import MonetaryCostManager, track_openrouter_response_cost
 
 
 def log_prediction_prompt(question_type: str, title: str, prompt: str) -> None:
@@ -146,12 +147,15 @@ async def call_llm(
         print(f"::group::[LLM CALL] {_label} | model={model}")
         print(f"[PROMPT]\n{prompt}\n[/PROMPT]")
         async with llm_rate_limiter:
+            MonetaryCostManager.raise_error_if_limit_would_be_reached()
             response = await client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
                 stream=False,
             )
+        tracked_cost = track_openrouter_response_cost(response)
+        print(f"[COST] Estimated OpenRouter cost: ${tracked_cost:.6f}")
         answer = response.choices[0].message.content
         print(f"[RESPONSE]\n{answer}\n[/RESPONSE]")
         print("::endgroup::")
@@ -165,6 +169,7 @@ async def call_llm(
     messages: list[dict] = [{"role": "user", "content": prompt}]
     for iteration in range(10):
         async with llm_rate_limiter:
+            MonetaryCostManager.raise_error_if_limit_would_be_reached()
             response = await client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -173,6 +178,8 @@ async def call_llm(
                 tools=[RUN_PYTHON_CODE_TOOL],
                 tool_choice="auto",
             )
+        tracked_cost = track_openrouter_response_cost(response)
+        print(f"[COST] Iteration {iteration + 1} estimated OpenRouter cost: ${tracked_cost:.6f}")
         choice = response.choices[0]
 
         if choice.finish_reason != "tool_calls":
@@ -229,11 +236,91 @@ async def run_research(
     background: str = "",
     fine_print: str = "",
 ) -> str:
-    from asknews_research import run_asknews_research
+    from research.asknews_research import run_asknews_research
+    from research.manifold_research import scrape_manifold
+    from research.polymarket_research import scrape_polymarket
 
-    return await run_asknews_research(
+    async def run_provider(name: str, research_call) -> tuple[str, str | None]:
+        try:
+            result = await research_call()
+            if result is None or not str(result).strip():
+                return name, None
+            return name, str(result).strip()
+        except Exception as exc:
+            return name, f"{name} research unavailable: {type(exc).__name__}: {exc}"
+
+    def should_include_provider_result(name: str, content: str | None) -> bool:
+        if not content:
+            return False
+        lowered = content.lower()
+        if "research unavailable" in lowered:
+            return False
+        if name in {"Manifold", "Polymarket"}:
+            no_result_markers = (
+                "no sufficiently relevant",
+                "no active",
+                "no manifold markets results",
+                "no polymarket results",
+            )
+            return not any(marker in lowered for marker in no_result_markers)
+        return True
+
+    async def asknews_call() -> str:
+        return await run_asknews_research(
+            title=title,
+            resolution_criteria=resolution_criteria,
+            background=background,
+            fine_print=fine_print,
+        )
+
+    async def resolution_sources_call() -> str:
+        if not resolution_criteria.strip():
+            return ""
+
+        from resolution_criteria_scraper import scrape_resolution_sources
+
+        question_context = title
+        if background.strip():
+            question_context += f"\n\nBackground:\n{background.strip()}"
+        if fine_print.strip():
+            question_context += f"\n\nFine print:\n{fine_print.strip()}"
+
+        return await scrape_resolution_sources(
+            resolution_criteria=resolution_criteria,
+            question_text=question_context,
+            use_llm_cleaning=True,
+        )
+
+    async def manifold_call() -> str:
+        return await asyncio.to_thread(scrape_manifold, title)
+
+    async def polymarket_call() -> str:
+        return await asyncio.to_thread(scrape_polymarket, title)
+
+    results = await asyncio.gather(
+        run_provider("Resolution Criteria Sources", resolution_sources_call),
+        run_provider("Manifold", manifold_call),
+        run_provider("Polymarket", polymarket_call),
+        run_provider("AskNews", asknews_call),
+    )
+
+    sections = []
+    included_results: list[tuple[str, str]] = []
+    for name, content in results:
+        if should_include_provider_result(name, content):
+            cleaned_content = content or ""
+            sections.append(cleaned_content)
+            included_results.append((name, cleaned_content))
+
+    if not sections:
+        return "No external research material found."
+
+    from compiler import compile_research_report
+
+    return await compile_research_report(
         title=title,
         resolution_criteria=resolution_criteria,
         background=background,
         fine_print=fine_print,
+        provider_results=included_results,
     )

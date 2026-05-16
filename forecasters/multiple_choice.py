@@ -47,7 +47,7 @@ Today is {today}.
 
 ## PHASE 1 — OUTSIDE VIEW (Base Rate)
 
-Before examining any of the provided research, establish a starting distribution using base rates and reference classes.
+Establish a starting distribution using base rates and reference classes.
 
 - Identify the most relevant reference class for this type of question. How are outcomes of this kind typically distributed across similar option sets?
 - Reason about the prior probability each option deserves based purely on historical patterns and structural priors (e.g. incumbency advantage, status quo bias).

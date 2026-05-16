@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from config import API_BASE_URL
+from config import API_BASE_URL, OPENROUTER_API_KEY
 from forecasters.binary import get_binary_gpt_prediction
 from forecasters.multiple_choice import get_multiple_choice_gpt_prediction
 from forecasters.numeric import get_numeric_gpt_prediction
@@ -13,6 +13,37 @@ from metaculus_client import (
     post_question_comment,
     post_question_prediction,
 )
+from monetary_cost_manager import MonetaryCostManager, get_openrouter_key_usage
+
+
+async def get_openrouter_usage_summary() -> str:
+    try:
+        data = await get_openrouter_key_usage(OPENROUTER_API_KEY or "")
+    except Exception as exc:
+        return (
+            "OpenRouter key usage unavailable: "
+            f"{exc.__class__.__name__}: {exc}"
+        )
+
+    label = data.get("label") or "current key"
+    limit_remaining = data.get("limit_remaining")
+    key_limit = data.get("limit")
+    usage = data.get("usage")
+    usage_daily = data.get("usage_daily")
+
+    if limit_remaining is None:
+        remaining_text = "unlimited or no key limit configured"
+    else:
+        remaining_text = f"${float(limit_remaining):.6f}"
+
+    limit_text = "unlimited" if key_limit is None else f"${float(key_limit):.6f}"
+    usage_text = "unknown" if usage is None else f"${float(usage):.6f}"
+    daily_text = "unknown" if usage_daily is None else f"${float(usage_daily):.6f}"
+    return (
+        f"OpenRouter key usage ({label}): "
+        f"limit_remaining={remaining_text}, limit={limit_text}, "
+        f"usage={usage_text}, usage_daily={daily_text}"
+    )
 
 
 def forecast_is_already_made(post_details: dict) -> bool:
@@ -62,20 +93,22 @@ async def forecast_individual_question(
         summary_of_forecast += f"Skipped: Forecast already made\n"
         return summary_of_forecast
 
-    if question_type == "binary":
-        forecast, comment, prompt, raw_responses = await get_binary_gpt_prediction(
-            question_details, num_runs_per_question
-        )
-    elif question_type in ("numeric", "discrete"):
-        forecast, comment, prompt, raw_responses = await get_numeric_gpt_prediction(
-            question_details, num_runs_per_question
-        )
-    elif question_type == "multiple_choice":
-        forecast, comment, prompt, raw_responses = await get_multiple_choice_gpt_prediction(
-            question_details, num_runs_per_question
-        )
-    else:
-        raise ValueError(f"Unknown question type: {question_type}")
+    with MonetaryCostManager() as question_cost_manager:
+        if question_type == "binary":
+            forecast, comment, prompt, raw_responses = await get_binary_gpt_prediction(
+                question_details, num_runs_per_question
+            )
+        elif question_type in ("numeric", "discrete"):
+            forecast, comment, prompt, raw_responses = await get_numeric_gpt_prediction(
+                question_details, num_runs_per_question
+            )
+        elif question_type == "multiple_choice":
+            forecast, comment, prompt, raw_responses = await get_multiple_choice_gpt_prediction(
+                question_details, num_runs_per_question
+            )
+        else:
+            raise ValueError(f"Unknown question type: {question_type}")
+        price_estimate = question_cost_manager.current_usage
 
     print(
         f"-----------------------------------------------\nPost {post_id} Question {question_id}:\n"
@@ -89,6 +122,7 @@ async def forecast_individual_question(
         summary_of_forecast += f"Forecast: {forecast}\n"
 
     summary_of_forecast += f"Comment:\n```\n{comment[:200]}...\n```\n\n"
+    summary_of_forecast += f"Estimated LLM cost: ${price_estimate:.6f}\n"
 
     forecast_payload = create_forecast_payload(forecast, question_type)
     save_llm_result(question_id, post_id, title, question_type, prompt, raw_responses, forecast, forecast_payload)
@@ -106,19 +140,34 @@ async def forecast_questions(
     submit_prediction: bool,
     num_runs_per_question: int,
     skip_previously_forecasted_questions: bool,
+    cost_hard_limit_usd: float = 0,
 ) -> None:
-    forecast_tasks = [
-        forecast_individual_question(
-            question_id,
-            post_id,
-            submit_prediction,
-            num_runs_per_question,
-            skip_previously_forecasted_questions,
-        )
-        for question_id, post_id in open_question_id_post_id
-    ]
-    forecast_summaries = await asyncio.gather(*forecast_tasks, return_exceptions=True)
+    print(await get_openrouter_usage_summary())
+
+    with MonetaryCostManager(hard_limit=cost_hard_limit_usd) as run_cost_manager:
+        forecast_tasks = [
+            forecast_individual_question(
+                question_id,
+                post_id,
+                submit_prediction,
+                num_runs_per_question,
+                skip_previously_forecasted_questions,
+            )
+            for question_id, post_id in open_question_id_post_id
+        ]
+        forecast_summaries = await asyncio.gather(*forecast_tasks, return_exceptions=True)
+        total_estimated_cost = run_cost_manager.current_usage
+
+    completed_count = sum(
+        1 for forecast_summary in forecast_summaries if not isinstance(forecast_summary, Exception)
+    )
+    average_estimated_cost = (
+        total_estimated_cost / completed_count if completed_count else 0
+    )
     print("\n", "#" * 100, "\nForecast Summaries\n", "#" * 100)
+    print(f"Total estimated OpenRouter LLM cost: ${total_estimated_cost:.6f}")
+    print(f"Average estimated cost per completed question: ${average_estimated_cost:.6f}\n")
+    print(await get_openrouter_usage_summary())
 
     errors = []
     for question_id_post_id, forecast_summary in zip(

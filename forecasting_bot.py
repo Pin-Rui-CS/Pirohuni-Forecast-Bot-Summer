@@ -13,6 +13,7 @@ from config import (
     METACULUS_TOKEN,
     NUM_RUNS_PER_QUESTION,
     OPENROUTER_API_KEY,
+    OPENROUTER_COST_HARD_LIMIT_USD,
     SKIP_PREVIOUSLY_FORECASTED_QUESTIONS,
     TOURNAMENT_MAPPING,
 )
@@ -67,6 +68,17 @@ Examples:
         type=positive_int,
         default=NUM_RUNS_PER_QUESTION,
         help=f"Number of LLM runs per question for median aggregation (default: {NUM_RUNS_PER_QUESTION})",
+    )
+
+    parser.add_argument(
+        "--cost-limit",
+        type=float,
+        default=OPENROUTER_COST_HARD_LIMIT_USD,
+        help=(
+            "Optional OpenRouter cost hard limit in USD for this run. "
+            "Use 0 to track cost without enforcing a limit "
+            f"(default: {OPENROUTER_COST_HARD_LIMIT_USD})"
+        ),
     )
 
     return parser.parse_args()
@@ -165,6 +177,7 @@ if __name__ == "__main__":
         print("Running in TEST mode - predictions will NOT be submitted to Metaculus")
 
     print(f"Using {args.num_runs} runs per question")
+    print(f"OpenRouter cost hard limit: ${args.cost_limit:.2f}" if args.cost_limit else "OpenRouter cost hard limit: disabled")
     print(f"Skip previously forecasted: {SKIP_PREVIOUSLY_FORECASTED_QUESTIONS}\n")
 
     asyncio.run(
@@ -173,5 +186,6 @@ if __name__ == "__main__":
             submit_prediction,
             args.num_runs,
             SKIP_PREVIOUSLY_FORECASTED_QUESTIONS,
+            args.cost_limit,
         )
     )

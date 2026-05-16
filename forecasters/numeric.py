@@ -55,7 +55,7 @@ Today is {today}.
 
 ## PHASE 1 — OUTSIDE VIEW (Base Rate)
 
-Before examining any of the provided research, establish a starting distribution using base rates and reference classes.
+Establish a starting distribution using base rates and reference classes.
 
 - Identify the most relevant reference class. What is the typical range of outcomes for this type of quantity?
 - Reason about the historical base rate distribution: central tendency, spread, and whether outcomes are skewed.

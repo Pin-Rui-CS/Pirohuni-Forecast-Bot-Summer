@@ -48,7 +48,7 @@ Today is {today}.
 
 ## PHASE 1 — OUTSIDE VIEW (Base Rate)
 
-Before examining any of the provided research, establish a starting probability using base rates and reference classes.
+Establish a starting probability using base rates and reference classes.
 
 - Identify the most relevant reference class for this question. What is the general category of event being predicted?
 - Find or reason about the historical base rate. How often do events of this type occur under broadly similar conditions?

@@ -60,7 +60,7 @@ async def run_asknews_research(
         searcher = AskNewsSearcher()
         report = await searcher.get_formatted_news_async(query)
 
-    return f"AskNews research report\n\nQuery:\n{query}\n\n{report}"
+    return report
 
 
 class AskNewsSearcher:

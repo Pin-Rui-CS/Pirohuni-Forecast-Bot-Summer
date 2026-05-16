@@ -3,7 +3,9 @@ name: Forecast on new AI tournament questions
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 * * * *" # runs every hour
+    - cron: "4 * * * *" # every hour at 4 minutes past the hour
+    - cron: "24 * * * *" # every hour at 24 minutes past the hour
+    - cron: "44 * * * *" # every hour at 44 minutes past the hour
 
 # Prevent parallel runs
 concurrency:
@@ -46,7 +48,24 @@ jobs:
           echo "ASKNEWS_CLIENT_ID:    $([ -n '${{ secrets.ASKNEWS_CLIENT_ID }}'    ] && echo 'SET' || echo 'MISSING')"
           echo "ASKNEWS_SECRET:       $([ -n '${{ secrets.ASKNEWS_SECRET }}'       ] && echo 'SET' || echo 'MISSING')"
           echo "ASKNEWS_API_KEY:      $([ -n '${{ secrets.ASKNEWS_API_KEY }}'      ] && echo 'SET' || echo 'MISSING')"
+          echo "JINA_API_KEY:         $([ -n '${{ secrets.JINA_API_KEY }}'         ] && echo 'SET' || echo 'MISSING')"
           echo "::endgroup::"
+
+      - name: Show optional runtime configuration
+        run: |
+          echo "::group::Runtime Configuration"
+          echo "METACULUS_MAX_CONCURRENT_REQUESTS=${METACULUS_MAX_CONCURRENT_REQUESTS}"
+          echo "METACULUS_REQUEST_INTERVAL=${METACULUS_REQUEST_INTERVAL}"
+          echo "INITIAL_API_GET_RETRY_WAIT_SECONDS=${INITIAL_API_GET_RETRY_WAIT_SECONDS}"
+          echo "ASKNEWS_CACHE_MODE=${ASKNEWS_CACHE_MODE}"
+          echo "OPENROUTER_COST_HARD_LIMIT_USD=${OPENROUTER_COST_HARD_LIMIT_USD}"
+          echo "::endgroup::"
+        env:
+          METACULUS_MAX_CONCURRENT_REQUESTS: ${{ vars.METACULUS_MAX_CONCURRENT_REQUESTS || '1' }}
+          METACULUS_REQUEST_INTERVAL: ${{ vars.METACULUS_REQUEST_INTERVAL || '3.0' }}
+          INITIAL_API_GET_RETRY_WAIT_SECONDS: ${{ vars.INITIAL_API_GET_RETRY_WAIT_SECONDS || '3.0' }}
+          ASKNEWS_CACHE_MODE: ${{ vars.ASKNEWS_CACHE_MODE || 'no_cache' }}
+          OPENROUTER_COST_HARD_LIMIT_USD: ${{ vars.OPENROUTER_COST_HARD_LIMIT_USD || '0' }}
 
       - name: Run forecasting bot
         run: |
@@ -63,6 +82,12 @@ jobs:
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+          JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
+          METACULUS_MAX_CONCURRENT_REQUESTS: ${{ vars.METACULUS_MAX_CONCURRENT_REQUESTS || '1' }}
+          METACULUS_REQUEST_INTERVAL: ${{ vars.METACULUS_REQUEST_INTERVAL || '3.0' }}
+          INITIAL_API_GET_RETRY_WAIT_SECONDS: ${{ vars.INITIAL_API_GET_RETRY_WAIT_SECONDS || '3.0' }}
+          ASKNEWS_CACHE_MODE: ${{ vars.ASKNEWS_CACHE_MODE || 'no_cache' }}
+          OPENROUTER_COST_HARD_LIMIT_USD: ${{ vars.OPENROUTER_COST_HARD_LIMIT_USD || '0' }}
 
       - name: Upload bot log as artifact
         if: always() # upload even if the bot step failed
