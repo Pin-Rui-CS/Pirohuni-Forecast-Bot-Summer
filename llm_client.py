@@ -38,7 +38,7 @@ def save_llm_result(
     final_forecast,
     forecast_payload: dict,
     usage_yaml_table: str | None = None,
-) -> tuple[str, str]:
+) -> None:
     os.makedirs(LLM_RESULTS_DIR, exist_ok=True)
     safe_title = re.sub(r'[^\w\s-]', '', title)[:60].strip().replace(' ', '_')
     filename = f"{question_id}_{safe_title}.txt"
@@ -74,16 +74,14 @@ def save_llm_result(
     if usage_yaml_table:
         lines += [
             sep,
-            "OPENROUTER USAGE (character/token estimate)",
+            "MONETARY COST MANAGER / OPENROUTER USAGE (character/token estimate)",
             sep,
             usage_yaml_table,
             "",
         ]
-    result_text = "\n".join(lines)
     with open(filepath, "w", encoding="utf-8") as f:
-        f.write(result_text)
+        f.write("\n".join(lines))
     print(f"  [LLM result saved] {filepath}")
-    return filepath, result_text
 
 
 RUN_PYTHON_CODE_TOOL = {

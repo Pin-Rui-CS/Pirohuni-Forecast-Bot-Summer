@@ -51,14 +51,6 @@ on:
         required: true
         default: "0"
         type: string
-      google_sheet_url_or_id:
-        description: "Optional Google Sheet URL/ID for money manager rows. Falls back to repo variable GOOGLE_SHEETS_SPREADSHEET_ID."
-        required: false
-        type: string
-      google_drive_folder_url_or_id:
-        description: "Optional Google Drive folder URL/ID for per-question Google Docs. Falls back to repo variable GOOGLE_DRIVE_FOLDER_ID."
-        required: false
-        type: string
 
 concurrency:
   group: test-one-metaculus-cup-question
@@ -92,21 +84,9 @@ jobs:
       - name: Install Python dependencies
         run: poetry install --no-interaction --no-root
 
-      - name: Verify secrets are configured
-        run: |
-          echo "::group::API Key Configuration"
-          echo "METACULUS_TOKEN:      $([ -n '${{ secrets.METACULUS_TOKEN }}'      ] && echo 'SET' || echo 'MISSING')"
-          echo "OPENROUTER_API_KEY:   $([ -n '${{ secrets.OPENROUTER_API_KEY }}'   ] && echo 'SET' || echo 'MISSING')"
-          echo "ASKNEWS_CLIENT_ID:    $([ -n '${{ secrets.ASKNEWS_CLIENT_ID }}'    ] && echo 'SET' || echo 'MISSING')"
-          echo "ASKNEWS_SECRET:       $([ -n '${{ secrets.ASKNEWS_SECRET }}'       ] && echo 'SET' || echo 'MISSING')"
-          echo "ASKNEWS_API_KEY:      $([ -n '${{ secrets.ASKNEWS_API_KEY }}'      ] && echo 'SET' || echo 'MISSING')"
-          echo "JINA_API_KEY:         $([ -n '${{ secrets.JINA_API_KEY }}'         ] && echo 'SET' || echo 'MISSING')"
-          echo "::endgroup::"
-
       - name: Run Metaculus Cup test
         run: |
-          set -o pipefail
-          poetry run python - <<'PY' 2>&1 | tee bot_run.log
+          poetry run python - <<'PY' > "$RUNNER_TEMP/metaculus_cup_raw.log" 2>&1
           import asyncio
           import os
 
@@ -261,6 +241,8 @@ jobs:
               )
           )
           PY
+          echo "Clean LLM result files created:"
+          find "docs/LLM results" -type f -name "*.txt" -print 2>/dev/null || true
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONFAULTHANDLER: "1"
@@ -278,22 +260,17 @@ jobs:
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
           JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
-          GOOGLE_SHEETS_SPREADSHEET_ID: ${{ inputs.google_sheet_url_or_id || vars.GOOGLE_SHEETS_SPREADSHEET_ID }}
-          GOOGLE_SHEETS_TAB: ${{ vars.GOOGLE_SHEETS_TAB || 'Money Manager' }}
-          GOOGLE_DRIVE_FOLDER_ID: ${{ inputs.google_drive_folder_url_or_id || vars.GOOGLE_DRIVE_FOLDER_ID }}
-          GOOGLE_EXPORT_STRICT: ${{ vars.GOOGLE_EXPORT_STRICT || 'true' }}
           METACULUS_MAX_CONCURRENT_REQUESTS: ${{ vars.METACULUS_MAX_CONCURRENT_REQUESTS || '1' }}
           METACULUS_REQUEST_INTERVAL: ${{ vars.METACULUS_REQUEST_INTERVAL || '3.0' }}
           INITIAL_API_GET_RETRY_WAIT_SECONDS: ${{ vars.INITIAL_API_GET_RETRY_WAIT_SECONDS || '3.0' }}
           ASKNEWS_CACHE_MODE: ${{ vars.ASKNEWS_CACHE_MODE || 'no_cache' }}
           OPENROUTER_COST_HARD_LIMIT_USD: ${{ vars.OPENROUTER_COST_HARD_LIMIT_USD || '0' }}
 
-      - name: Upload bot log as artifact
+      - name: Upload clean LLM result logs as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: metaculus-cup-test-log-${{ github.run_id }}
-          path: bot_run.log
+          name: metaculus-cup-llm-results-${{ github.run_id }}
+          path: "docs/LLM results/**/*.txt"
+          if-no-files-found: warn
           retention-days: 14
