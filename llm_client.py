@@ -142,7 +142,7 @@ def execute_python_code(code: str) -> str:
 
 async def call_llm(
     prompt: str,
-    model: str = "anthropic/claude-opus-4.6",
+    model: str = "anthropic/claude-opus-4.7",
     temperature: float = 0.3,
     use_tools: bool = False,
     _label: str = "forecast",
