@@ -39,12 +39,6 @@ Today is {today}.
 
 ---
 
-## Research Material
-
-{summary_report}
-
----
-
 ## PHASE 1 — OUTSIDE VIEW (Base Rate)
 
 Establish a starting distribution using base rates and reference classes.
@@ -114,6 +108,12 @@ Output format:
 - Failure narrative (upset)
 - Failure narrative (favourite loses)
 - Any final adjustment
+
+---
+
+## Research Material
+
+{summary_report}
 
 ---
 

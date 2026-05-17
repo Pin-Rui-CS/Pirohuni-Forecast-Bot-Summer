@@ -40,12 +40,6 @@ Today is {today}.
 
 ---
 
-## Research Material
-
-{summary_report}
-
----
-
 ## PHASE 1 — OUTSIDE VIEW (Base Rate)
 
 Establish a starting probability using base rates and reference classes.
@@ -117,6 +111,12 @@ Output format:
 - Failure narrative (it didn't happen)
 - Any final adjustment
 - **Final probability estimate: X%**
+
+---
+
+## Research Material
+
+{summary_report}
 
 ---
 
