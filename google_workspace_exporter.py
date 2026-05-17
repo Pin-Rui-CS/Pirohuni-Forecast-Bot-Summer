@@ -20,7 +20,7 @@ DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 DOCS_DOCUMENTS_URL = "https://docs.googleapis.com/v1/documents"
 SHEETS_SPREADSHEETS_URL = "https://sheets.googleapis.com/v4/spreadsheets"
 SCOPES = (
-    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/spreadsheets",
 )
@@ -88,6 +88,10 @@ def export_question_result_to_google(
 
     try:
         token = _get_access_token()
+        _verify_drive_folder_access(
+            token=token,
+            folder_id=_drive_folder_id(required=True),
+        )
         doc_url = _create_google_doc(
             token=token,
             folder_id=_drive_folder_id(required=True),
@@ -182,12 +186,40 @@ def _get_access_token() -> str:
         },
         timeout=30.0,
     )
-    response.raise_for_status()
+    _raise_for_status(response, "fetch Google OAuth access token")
     payload = response.json()
     access_token = payload.get("access_token")
     if not access_token:
         raise RuntimeError("Google OAuth token response did not include access_token.")
     return str(access_token)
+
+
+def _verify_drive_folder_access(*, token: str, folder_id: str) -> None:
+    response = httpx.get(
+        f"{DRIVE_FILES_URL}/{folder_id}",
+        headers=_auth_headers(token),
+        params={
+            "fields": "id,name,mimeType,driveId,capabilities(canAddChildren,canEdit,canShare)",
+            "supportsAllDrives": "true",
+        },
+        timeout=30.0,
+    )
+    _raise_for_status(response, "verify Google Drive folder access")
+    folder = response.json()
+    if folder.get("mimeType") != "application/vnd.google-apps.folder":
+        raise RuntimeError(
+            "Google Workspace export failed: GOOGLE_DRIVE_FOLDER_ID does not point "
+            f"to a Drive folder. Got mimeType={folder.get('mimeType')!r}."
+        )
+    capabilities = folder.get("capabilities") or {}
+    if not capabilities.get("canAddChildren"):
+        raise RuntimeError(
+            "Google Workspace export failed: the service account can see the Drive "
+            f"folder {folder.get('name')!r}, but Google says it cannot create files "
+            f"inside it. Folder capabilities={capabilities!r}. Share the folder "
+            "directly with the service account as Editor, or use a folder owned by "
+            "the same account/domain."
+        )
 
 
 def _sign_jwt(private_key_pem: str, claims: dict[str, Any]) -> str:
@@ -237,7 +269,7 @@ def _create_google_doc(
         params={"fields": "id,webViewLink", "supportsAllDrives": "true"},
         timeout=30.0,
     )
-    create_response.raise_for_status()
+    _raise_for_status(create_response, "create Google Doc in Drive folder")
     file_info = create_response.json()
     document_id = file_info["id"]
 
@@ -269,7 +301,7 @@ def _insert_doc_text(token: str, document_id: str, content: str) -> None:
             },
             timeout=30.0,
         )
-        response.raise_for_status()
+        _raise_for_status(response, "insert text into Google Doc")
 
 
 def _append_usage_rows(
@@ -295,7 +327,7 @@ def _append_usage_rows(
         json={"values": rows},
         timeout=30.0,
     )
-    response.raise_for_status()
+    _raise_for_status(response, "append money manager rows to Google Sheet")
 
 
 def _ensure_sheet(token: str, spreadsheet_id: str, sheet_title: str) -> None:
@@ -305,7 +337,7 @@ def _ensure_sheet(token: str, spreadsheet_id: str, sheet_title: str) -> None:
         params={"fields": "sheets.properties.title"},
         timeout=30.0,
     )
-    response.raise_for_status()
+    _raise_for_status(response, "read Google Sheet metadata")
     existing_titles = {
         sheet.get("properties", {}).get("title")
         for sheet in response.json().get("sheets", [])
@@ -329,7 +361,7 @@ def _ensure_sheet(token: str, spreadsheet_id: str, sheet_title: str) -> None:
         },
         timeout=30.0,
     )
-    create_response.raise_for_status()
+    _raise_for_status(create_response, "create Google Sheet tab")
 
 
 def _ensure_header_row(token: str, spreadsheet_id: str, sheet_title: str) -> None:
@@ -342,7 +374,7 @@ def _ensure_header_row(token: str, spreadsheet_id: str, sheet_title: str) -> Non
         headers=_auth_headers(token),
         timeout=30.0,
     )
-    get_response.raise_for_status()
+    _raise_for_status(get_response, "read Google Sheet header row")
     if get_response.json().get("values"):
         return
 
@@ -356,7 +388,7 @@ def _ensure_header_row(token: str, spreadsheet_id: str, sheet_title: str) -> Non
         json={"values": [SHEETS_HEADERS]},
         timeout=30.0,
     )
-    update_response.raise_for_status()
+    _raise_for_status(update_response, "write Google Sheet header row")
 
 
 def _usage_rows(
@@ -475,6 +507,19 @@ def _auth_headers(token: str) -> dict[str, str]:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+
+
+def _raise_for_status(response: httpx.Response, action: str) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = response.text.strip()
+        if len(detail) > 1200:
+            detail = detail[:1200] + "..."
+        raise RuntimeError(
+            f"Google Workspace export failed while trying to {action}. "
+            f"Status={response.status_code}. Response={detail}"
+        ) from exc
 
 
 def _base64url_json(value: dict[str, Any]) -> str:

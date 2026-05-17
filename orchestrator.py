@@ -141,6 +141,11 @@ async def forecast_individual_question(
     )
     summary_of_forecast += f"Local LLM result file: {llm_result_path}\n"
 
+    if submit_prediction:
+        await post_question_prediction(question_id, forecast_payload)
+        await post_question_comment(post_id, comment)
+        summary_of_forecast += "Posted: Forecast was posted to Metaculus.\n"
+
     google_doc_url = export_question_result_to_google(
         question_id=question_id,
         post_id=post_id,
@@ -152,11 +157,6 @@ async def forecast_individual_question(
     )
     if google_doc_url:
         summary_of_forecast += f"Google Doc: {google_doc_url}\n"
-
-    if submit_prediction:
-        await post_question_prediction(question_id, forecast_payload)
-        await post_question_comment(post_id, comment)
-        summary_of_forecast += "Posted: Forecast was posted to Metaculus.\n"
 
     return summary_of_forecast
 
