@@ -51,6 +51,14 @@ on:
         required: true
         default: "0"
         type: string
+      google_sheet_url_or_id:
+        description: "Optional Google Sheet URL/ID for money manager rows. Falls back to repo variable GOOGLE_SHEETS_SPREADSHEET_ID."
+        required: false
+        type: string
+      google_drive_folder_url_or_id:
+        description: "Optional Google Drive folder URL/ID for per-question Google Docs. Falls back to repo variable GOOGLE_DRIVE_FOLDER_ID."
+        required: false
+        type: string
 
 concurrency:
   group: test-one-metaculus-cup-question
@@ -270,6 +278,12 @@ jobs:
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
           JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
+          GOOGLE_SHEETS_SPREADSHEET_ID: ${{ inputs.google_sheet_url_or_id || vars.GOOGLE_SHEETS_SPREADSHEET_ID }}
+          GOOGLE_SHEETS_TAB: ${{ vars.GOOGLE_SHEETS_TAB || 'Money Manager' }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ inputs.google_drive_folder_url_or_id || vars.GOOGLE_DRIVE_FOLDER_ID }}
+          GOOGLE_EXPORT_STRICT: ${{ vars.GOOGLE_EXPORT_STRICT || 'true' }}
           METACULUS_MAX_CONCURRENT_REQUESTS: ${{ vars.METACULUS_MAX_CONCURRENT_REQUESTS || '1' }}
           METACULUS_REQUEST_INTERVAL: ${{ vars.METACULUS_REQUEST_INTERVAL || '3.0' }}
           INITIAL_API_GET_RETRY_WAIT_SECONDS: ${{ vars.INITIAL_API_GET_RETRY_WAIT_SECONDS || '3.0' }}

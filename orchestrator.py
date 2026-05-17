@@ -6,6 +6,7 @@ from config import API_BASE_URL, OPENROUTER_API_KEY
 from forecasters.binary import get_binary_gpt_prediction
 from forecasters.multiple_choice import get_multiple_choice_gpt_prediction
 from forecasters.numeric import get_numeric_gpt_prediction
+from google_workspace_exporter import export_question_result_to_google
 from llm_client import save_llm_result
 from metaculus_client import (
     create_forecast_payload,
@@ -127,7 +128,7 @@ async def forecast_individual_question(
     summary_of_forecast += f"{usage_yaml_table}\n"
 
     forecast_payload = create_forecast_payload(forecast, question_type)
-    save_llm_result(
+    llm_result_path, llm_result_text = save_llm_result(
         question_id,
         post_id,
         title,
@@ -138,6 +139,19 @@ async def forecast_individual_question(
         forecast_payload,
         usage_yaml_table=usage_yaml_table,
     )
+    summary_of_forecast += f"Local LLM result file: {llm_result_path}\n"
+
+    google_doc_url = export_question_result_to_google(
+        question_id=question_id,
+        post_id=post_id,
+        title=title,
+        question_type=question_type,
+        llm_result_text=llm_result_text,
+        usage_records=question_cost_manager.get_usage_records(),
+        metaculus_post_url=f"{API_BASE_URL}/posts/{post_id}/",
+    )
+    if google_doc_url:
+        summary_of_forecast += f"Google Doc: {google_doc_url}\n"
 
     if submit_prediction:
         await post_question_prediction(question_id, forecast_payload)
