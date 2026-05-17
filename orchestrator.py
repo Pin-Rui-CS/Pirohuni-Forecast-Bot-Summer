@@ -108,7 +108,8 @@ async def forecast_individual_question(
             )
         else:
             raise ValueError(f"Unknown question type: {question_type}")
-        price_estimate = question_cost_manager.current_usage
+        estimated_tokens = question_cost_manager.total_tokens
+        usage_yaml_table = question_cost_manager.format_usage_yaml_table()
 
     print(
         f"-----------------------------------------------\nPost {post_id} Question {question_id}:\n"
@@ -122,10 +123,21 @@ async def forecast_individual_question(
         summary_of_forecast += f"Forecast: {forecast}\n"
 
     summary_of_forecast += f"Comment:\n```\n{comment[:200]}...\n```\n\n"
-    summary_of_forecast += f"Estimated LLM cost: ${price_estimate:.6f}\n"
+    summary_of_forecast += f"Estimated OpenRouter LLM tokens: {estimated_tokens}\n"
+    summary_of_forecast += f"{usage_yaml_table}\n"
 
     forecast_payload = create_forecast_payload(forecast, question_type)
-    save_llm_result(question_id, post_id, title, question_type, prompt, raw_responses, forecast, forecast_payload)
+    save_llm_result(
+        question_id,
+        post_id,
+        title,
+        question_type,
+        prompt,
+        raw_responses,
+        forecast,
+        forecast_payload,
+        usage_yaml_table=usage_yaml_table,
+    )
 
     if submit_prediction:
         await post_question_prediction(question_id, forecast_payload)
@@ -156,17 +168,19 @@ async def forecast_questions(
             for question_id, post_id in open_question_id_post_id
         ]
         forecast_summaries = await asyncio.gather(*forecast_tasks, return_exceptions=True)
-        total_estimated_cost = run_cost_manager.current_usage
+        total_estimated_tokens = run_cost_manager.total_tokens
+        run_usage_yaml_table = run_cost_manager.format_usage_yaml_table("openrouter_llm_run_usage")
 
     completed_count = sum(
         1 for forecast_summary in forecast_summaries if not isinstance(forecast_summary, Exception)
     )
-    average_estimated_cost = (
-        total_estimated_cost / completed_count if completed_count else 0
+    average_estimated_tokens = (
+        total_estimated_tokens / completed_count if completed_count else 0
     )
     print("\n", "#" * 100, "\nForecast Summaries\n", "#" * 100)
-    print(f"Total estimated OpenRouter LLM cost: ${total_estimated_cost:.6f}")
-    print(f"Average estimated cost per completed question: ${average_estimated_cost:.6f}\n")
+    print(f"Total estimated OpenRouter LLM tokens: {total_estimated_tokens}")
+    print(f"Average estimated tokens per completed question: {average_estimated_tokens:.1f}\n")
+    print(run_usage_yaml_table)
     print(await get_openrouter_usage_summary())
 
     errors = []

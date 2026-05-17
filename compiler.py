@@ -8,10 +8,7 @@ from typing import Iterable
 from openai import AsyncOpenAI
 
 from config import OPENROUTER_API_KEY, llm_rate_limiter
-from monetary_cost_manager import (
-    MonetaryCostManager,
-    track_openrouter_response_cost,
-)
+from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
 
 logger = logging.getLogger(__name__)
 
@@ -357,34 +354,41 @@ async def _try_llm_compile(
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
     )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a research compiler for forecasting prompts. "
+                "You organize evidence without summarizing, paraphrasing, or forecasting. "
+                "Preserve article wording, citations, market odds, and source URLs. "
+                "When articles repeat the same content, show the shared content once "
+                "and list every article/source that shares it."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
     try:
         async with llm_rate_limiter:
-            MonetaryCostManager.raise_error_if_limit_would_be_reached()
+            usage_handle = MonetaryCostManager.start_openrouter_call(
+                "compiler/research-brief",
+                model,
+                {"messages": messages, "max_tokens": 5000},
+            )
             response = await client.chat.completions.create(
                 model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a research compiler for forecasting prompts. "
-                            "You organize evidence without summarizing, paraphrasing, or forecasting. "
-                            "Preserve article wording, citations, market odds, and source URLs. "
-                            "When articles repeat the same content, show the shared content once "
-                            "and list every article/source that shares it."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
+                messages=messages,
                 temperature=0.1,
                 max_tokens=5000,
                 stream=False,
             )
-        tracked_cost = track_openrouter_response_cost(response)
-        logger.info("research-compiler | model=%s | estimated OpenRouter cost=$%.6f", model, tracked_cost)
+        usage_handle.record_response(response)
+        logger.info("research-compiler | model=%s | OpenRouter usage recorded", model)
         content = response.choices[0].message.content
         if not content or not content.strip():
             return None
         return _normalise_compiled_report(content)
+    except HardLimitExceededError:
+        raise
     except Exception as exc:
         logger.warning("Research compiler LLM pass failed: %s: %s", type(exc).__name__, exc)
         return None

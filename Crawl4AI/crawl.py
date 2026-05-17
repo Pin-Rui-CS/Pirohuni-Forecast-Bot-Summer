@@ -36,6 +36,12 @@ DEFAULT_QUERY_MODEL = "openrouter/google/gemini-2.5-flash-lite"
 DEFAULT_RUNTIME_BASE_DIR = Path(__file__).resolve().parent / ".runtime"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
+
 
 @dataclass(slots=True)
 class AdaptiveResearchConfig:
@@ -323,6 +329,13 @@ The variations should include different phrasings, related concepts, and specifi
                 )
                 api_token = llm_config_dict.get("api_token") if llm_config_dict else None
                 base_url = llm_config_dict.get("base_url") if llm_config_dict else None
+                usage_handle = None
+                if base_url and "openrouter.ai" in str(base_url):
+                    usage_handle = MonetaryCostManager.start_openrouter_call(
+                        "crawl4ai/query-expansion",
+                        provider,
+                        {"prompt": prompt, "json_response": True},
+                    )
 
                 response = perform_completion_with_backoff(
                     provider=provider,
@@ -348,8 +361,12 @@ The variations should include different phrasings, related concepts, and specifi
                     if llm_config_dict
                     else 2,
                 )
+                if usage_handle is not None:
+                    usage_handle.record_response(response)
                 content = response.choices[0].message.content
                 variations = _parse_query_variations(content)
+            except HardLimitExceededError:
+                raise
             except Exception as exc:
                 self._query_expansion_error = f"{type(exc).__name__}: {exc}"
 

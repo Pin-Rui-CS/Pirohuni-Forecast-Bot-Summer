@@ -8,7 +8,7 @@ from typing import Any
 from llm_client import call_llm
 
 
-DEFAULT_QUERY_COUNT = 10
+DEFAULT_QUERY_COUNT = 8
 DEFAULT_QUERY_GENERATION_MODEL = "anthropic/claude-sonnet-4.6"
 DEFAULT_ASKNEWS_CHAR_LIMIT = 14_000
 

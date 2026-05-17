@@ -25,10 +25,10 @@ forecast_types/
 input_questions/
 question_types/
 test_results/
-docs/LLM results/
+docs/
 sounds/
 
-testasknews.py
+test_serp_research.py
 
 # Claude Code local config
 .claude/

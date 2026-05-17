@@ -36,10 +36,7 @@ if str(_SCRAPER_ROOT) not in sys.path:
 
 from scraper import scrape_batch  # noqa: E402  (path inserted above)
 from config import OPENROUTER_API_KEY, llm_rate_limiter  # noqa: E402
-from monetary_cost_manager import (  # noqa: E402
-    MonetaryCostManager,
-    track_openrouter_response_cost,
-)
+from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +48,8 @@ def _get_openrouter_api_key() -> str:
     return api_key
 
 
-def _track_and_log_openrouter_call(label: str, model: str, response) -> None:
-    tracked_cost = track_openrouter_response_cost(response)
-    logger.info("%s | model=%s | estimated OpenRouter cost=$%.6f", label, model, tracked_cost)
+def _log_openrouter_call(label: str, model: str) -> None:
+    logger.info("%s | model=%s | OpenRouter usage recorded", label, model)
 
 # ---------------------------------------------------------------------------
 # Import the Jina Crawler by file path to avoid naming collision.
@@ -296,16 +292,22 @@ async def _llm_summarize(
     )
 
     prompt = _build_summary_prompt(question_text, resolution_criteria, url, content, key_terms)
+    messages = [{"role": "user", "content": prompt}]
 
     async with llm_rate_limiter:
-        MonetaryCostManager.raise_error_if_limit_would_be_reached()
+        usage_handle = MonetaryCostManager.start_openrouter_call(
+            "resolution-scraper/page-summary",
+            model,
+            {"messages": messages, "max_tokens": 2000},
+        )
         response = await client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             max_tokens=2000,
             temperature=0.1,
         )
-    _track_and_log_openrouter_call("resolution-scraper/page-summary", model, response)
+    usage_handle.record_response(response)
+    _log_openrouter_call("resolution-scraper/page-summary", model)
     return response.choices[0].message.content.strip()
 
 
@@ -385,15 +387,21 @@ async def _compile_summaries(
         api_key=_get_openrouter_api_key(),
     )
     prompt = _build_compile_prompt(question_text, resolution_criteria, summaries)
+    messages = [{"role": "user", "content": prompt}]
     async with llm_rate_limiter:
-        MonetaryCostManager.raise_error_if_limit_would_be_reached()
+        usage_handle = MonetaryCostManager.start_openrouter_call(
+            "resolution-scraper/compile-summaries",
+            model,
+            {"messages": messages, "max_tokens": 2000},
+        )
         response = await client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             max_tokens=2000,
             temperature=0.1,
         )
-    _track_and_log_openrouter_call("resolution-scraper/compile-summaries", model, response)
+    usage_handle.record_response(response)
+    _log_openrouter_call("resolution-scraper/compile-summaries", model)
     return response.choices[0].message.content.strip()
 
 
@@ -426,6 +434,8 @@ async def _try_jina_crawler(
             max_pages=max_pages,
         )
         return result if result.strip() else None
+    except HardLimitExceededError:
+        raise
     except Exception as exc:
         logger.warning("Jina Crawler failed for %s: %s — will fall back to Web Scraper", url, exc)
         return None
@@ -543,6 +553,8 @@ async def scrape_resolution_sources(
                             "LLM identified %d follow-up link(s) from %s: %s",
                             len(follow_up_urls), result.url, follow_up_urls,
                         )
+                except HardLimitExceededError:
+                    raise
                 except Exception as exc:
                     logger.warning(
                         "LLM cleaning failed for %s: %s — using heuristic output",
@@ -593,6 +605,8 @@ async def scrape_resolution_sources(
                         )
                         # Strip any follow-up links the LLM might add (no recursion)
                         fu_summary, _ = _extract_follow_up_links(fu_summary)
+                    except HardLimitExceededError:
+                        raise
                     except Exception as exc:
                         logger.warning(
                             "LLM cleaning failed for follow-up %s: %s — using heuristic output",
@@ -628,6 +642,8 @@ async def scrape_resolution_sources(
                 "## Individual Source Summaries\n\n"
                 + "\n\n---\n\n".join(sections)
             )
+        except HardLimitExceededError:
+            raise
         except Exception as exc:
             logger.warning("Compilation step failed: %s — returning individual summaries", exc)
 

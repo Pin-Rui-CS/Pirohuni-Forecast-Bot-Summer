@@ -37,38 +37,36 @@ Any per-question failure is reported and then causes the process to exit with a 
 
 ## Monetary Cost Manager
 
-The bot tracks estimated LLM spend from OpenRouter responses. OpenRouter returns
-`usage.cost` on non-streaming chat completion responses; OpenRouter credits are
-USD-denominated, so the bot treats that value as estimated USD cost.
+The bot now tracks crude OpenRouter LLM usage by character count instead of
+trusting response billing fields. Before each OpenRouter LLM call, it records
+the task name, model, and serialized input character count. After the response,
+it records output characters. Tokens are estimated with `1 token = 4 characters`.
 
 The bot also checks the active key's remaining spend before and after each run
 through `GET https://openrouter.ai/api/v1/key`. The important field for this is
 `data.limit_remaining`, because it reflects the current API key's remaining
-credit limit. If `limit_remaining` is `null`, the key is unlimited or has no key
-limit configured.
+credit limit. This is useful as a billing-side comparison only; local run logs
+use the character/token ledger.
 
 `monetary_cost_manager.py` provides `MonetaryCostManager`, which exposes:
 
 | Property | Meaning |
 |---|---|
-| `current_usage` | Estimated USD cost accumulated inside the manager context |
-| `amount_left` | Remaining USD before the configured hard limit |
+| `current_usage` | Backward-compatible numeric usage value: total estimated tokens |
+| `total_input_characters` / `total_output_characters` | Raw character totals |
+| `total_input_tokens` / `total_output_tokens` | Token estimates using 4 chars/token |
+| `format_usage_yaml_table()` | YAML-compatible log block containing the requested usage table |
 
 The orchestrator wraps each forecast in a per-question `MonetaryCostManager()`
 and wraps the whole run in a parent manager. Forecast summaries include
-per-question cost, and the final run summary includes total estimated cost and
-average estimated cost per completed question.
+per-question token usage, and the final run summary includes a YAML-compatible
+table with columns for no., task name, input/output characters, input/output
+tokens, and model used.
 
 A hard limit can be set with either `OPENROUTER_COST_HARD_LIMIT_USD` or the
-`--cost-limit` CLI flag. A value of `0` disables enforcement while still
-tracking cost. Because costs are known after responses return, concurrent calls
-can slightly exceed the limit before the next pre-call check stops additional
-requests.
-
-OpenRouter's site UI is still useful for graphical cost breakdowns, especially
-when using a personal testing key. LiteLLM can also estimate model costs, but
-this bot currently avoids a LiteLLM migration because OpenRouter already returns
-authoritative per-response cost data for the OpenRouter calls the bot makes.
+`--token-limit` / `--cost-limit` CLI flag. The old env var name is kept for
+compatibility, but the value is now interpreted as estimated tokens. A value of
+`0` disables enforcement while still tracking usage.
 
 ## Research
 
@@ -100,7 +98,7 @@ Optional environment variables:
 | `INITIAL_API_GET_RETRY_WAIT_SECONDS` | `3.0` | Initial retry delay |
 | `ASKNEWS_CACHE_MODE` | `no_cache` | AskNews cache behavior: `use_cache`, `use_cache_with_fallback`, or `no_cache` |
 | `JINA_API_KEY` | unset | Optional Jina Reader key for LLM-guided resolution-source crawling |
-| `OPENROUTER_COST_HARD_LIMIT_USD` | `0` | Optional run-level OpenRouter cost hard limit in USD; `0` means no hard limit |
+| `OPENROUTER_COST_HARD_LIMIT_USD` | `0` | Optional run-level estimated-token hard limit; old name kept for compatibility |
 
 Never commit `.env`.
 
@@ -144,7 +142,7 @@ poetry run python forecasting_bot.py --mode tournament --tournament metaculus-cu
 | `--tournament` | `metaculus-cup-summer-2026` | One or more tournament aliases or raw integer IDs |
 | `--no-submit` | off | Dry run; no forecasts or comments are posted |
 | `--num-runs` | `3` | Number of LLM runs per question; must be at least 1 |
-| `--cost-limit` | `OPENROUTER_COST_HARD_LIMIT_USD` | Optional OpenRouter cost hard limit in USD; `0` tracks only |
+| `--token-limit`, `--cost-limit` | `OPENROUTER_COST_HARD_LIMIT_USD` | Optional OpenRouter estimated-token hard limit; `0` tracks only |
 
 ## Tournament aliases
 

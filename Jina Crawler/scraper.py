@@ -29,6 +29,12 @@ from typing import Optional
 
 import aiohttp
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
+
 
 # ---------------------------------------------------------------------------
 # Config file loader (config.toml, stdlib-only)
@@ -442,32 +448,43 @@ async def _call_openrouter(
     user: str,
     max_tokens: int,
     semaphore: asyncio.Semaphore,
+    task_name: str = "jina-crawler/openrouter",
 ) -> Optional[str]:
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
     async with semaphore:
         try:
+            usage_handle = MonetaryCostManager.start_openrouter_call(
+                task_name,
+                model,
+                payload,
+            )
             async with session.post(
                 OPENROUTER_URL,
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "max_tokens": max_tokens,
-                    "response_format": {"type": "json_object"},
-                },
+                json=payload,
                 timeout=aiohttp.ClientTimeout(total=90),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data["choices"][0]["message"]["content"].strip()
+                    content = data["choices"][0]["message"]["content"].strip()
+                    usage_handle.record_output(content)
+                    return content
                 body = await resp.text()
                 logger.warning("OpenRouter %d: %s", resp.status, body[:300])
                 return None
+        except HardLimitExceededError:
+            raise
         except Exception as e:
             logger.warning("OpenRouter call failed: %s", e)
             return None
@@ -555,6 +572,7 @@ Scoring guidance:
     raw = await _call_openrouter(
         session, openrouter_key, model, system, user,
         max_tokens=1500, semaphore=llm_semaphore,
+        task_name="jina-crawler/analyze-page",
     )
 
     _empty = {"relevance_score": 0, "new_facts": "", "links_to_follow": []}
@@ -623,6 +641,7 @@ from the findings wherever possible."""
     result = await _call_openrouter(
         session, openrouter_key, model, system, user,
         max_tokens=1000, semaphore=llm_semaphore,
+        task_name="jina-crawler/synthesize",
     )
     return result or "Synthesis unavailable — LLM call failed."
 
@@ -1066,6 +1085,8 @@ async def scrape_for_forecast(
                 pages_visited=pages_visited,
                 llm_semaphore=llm_semaphore,
             )
+    except HardLimitExceededError:
+        raise
     except Exception as exc:
         logger.warning("scrape_for_forecast failed for %s: %s", url, exc)
         return ""

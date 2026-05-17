@@ -17,9 +17,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
+from pathlib import Path
 
 import httpx
 from openai import OpenAI
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
 
 # ---------------------------------------------------------------------------
 # Config
@@ -76,11 +84,18 @@ def _generate_search_queries(question: str) -> list[str]:
         'Reply with ONLY a JSON array of strings. Example: ["crude oil", "oil price", "Brent crude"]'
     )
     try:
+        messages = [{"role": "user", "content": prompt}]
+        usage_handle = MonetaryCostManager.start_openrouter_call(
+            "polymarket/search-query-generation",
+            _POLYMARKET_SCORING_MODEL,
+            {"messages": messages},
+        )
         response = _get_openai_client().chat.completions.create(
             model=_POLYMARKET_SCORING_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             temperature=0,
         )
+        usage_handle.record_response(response)
         content = response.choices[0].message.content.strip()
         match = re.search(r"\[.*?\]", content, re.DOTALL)
         if match:
@@ -90,6 +105,8 @@ def _generate_search_queries(question: str) -> list[str]:
             queries = _unique_nonempty([str(q) for q in queries])
             if queries:
                 return queries
+    except HardLimitExceededError:
+        raise
     except Exception:
         pass
     # Fallback: use keyword extraction
@@ -242,11 +259,18 @@ def _score_events(question: str, events: list[dict]) -> list[float]:
         "Reply with ONLY a JSON array of numbers, one per market in order. "
         "Example: [8.5, 3.0, 6.0]"
     )
+    messages = [{"role": "user", "content": prompt}]
+    usage_handle = MonetaryCostManager.start_openrouter_call(
+        "polymarket/relevance-scoring",
+        _POLYMARKET_SCORING_MODEL,
+        {"messages": messages},
+    )
     response = _get_openai_client().chat.completions.create(
         model=_POLYMARKET_SCORING_MODEL,
-        messages=[{"role": "user", "content": prompt}],
+        messages=messages,
         temperature=0,
     )
+    usage_handle.record_response(response)
     content = response.choices[0].message.content.strip()
     match = re.search(r"\[[\d\s.,]+\]", content)
     if not match:

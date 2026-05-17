@@ -12,7 +12,7 @@ import tempfile
 from openai import AsyncOpenAI
 
 from config import OPENROUTER_API_KEY, llm_rate_limiter
-from monetary_cost_manager import MonetaryCostManager, track_openrouter_response_cost
+from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
 
 
 def log_prediction_prompt(question_type: str, title: str, prompt: str) -> None:
@@ -37,6 +37,7 @@ def save_llm_result(
     per_run_responses: list[str],
     final_forecast,
     forecast_payload: dict,
+    usage_yaml_table: str | None = None,
 ) -> None:
     os.makedirs(LLM_RESULTS_DIR, exist_ok=True)
     safe_title = re.sub(r'[^\w\s-]', '', title)[:60].strip().replace(' ', '_')
@@ -70,6 +71,14 @@ def save_llm_result(
         json.dumps(forecast_payload, indent=2),
         "",
     ]
+    if usage_yaml_table:
+        lines += [
+            sep,
+            "OPENROUTER USAGE (character/token estimate)",
+            sep,
+            usage_yaml_table,
+            "",
+        ]
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print(f"  [LLM result saved] {filepath}")
@@ -146,16 +155,20 @@ async def call_llm(
     if not use_tools:
         print(f"::group::[LLM CALL] {_label} | model={model}")
         print(f"[PROMPT]\n{prompt}\n[/PROMPT]")
+        messages = [{"role": "user", "content": prompt}]
         async with llm_rate_limiter:
-            MonetaryCostManager.raise_error_if_limit_would_be_reached()
+            usage_handle = MonetaryCostManager.start_openrouter_call(
+                _label,
+                model,
+                {"messages": messages},
+            )
             response = await client.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
                 temperature=temperature,
                 stream=False,
             )
-        tracked_cost = track_openrouter_response_cost(response)
-        print(f"[COST] Estimated OpenRouter cost: ${tracked_cost:.6f}")
+        usage_handle.record_response(response)
         answer = response.choices[0].message.content
         print(f"[RESPONSE]\n{answer}\n[/RESPONSE]")
         print("::endgroup::")
@@ -169,7 +182,15 @@ async def call_llm(
     messages: list[dict] = [{"role": "user", "content": prompt}]
     for iteration in range(10):
         async with llm_rate_limiter:
-            MonetaryCostManager.raise_error_if_limit_would_be_reached()
+            usage_handle = MonetaryCostManager.start_openrouter_call(
+                f"{_label}/tool-loop-{iteration + 1}",
+                model,
+                {
+                    "messages": messages,
+                    "tools": [RUN_PYTHON_CODE_TOOL],
+                    "tool_choice": "auto",
+                },
+            )
             response = await client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -178,8 +199,7 @@ async def call_llm(
                 tools=[RUN_PYTHON_CODE_TOOL],
                 tool_choice="auto",
             )
-        tracked_cost = track_openrouter_response_cost(response)
-        print(f"[COST] Iteration {iteration + 1} estimated OpenRouter cost: ${tracked_cost:.6f}")
+        usage_handle.record_response(response)
         choice = response.choices[0]
 
         if choice.finish_reason != "tool_calls":
@@ -246,6 +266,8 @@ async def run_research(
             if result is None or not str(result).strip():
                 return name, None
             return name, str(result).strip()
+        except HardLimitExceededError:
+            raise
         except Exception as exc:
             return name, f"{name} research unavailable: {type(exc).__name__}: {exc}"
 
@@ -291,6 +313,16 @@ async def run_research(
             use_llm_cleaning=True,
         )
 
+    async def serpapi_call() -> str:
+        from research.serp_research import run_serp_research
+
+        return await run_serp_research(
+            title=title,
+            resolution_criteria=resolution_criteria,
+            background=background,
+            fine_print=fine_print,
+        )
+
     async def manifold_call() -> str:
         return await asyncio.to_thread(scrape_manifold, title)
 
@@ -299,6 +331,7 @@ async def run_research(
 
     results = await asyncio.gather(
         run_provider("Resolution Criteria Sources", resolution_sources_call),
+        run_provider("SerpAPI Google", serpapi_call),
         run_provider("Manifold", manifold_call),
         run_provider("Polymarket", polymarket_call),
         run_provider("AskNews", asknews_call),

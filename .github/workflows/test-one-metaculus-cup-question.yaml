@@ -30,8 +30,8 @@ on:
         required: true
         default: false
         type: boolean
-      cost_limit:
-        description: "OpenRouter cost hard limit in USD. 0 tracks only."
+      token_limit:
+        description: "OpenRouter estimated-token hard limit. 0 tracks only."
         required: true
         default: "0"
         type: string
@@ -108,7 +108,7 @@ jobs:
           submit_prediction = parse_bool(os.getenv("SUBMIT_PREDICTION", "false"))
           skip_previously_forecasted = parse_bool(os.getenv("SKIP_PREVIOUSLY_FORECASTED", "false"))
           num_runs = int(os.getenv("NUM_RUNS", "1"))
-          cost_limit = float(os.getenv("COST_LIMIT", "0"))
+          token_limit = float(os.getenv("TOKEN_LIMIT", "0"))
 
           if post_id is not None and question_id is None:
               raise RuntimeError("post_id was provided without question_id.")
@@ -139,7 +139,7 @@ jobs:
               f"question_id={selected_question_id}, post_id={selected_post_id}, "
               f"submit={submit_prediction}, num_runs={num_runs}, "
               f"skip_previously_forecasted={skip_previously_forecasted}, "
-              f"cost_limit=${cost_limit:.2f}"
+              f"token_limit={token_limit:.0f}"
           )
 
           asyncio.run(
@@ -148,7 +148,7 @@ jobs:
                   submit_prediction,
                   num_runs,
                   skip_previously_forecasted,
-                  cost_limit,
+                  token_limit,
               )
           )
           PY
@@ -160,7 +160,7 @@ jobs:
           SUBMIT_PREDICTION: ${{ inputs.submit }}
           NUM_RUNS: ${{ inputs.num_runs }}
           SKIP_PREVIOUSLY_FORECASTED: ${{ inputs.skip_previously_forecasted }}
-          COST_LIMIT: ${{ inputs.cost_limit }}
+          TOKEN_LIMIT: ${{ inputs.token_limit }}
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
