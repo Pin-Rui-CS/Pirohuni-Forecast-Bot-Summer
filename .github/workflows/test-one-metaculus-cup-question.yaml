@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       question_id:
-        description: "Optional Metaculus question ID. Leave blank to test the first open Metaculus Cup question."
+        description: "Optional Metaculus question ID. Leave blank to test the first eligible open Metaculus Cup question."
         required: false
         type: string
       post_id:
@@ -89,6 +89,8 @@ jobs:
           from config import CURRENT_METACULUS_CUP_ID
           from forecasting_bot import validate_runtime_configuration
           from metaculus_client import get_open_question_ids_from_tournament
+          from metaculus_client import get_post_details
+          from orchestrator import forecast_is_already_made
           from orchestrator import forecast_questions
 
 
@@ -99,6 +101,22 @@ jobs:
           def parse_optional_int(name: str) -> int | None:
               value = os.getenv(name, "").strip()
               return int(value) if value else None
+
+
+          async def find_first_unforecasted_question(
+              questions: list[tuple[int, int]],
+          ) -> tuple[int, int] | None:
+              for candidate_question_id, candidate_post_id in questions:
+                  post_details = await get_post_details(candidate_post_id)
+                  if forecast_is_already_made(post_details):
+                      print(
+                          "Skipping candidate because this account already forecasted it: "
+                          f"question_id={candidate_question_id}, post_id={candidate_post_id}"
+                      )
+                      continue
+                  return candidate_question_id, candidate_post_id
+
+              return None
 
 
           validate_runtime_configuration()
@@ -120,7 +138,19 @@ jobs:
               if question_id is None:
                   if not cup_questions:
                       raise RuntimeError("No open Metaculus Cup questions found.")
-                  selected_questions = [cup_questions[0]]
+                  if skip_previously_forecasted:
+                      selected_question = asyncio.run(
+                          find_first_unforecasted_question(cup_questions)
+                      )
+                      if selected_question is None:
+                          print(
+                              "No eligible open Metaculus Cup questions found; "
+                              "this account has already forecasted all open questions."
+                          )
+                          raise SystemExit(0)
+                      selected_questions = [selected_question]
+                  else:
+                      selected_questions = [cup_questions[0]]
               else:
                   selected_questions = [
                       (candidate_question_id, candidate_post_id)
