@@ -40,6 +40,12 @@ Today is {today}.
 
 ---
 
+## Research Material
+
+{summary_report}
+
+---
+
 ## PHASE 1 — OUTSIDE VIEW (Base Rate)
 
 Establish a starting probability using base rates and reference classes.
@@ -64,7 +70,7 @@ Now examine the provided research material. Identify the specific facts, signals
 
 For each significant piece of evidence:
 1. State the evidence clearly
-2. Assess its diagnostic value — how much should it move your estimate, and in which direction?
+2. Assess its diagnostic value — estimate a conservative likelihood ratio for the evidence under Yes vs No, shrink/discount it for uncertainty and dependence, update in log-odds space.
 3. Apply the adjustment incrementally. Do not let any single factor dominate unless its evidential weight is overwhelming.
 
 Guard against these biases:
@@ -111,12 +117,6 @@ Output format:
 - Failure narrative (it didn't happen)
 - Any final adjustment
 - **Final probability estimate: X%**
-
----
-
-## Research Material
-
-{summary_report}
 
 ---
 

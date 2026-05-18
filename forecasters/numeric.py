@@ -47,6 +47,12 @@ Today is {today}.
 
 ---
 
+## Research Material
+
+{summary_report}
+
+---
+
 ## PHASE 1 — OUTSIDE VIEW (Base Rate)
 
 Establish a starting distribution using base rates and reference classes.
@@ -71,7 +77,7 @@ Now examine the provided research material. Identify specific facts, signals, an
 
 For each significant piece of evidence:
 1. State the evidence clearly
-2. Assess its diagnostic value — does it shift the central estimate up or down, and does it widen or narrow the uncertainty?
+2. Assess its diagnostic value — estimate how the evidence changes the likelihood of different ranges or scenarios, apply conservative likelihood weights across the distribution, then renormalize and report updated median, quantiles, and credible interval.
 3. Apply the adjustment incrementally by considering the weightage of the evidence.
 
 Guard against these biases:
@@ -119,12 +125,6 @@ Output format:
 - Failure narrative (far higher)
 - Failure narrative (far lower)
 - Any final adjustment
-
----
-
-## Research Material
-
-{summary_report}
 
 ---
 

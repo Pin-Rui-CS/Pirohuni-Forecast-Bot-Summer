@@ -39,6 +39,12 @@ Today is {today}.
 
 ---
 
+## Research Material
+
+{summary_report}
+
+---
+
 ## PHASE 1 — OUTSIDE VIEW (Base Rate)
 
 Establish a starting distribution using base rates and reference classes.
@@ -62,7 +68,7 @@ Now examine the provided research material. Identify specific facts, signals, an
 
 For each significant piece of evidence:
 1. State the evidence clearly
-2. Assess its diagnostic value — which option(s) does it favour, and by how much?
+2. Assess its diagnostic value — estimate the relative likelihood of the evidence under each option, shrink/discount the likelihood weights, multiply each prior by its likelihood weight, then renormalize to get posterior option probabilities.
 3. Apply the adjustment incrementally, redistributing probability mass across options. Consider the weightage of the evidence. Do not let a piece of evidence dominate unless its weight is overwhelming.
 
 Guard against these biases:
@@ -108,12 +114,6 @@ Output format:
 - Failure narrative (upset)
 - Failure narrative (favourite loses)
 - Any final adjustment
-
----
-
-## Research Material
-
-{summary_report}
 
 ---
 
