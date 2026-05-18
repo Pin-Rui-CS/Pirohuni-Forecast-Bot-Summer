@@ -40,6 +40,9 @@ jobs:
       - name: Install Python dependencies (Poetry)
         run: poetry install --no-interaction --no-root
 
+      - name: Install Playwright browser dependencies
+        run: poetry run playwright install --with-deps chromium
+
       - name: Verify secrets are configured
         run: |
           echo "::group::API Key Configuration"
@@ -48,6 +51,7 @@ jobs:
           echo "ASKNEWS_CLIENT_ID:    $([ -n '${{ secrets.ASKNEWS_CLIENT_ID }}'    ] && echo 'SET' || echo 'MISSING')"
           echo "ASKNEWS_SECRET:       $([ -n '${{ secrets.ASKNEWS_SECRET }}'       ] && echo 'SET' || echo 'MISSING')"
           echo "ASKNEWS_API_KEY:      $([ -n '${{ secrets.ASKNEWS_API_KEY }}'      ] && echo 'SET' || echo 'MISSING')"
+          echo "SERPAPI_API_KEY:      $([ -n '${{ secrets.SERPAPI_API_KEY }}'      ] && echo 'SET' || echo 'MISSING')"
           echo "JINA_API_KEY:         $([ -n '${{ secrets.JINA_API_KEY }}'         ] && echo 'SET' || echo 'MISSING')"
           echo "::endgroup::"
 
@@ -74,6 +78,8 @@ jobs:
             --mode tournament \
             --tournament summer-2026-ai minibench \
             2>&1 | tee bot_run.log
+          echo "Clean LLM result files created:"
+          find "docs/LLM results" -type f -name "*.txt" -print 2>/dev/null || true
         env:
           PYTHONUNBUFFERED: "1" # stream Python output in real time
           PYTHONFAULTHANDLER: "1" # print traceback on crashes / segfaults
@@ -82,6 +88,7 @@ jobs:
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
           JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
           METACULUS_MAX_CONCURRENT_REQUESTS: ${{ vars.METACULUS_MAX_CONCURRENT_REQUESTS || '1' }}
           METACULUS_REQUEST_INTERVAL: ${{ vars.METACULUS_REQUEST_INTERVAL || '3.0' }}
@@ -95,4 +102,13 @@ jobs:
         with:
           name: bot-run-log-${{ github.run_id }}
           path: bot_run.log
+          retention-days: 14
+
+      - name: Upload clean LLM result logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-llm-results-${{ github.run_id }}
+          path: "docs/LLM results/**/*.txt"
+          if-no-files-found: warn
           retention-days: 14

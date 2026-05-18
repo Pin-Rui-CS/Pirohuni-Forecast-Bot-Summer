@@ -84,6 +84,9 @@ jobs:
       - name: Install Python dependencies
         run: poetry install --no-interaction --no-root
 
+      - name: Install Playwright browser dependencies
+        run: poetry run playwright install --with-deps chromium
+
       - name: Run Metaculus Cup test
         run: |
           poetry run python - <<'PY' > "$RUNNER_TEMP/metaculus_cup_raw.log" 2>&1

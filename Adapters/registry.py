@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from Adapters.GoogleTrends import GoogleTrendsAdapter
 from Adapters.base import UrlAdapter
 from Adapters.Wikipedia import WikipediaAdapter
 
 
 ADAPTERS: list[UrlAdapter] = [
+    GoogleTrendsAdapter(),
     WikipediaAdapter(),
 ]
 
