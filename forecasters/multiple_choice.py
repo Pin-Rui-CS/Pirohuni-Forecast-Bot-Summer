@@ -8,9 +8,9 @@ from llm_client import call_llm, run_research, log_prediction_prompt
 
 
 MULTIPLE_CHOICE_PROMPT_TEMPLATE = """
-You are a Superforecaster — a disciplined, calibrated prediction engine trained in the methods described in Philip Tetlock's research on superior forecasting. You will be given a forecasting question with a fixed set of mutually exclusive options and supporting research material. Your job is to assign a probability to each option by working through a structured analytical process.
+You are a Superforecaster — a disciplined, calibrated prediction engine trained in the methods described in Philip Tetlock's research on superior forecasting. You will be given a forecasting question with a fixed set of mutually exclusive options and supporting research material. Your job is to assign a well-reasoned probability to each option by working through a structured analytical process.
 
-You must complete every phase below in order. At the end of each phase, state your current probability distribution across all options. Show how probabilities shift (or don't) as you move through each phase. Probabilities must always sum to 100%.
+You must complete every phase below in order. At the end of each phase, state your current probability distribution across all options to the nearest whole percentage point. Show how probabilities shift (or don't) as you move through each phase. Be explicit about the direction and magnitude of every adjustment. Probabilities must always sum to 100%.
 
 ---
 
@@ -28,9 +28,10 @@ You have access to a `run_python_code` tool that executes Python 3.12 locally. n
 
 The options are: {options}
 
-Background:
+Question background:
 {background}
 
+This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
 {resolution_criteria}
 
 {fine_print}
@@ -64,19 +65,21 @@ Output format:
 
 ## PHASE 2 — INSIDE VIEW (Case-Specific Evidence)
 
-Now examine the provided research material. Identify specific facts, signals, and context that distinguish this case from the base rate.
+Now examine the provided research material. Identify the specific facts, signals, and context that distinguish this particular case from the base rate distribution.
 
 For each significant piece of evidence:
 1. State the evidence clearly
-2. Assess its diagnostic value — estimate the relative likelihood of the evidence under each option, shrink/discount the likelihood weights, multiply each prior by its likelihood weight, then renormalize to get posterior option probabilities.
-3. Apply the adjustment incrementally, redistributing probability mass across options. Consider the weightage of the evidence. Do not let a piece of evidence dominate unless its weight is overwhelming.
+2. Assess its diagnostic value - which option(s) it points toward, size of impact on result, dependent variables, and reliability of source
+3. Estimate the relative likelihood of the evidence under each option, shrink/discount the likelihood weights, multiply each prior by its likelihood weight, then renormalize to get posterior option probabilities
+4. Compare the importance of each evidence item and size of update to the probability distribution
+5. Consider that events take time and favour a conservative update unless evidence is conclusive
 
 Guard against these biases:
 - Narrative bias: A compelling story is not the same as strong evidence
 - Availability bias: Vivid or recent information is not automatically more important
 - Anchoring too tightly to the base rate OR abandoning it too quickly
 
-Treat prediction market data (Polymarket, Manifold) as calibrated priors weighted by volume and liquidity.
+Treat prediction market data (Polymarket, Manifold) as calibrated priors weighted by their volume and liquidity.
 
 Output format:
 - Evidence item → which option(s) it favours → magnitude → reasoning
@@ -90,8 +93,9 @@ Before finalising, stress-test your current distribution by seeking the stronges
 
 - What is the single strongest argument that your leading option is over-rated?
 - What is the single strongest argument that your least favoured option is under-rated?
-- Are there important considerations the research material does NOT cover?
-- Weigh these challenges honestly. Adjust if warranted.
+- Are there important considerations the research material does NOT cover that could meaningfully change the picture?
+- Weigh these challenges honestly. Adjust your distribution if warranted.
+- Consider the duration till resolution.
 
 Output format:
 - Best case for leading option being lower
@@ -114,6 +118,7 @@ Output format:
 - Failure narrative (upset)
 - Failure narrative (favourite loses)
 - Any final adjustment
+- **Final probability distribution: Option_A: X%, Option_B: Y%, ...**
 
 ---
 

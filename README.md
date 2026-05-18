@@ -70,7 +70,7 @@ compatibility, but the value is now interpreted as estimated tokens. A value of
 
 ## Research
 
-Research is handled by `llm_client.run_research()`. It gathers market/news context from the providers under `research/` and also scrapes any source URLs embedded in the question's resolution criteria via `resolution_criteria_scraper.py`. When `JINA_API_KEY` is set, resolution-source scraping first tries the LLM-guided Jina crawler, then falls back to the local Web Scraper pipeline.
+Research is handled by `llm_client.run_research()`. It gathers market/news context from the providers under `research/` and also scrapes any source URLs embedded in the question's resolution criteria via `resolution_criteria_scraper.py`. Resolution-source scraping uses URL-specific adapters first, then falls back to the local Crawl4AI research crawler.
 
 ## Setup
 
@@ -97,7 +97,6 @@ Optional environment variables:
 | `METACULUS_REQUEST_INTERVAL` | `3.0` | Delay before each Metaculus request |
 | `INITIAL_API_GET_RETRY_WAIT_SECONDS` | `3.0` | Initial retry delay |
 | `ASKNEWS_CACHE_MODE` | `no_cache` | AskNews cache behavior: `use_cache`, `use_cache_with_fallback`, or `no_cache` |
-| `JINA_API_KEY` | unset | Optional Jina Reader key for LLM-guided resolution-source crawling |
 | `OPENROUTER_COST_HARD_LIMIT_USD` | `0` | Optional run-level estimated-token hard limit; old name kept for compatibility |
 
 Never commit `.env`.

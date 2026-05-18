@@ -23,18 +23,9 @@ import asyncio
 import logging
 import os
 import re
-import sys
-from pathlib import Path
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
-# ---------------------------------------------------------------------------
-# Make the Web Scraper importable (sibling directory, not installed as package)
-# ---------------------------------------------------------------------------
-_SCRAPER_ROOT = Path(__file__).parent / "Web Scraper"
-if str(_SCRAPER_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SCRAPER_ROOT))
-
-from scraper import scrape_batch  # noqa: E402  (path inserted above)
 from config import OPENROUTER_API_KEY, llm_rate_limiter  # noqa: E402
 from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager  # noqa: E402
 
@@ -50,25 +41,6 @@ def _get_openrouter_api_key() -> str:
 
 def _log_openrouter_call(label: str, model: str) -> None:
     logger.info("%s | model=%s | OpenRouter usage recorded", label, model)
-
-# ---------------------------------------------------------------------------
-# Import the Jina Crawler by file path to avoid naming collision.
-# Both Web Scraper and Jina Crawler expose a module named 'scraper', so
-# sys.path cannot be used — we load it under a unique alias instead.
-# ---------------------------------------------------------------------------
-import importlib.util as _importlib_util
-
-_jina_scraper = None
-try:
-    _jina_spec = _importlib_util.spec_from_file_location(
-        "jina_crawler_scraper",
-        Path(__file__).parent / "Jina Crawler" / "scraper.py",
-    )
-    _jina_scraper = _importlib_util.module_from_spec(_jina_spec)
-    _jina_spec.loader.exec_module(_jina_scraper)
-except Exception as _jina_import_err:
-    logger.warning("Jina Crawler could not be imported: %s — will skip it", _jina_import_err)
-
 
 # ===========================================================================
 # 1. URL extraction
@@ -110,6 +82,7 @@ def extract_urls(resolution_criteria: str) -> list[str]:
 # ===========================================================================
 
 _MAX_CONTENT_CHARS = 8_000
+_CRAWL4AI_CONTENT_BUDGET = 18_000
 
 # Lines matching any of these patterns are likely boilerplate
 _BOILERPLATE_PATTERNS = [
@@ -406,39 +379,133 @@ async def _compile_summaries(
 
 
 # ===========================================================================
-# 5. Jina Crawler integration
+# 5. Adapter + Crawl4AI scraping
 # ===========================================================================
 
-async def _try_jina_crawler(
+@dataclass(frozen=True)
+class _ResolutionScrapeResult:
+    url: str
+    provider_used: str
+    success: bool
+    content: str = ""
+    error: str = ""
+
+
+def _build_crawl_query(question_text: str, resolution_criteria: str) -> str:
+    return "\n".join(
+        part
+        for part in [
+            f"Forecasting question: {question_text}" if question_text else "",
+            f"Resolution criteria: {resolution_criteria}" if resolution_criteria else "",
+            "Find concrete facts, dates, numbers, rules, labels, status fields, and source text relevant to the resolution criteria. Do not forecast.",
+        ]
+        if part
+    )
+
+
+def _truncate_scrape_content(content: str, max_chars: int = _CRAWL4AI_CONTENT_BUDGET) -> str:
+    content = str(content or "").strip()
+    if len(content) <= max_chars:
+        return content
+    if max_chars <= 100:
+        return content[:max_chars].rstrip()
+    return content[: max_chars - 80].rstrip() + "\n\n[Truncated for resolution-source scraping.]"
+
+
+async def _scrape_resolution_url(
     url: str,
     question_text: str,
     resolution_criteria: str,
-    model: str,
-    max_pages: int = 20,
-) -> str | None:
-    """Try scraping a URL with the Jina Crawler's LLM-driven crawl.
+    timeout: int,
+) -> _ResolutionScrapeResult:
+    """Scrape one resolution URL using the SerpAPI-style route.
 
-    Returns an already-formatted synthesis string on success, or None if the
-    crawl fails or finds nothing relevant. The caller should fall back to the
-    Web Scraper pipeline on None.
+    URL-specific adapters get first refusal. Generic URLs then use the focused
+    Crawl4AI adaptive crawler with the same crawl settings used by SerpAPI
+    research scraping.
     """
-    if _jina_scraper is None:
-        return None
+    query = _build_crawl_query(question_text, resolution_criteria)
+
+    adapter = None
     try:
-        result = await _jina_scraper.scrape_for_forecast(
+        from Adapters import find_adapter
+
+        adapter = find_adapter(url)
+    except Exception as exc:
+        logger.warning("Adapter registry unavailable for %s: %s: %s", url, type(exc).__name__, exc)
+
+    if adapter is not None:
+        try:
+            logger.info("Routing resolution source %s to adapter %s", url, adapter.name)
+            result = await adapter.extract(url, query=query, timeout=float(timeout))
+            content = _truncate_scrape_content(result.content)
+            return _ResolutionScrapeResult(
+                url=url,
+                provider_used=f"{result.adapter} adapter",
+                success=bool(content.strip()),
+                content=content,
+                error="" if content.strip() else f"{result.adapter} adapter returned no content.",
+            )
+        except HardLimitExceededError:
+            raise
+        except Exception as exc:
+            return _ResolutionScrapeResult(
+                url=url,
+                provider_used=f"{adapter.name} adapter",
+                success=False,
+                error=f"adapter failed: {type(exc).__name__}: {exc}",
+            )
+
+    try:
+        from Crawl4AI.crawl import AdaptiveResearchConfig, adaptive_research_crawl
+
+        config = AdaptiveResearchConfig.from_env()
+        config.max_pages = 4
+        config.max_depth = 1
+        config.top_k_links = 2
+        config.top_k_content = 4
+        config.max_chars_per_page = 16_000
+        config.max_total_chars = 40_000
+        config.content_budget = _CRAWL4AI_CONTENT_BUDGET
+        content = await adaptive_research_crawl(url, query, config=config)
+        content = _truncate_scrape_content(content)
+        return _ResolutionScrapeResult(
             url=url,
-            question=question_text,
-            focus=resolution_criteria,
-            analysis_model=model,
-            synthesis_model=model,
-            max_pages=max_pages,
+            provider_used="crawl4ai",
+            success=bool(content.strip()),
+            content=content,
+            error="" if content.strip() else "Crawl4AI returned no content.",
         )
-        return result if result.strip() else None
     except HardLimitExceededError:
         raise
     except Exception as exc:
-        logger.warning("Jina Crawler failed for %s: %s — will fall back to Web Scraper", url, exc)
-        return None
+        return _ResolutionScrapeResult(
+            url=url,
+            provider_used="crawl4ai",
+            success=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
+async def _scrape_resolution_urls(
+    urls: list[str],
+    question_text: str,
+    resolution_criteria: str,
+    max_concurrent: int,
+    timeout: int,
+) -> list[_ResolutionScrapeResult]:
+    semaphore = asyncio.Semaphore(max(1, max_concurrent))
+
+    async def scrape_one(url: str) -> _ResolutionScrapeResult:
+        async with semaphore:
+            return await _scrape_resolution_url(
+                url=url,
+                question_text=question_text,
+                resolution_criteria=resolution_criteria,
+                timeout=timeout,
+            )
+
+    return await asyncio.gather(*(scrape_one(url) for url in urls))
 
 
 # ===========================================================================
@@ -481,40 +548,21 @@ async def scrape_resolution_sources(
     all_summaries: list[tuple[str, str]] = []
 
     # ------------------------------------------------------------------
-    # Step 1: Jina Crawler (use_llm_cleaning only)
-    # Try each URL with the LLM-driven crawl. URLs it handles are added
-    # directly — their output is already formatted, no further cleaning
-    # or summarization needed. Failed URLs are queued for Web Scraper.
+    # Step 1: scrape source URLs through URL adapters, then Crawl4AI.
     # ------------------------------------------------------------------
-    web_scraper_urls: list[str] = []
-
-    if use_llm_cleaning:
-        for url in urls:
-            logger.info("Trying Jina Crawler for %s", url)
-            jina_result = await _try_jina_crawler(
-                url=url,
-                question_text=question_text,
-                resolution_criteria=resolution_criteria,
-                model=llm_model,
-            )
-            if jina_result:
-                all_summaries.append((url, jina_result))
-                sections.append(
-                    f"## Source: {url}\n"
-                    f"_Scraped via Jina Crawler_\n\n"
-                    f"{jina_result}"
-                )
-            else:
-                logger.info("Jina Crawler returned nothing for %s — queuing for Web Scraper", url)
-                web_scraper_urls.append(url)
-    else:
-        web_scraper_urls = list(urls)
+    source_urls = list(urls)
 
     # ------------------------------------------------------------------
-    # Step 2: Web Scraper fallback for any URLs Jina Crawler didn't handle
+    # Step 2: clean and optionally summarize scraped source content.
     # ------------------------------------------------------------------
-    if web_scraper_urls:
-        results = await scrape_batch(web_scraper_urls, max_concurrent=max_concurrent, timeout=timeout)
+    if source_urls:
+        results = await _scrape_resolution_urls(
+            source_urls,
+            question_text=question_text,
+            resolution_criteria=resolution_criteria,
+            max_concurrent=max_concurrent,
+            timeout=timeout,
+        )
 
         for result in results:
             if not result.success:
@@ -573,8 +621,12 @@ async def scrape_resolution_sources(
             # each one, and collect for the final compilation step.
             # ------------------------------------------------------------------
             if follow_up_urls:
-                follow_up_results = await scrape_batch(
-                    follow_up_urls, max_concurrent=max_concurrent, timeout=timeout,
+                follow_up_results = await _scrape_resolution_urls(
+                    follow_up_urls,
+                    question_text=question_text,
+                    resolution_criteria=resolution_criteria,
+                    max_concurrent=max_concurrent,
+                    timeout=timeout,
                 )
                 for fu_result in follow_up_results:
                     if not fu_result.success:

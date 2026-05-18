@@ -70,8 +70,9 @@ Now examine the provided research material. Identify the specific facts, signals
 
 For each significant piece of evidence:
 1. State the evidence clearly
-2. Assess its diagnostic value — estimate a conservative likelihood ratio for the evidence under Yes vs No, shrink/discount it for uncertainty and dependence, update in log-odds space.
-3. Apply the adjustment incrementally. Do not let any single factor dominate unless its evidential weight is overwhelming.
+2. Assess its diagnostic value - whether it points to YES/NO, size of impact on result, dependent variables, reliability of source
+3. Compare the importance of each evidence item and size of update to the probability 
+4. Consider that events take time and favour a conservative update unless evidence is conclusive
 
 Guard against these biases:
 - Narrative bias: A compelling story is not the same as strong evidence
@@ -94,6 +95,7 @@ Before finalising, actively stress-test your current estimate by seeking the str
 - What is the single strongest argument that your current estimate is too LOW?
 - Are there important considerations the research material does NOT cover that could meaningfully change the picture?
 - Weigh these challenges honestly. Adjust your estimate if warranted.
+- Consider the duration till resolution.
 
 Output format:
 - Best case for higher probability
