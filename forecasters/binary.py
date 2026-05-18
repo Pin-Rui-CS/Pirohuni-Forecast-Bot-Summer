@@ -170,13 +170,18 @@ async def get_binary_gpt_prediction(
     log_prediction_prompt("binary", title, content)
 
     async def get_rationale_and_probability(content: str) -> tuple[float, str, str]:
-        rationale = await call_llm(content, use_tools=True, _label="binary-forecast")
+        rationale, transcript = await call_llm(
+            content,
+            use_tools=True,
+            _label="binary-forecast",
+            return_transcript=True,
+        )
         probability = extract_probability_from_response_as_percentage_not_decimal(rationale)
         comment = (
             f"Extracted Probability: {probability}%\n\nGPT's Answer: "
             f"{rationale}\n\n\n"
         )
-        return probability, comment, rationale
+        return probability, comment, transcript
 
     probability_and_comment_pairs = await asyncio.gather(
         *[get_rationale_and_probability(content) for _ in range(num_runs)]

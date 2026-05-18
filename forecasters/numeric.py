@@ -130,7 +130,7 @@ Output format:
 
 ## FINAL OUTPUT
 
-Write a one-paragraph summary of your reasoning, then output your final answer as a single JSON object with no text after it:
+Summarise your forecast in this structure:
 
 {{
   "reasoning": "<one-paragraph summary of phases 1–4>",
@@ -704,7 +704,12 @@ async def get_numeric_gpt_prediction(
     log_prediction_prompt(question_type, title, reasoning_prompt)
 
     async def ask_llm_to_get_cdf() -> tuple[list[float], str, str]:
-        response = await call_llm(reasoning_prompt, use_tools=True, _label="numeric-forecast")
+        response, transcript = await call_llm(
+            reasoning_prompt,
+            use_tools=True,
+            _label="numeric-forecast",
+            return_transcript=True,
+        )
 
         try:
             parsed = json.loads(response)
@@ -740,7 +745,7 @@ async def get_numeric_gpt_prediction(
             f"CDF ({cdf_size} points, first 5: {cdf[:5]})\n\n"
             f"{reasoning_text}"
         )
-        return cdf, comment, response
+        return cdf, comment, transcript
 
     cdf_and_comment_pairs = await asyncio.gather(*[ask_llm_to_get_cdf() for _ in range(num_runs)])
     comments = [pair[1] for pair in cdf_and_comment_pairs]

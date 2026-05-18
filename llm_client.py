@@ -146,12 +146,27 @@ async def call_llm(
     temperature: float = 0.3,
     use_tools: bool = False,
     _label: str = "forecast",
-) -> str:
+    return_transcript: bool = False,
+) -> str | tuple[str, str]:
     """Call the LLM via OpenRouter."""
     client = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
     )
+    transcript_parts = [
+        "# LLM Transcript",
+        f"Label: {_label}",
+        f"Model: {model}",
+        "",
+        "## User Prompt",
+        prompt,
+    ]
+
+    def finish(answer: str) -> str | tuple[str, str]:
+        if not return_transcript:
+            return answer
+        return answer, "\n\n".join(transcript_parts)
+
     if not use_tools:
         print(f"::group::[LLM CALL] {_label} | model={model}")
         print(f"[PROMPT]\n{prompt}\n[/PROMPT]")
@@ -174,7 +189,11 @@ async def call_llm(
         print("::endgroup::")
         if answer is None:
             raise ValueError("No answer returned from LLM")
-        return answer
+        transcript_parts += [
+            "## Assistant Final Response",
+            answer,
+        ]
+        return finish(answer)
 
     # Agentic tool-use loop (max 10 iterations)
     print(f"::group::[LLM CALL] {_label} (tool-use) | model={model}")
@@ -208,9 +227,17 @@ async def call_llm(
                 raise ValueError("No answer returned from LLM")
             print(f"[RESPONSE]\n{answer}\n[/RESPONSE]")
             print("::endgroup::")
-            return answer
+            transcript_parts += [
+                f"## Assistant Turn {iteration + 1}: Final Response",
+                answer,
+            ]
+            return finish(answer)
 
         tool_calls = choice.message.tool_calls or []
+        transcript_parts += [
+            f"## Assistant Turn {iteration + 1}: Tool Calls",
+            choice.message.content or "(no assistant content)",
+        ]
         messages.append({
             "role": "assistant",
             "content": choice.message.content,
@@ -227,9 +254,15 @@ async def call_llm(
             ],
         })
 
-        for tc in tool_calls:
+        for tool_index, tc in enumerate(tool_calls, 1):
+            raw_arguments = tc.function.arguments
+            transcript_parts += [
+                f"### Tool Call {tool_index}: {tc.function.name}",
+                "Arguments:",
+                f"```json\n{raw_arguments}\n```",
+            ]
             if tc.function.name == "run_python_code":
-                args = json.loads(tc.function.arguments)
+                args = json.loads(raw_arguments)
                 code = args.get("code", "")
                 reasoning = args.get("reasoning", "")
                 if reasoning:
@@ -237,8 +270,23 @@ async def call_llm(
                 print(f"[tool] executing:\n{code}")
                 result = await asyncio.to_thread(execute_python_code, code)
                 print(f"[tool] result:\n{result}")
+                if reasoning:
+                    transcript_parts += [
+                        "Reasoning:",
+                        reasoning,
+                    ]
+                transcript_parts += [
+                    "Python code:",
+                    f"```python\n{code}\n```",
+                    "Tool result:",
+                    f"```text\n{result}\n```",
+                ]
             else:
                 result = f"[error] Unknown tool: {tc.function.name}"
+                transcript_parts += [
+                    "Tool result:",
+                    f"```text\n{result}\n```",
+                ]
 
             messages.append({
                 "role": "tool",
@@ -264,11 +312,14 @@ async def run_research(
         try:
             result = await research_call()
             if result is None or not str(result).strip():
+                print(f"[research] {name}: no usable result")
                 return name, None
+            print(f"[research] {name}: completed")
             return name, str(result).strip()
         except HardLimitExceededError:
             raise
         except Exception as exc:
+            print(f"[research] {name}: unavailable ({type(exc).__name__}: {exc})")
             return name, f"{name} research unavailable: {type(exc).__name__}: {exc}"
 
     def should_include_provider_result(name: str, content: str | None) -> bool:

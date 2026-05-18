@@ -29,6 +29,7 @@ docs/
 sounds/
 
 test_serp_research.py
+test_adapter.py
 
 # Claude Code local config
 .claude/

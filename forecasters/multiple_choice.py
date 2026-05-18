@@ -217,7 +217,12 @@ async def get_multiple_choice_gpt_prediction(
     async def ask_llm_for_multiple_choice_probabilities(
         content: str,
     ) -> tuple[dict[str, float], str, str]:
-        rationale = await call_llm(content, use_tools=True, _label="mc-forecast")
+        rationale, transcript = await call_llm(
+            content,
+            use_tools=True,
+            _label="mc-forecast",
+            return_transcript=True,
+        )
 
         option_probabilities = extract_option_probabilities_from_response(
             rationale, options
@@ -231,7 +236,7 @@ async def get_multiple_choice_gpt_prediction(
         probability_yes_per_category = generate_multiple_choice_forecast(
             options, option_probabilities
         )
-        return probability_yes_per_category, comment, rationale
+        return probability_yes_per_category, comment, transcript
 
     probability_yes_per_category_and_comment_pairs = await asyncio.gather(
         *[ask_llm_for_multiple_choice_probabilities(content) for _ in range(num_runs)]

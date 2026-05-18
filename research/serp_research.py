@@ -265,6 +265,8 @@ async def run_scrape_cycles(
         scrapes = await _scrape_targets(
             title=title,
             resolution_criteria=resolution_criteria,
+            background=background,
+            fine_print=fine_print,
             targets=targets,
             cycle_no=cycle_no,
         )
@@ -586,6 +588,8 @@ def _cycle_targets(
 async def _scrape_targets(
     title: str,
     resolution_criteria: str,
+    background: str,
+    fine_print: str,
     targets: list[tuple[RankedSerpUrlGroup, RankedSerpUrl]],
     cycle_no: int,
 ) -> list[Scrape]:
@@ -593,9 +597,44 @@ async def _scrape_targets(
         query = _crawl_query(
             title=title,
             resolution_criteria=resolution_criteria,
+            background=background,
+            fine_print=fine_print,
             group=group,
             item=item,
         )
+        adapter = None
+        try:
+            from Adapters import find_adapter
+
+            adapter = find_adapter(item.url)
+        except Exception as exc:
+            print(f"[adapter] registry unavailable for {item.url}: {type(exc).__name__}: {exc}")
+
+        if adapter is not None:
+            try:
+                print(f"[adapter] {adapter.name} handling {item.url}")
+                result = await adapter.extract(item.url, query=query)
+                return Scrape(
+                    cycle=0,
+                    group=group.group,
+                    group_purpose=group.group_purpose,
+                    url=item.url,
+                    purpose=item.purpose,
+                    ok=bool(result.content.strip()),
+                    content=_truncate_text(result.content, _MAX_SCRAPE_CHARS),
+                    error="" if result.content.strip() else f"{adapter.name} returned no content.",
+                )
+            except Exception as exc:
+                return Scrape(
+                    cycle=0,
+                    group=group.group,
+                    group_purpose=group.group_purpose,
+                    url=item.url,
+                    purpose=item.purpose,
+                    ok=False,
+                    error=f"adapter failed: {type(exc).__name__}: {exc}",
+                )
+
         try:
             from Crawl4AI.crawl import AdaptiveResearchConfig, adaptive_research_crawl
 
@@ -737,6 +776,8 @@ def _format_scrapes_for_prompt(cycles: list[Cycle]) -> str:
 def _crawl_query(
     title: str,
     resolution_criteria: str,
+    background: str,
+    fine_print: str,
     group: RankedSerpUrlGroup,
     item: RankedSerpUrl,
 ) -> str:
@@ -744,7 +785,9 @@ def _crawl_query(
         part
         for part in [
             f"Forecasting question: {title}",
+            f"Background: {background}" if background else "",
             f"Resolution criteria: {resolution_criteria}" if resolution_criteria else "",
+            f"Fine print: {fine_print}" if fine_print else "",
             f"Research category: {group.group}",
             f"Category purpose: {group.group_purpose}",
             f"URL purpose hint: {item.purpose}",
