@@ -26,6 +26,13 @@ logger = logging.getLogger(__name__)
 _asknews_request_lock = asyncio.Lock()
 
 
+def _clean_credential(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def build_asknews_query(
     title: str,
     resolution_criteria: str = "",
@@ -84,9 +91,15 @@ class AskNewsSearcher:
         if cache_mode not in ["use_cache", "use_cache_with_fallback", "no_cache"]:
             raise ValueError(f"Invalid cache mode: {cache_mode}")
 
-        self.client_id = client_id or os.getenv("ASKNEWS_CLIENT_ID")
-        self.client_secret = client_secret or os.getenv("ASKNEWS_SECRET")
-        self.api_key = api_key or os.getenv("ASKNEWS_API_KEY")
+        self.client_id = _clean_credential(client_id) or _clean_credential(
+            os.getenv("ASKNEWS_CLIENT_ID")
+        )
+        self.client_secret = _clean_credential(client_secret) or _clean_credential(
+            os.getenv("ASKNEWS_SECRET")
+        )
+        self.api_key = _clean_credential(api_key) or _clean_credential(
+            os.getenv("ASKNEWS_API_KEY")
+        )
 
         # Check if both authentication methods are defined
         has_oauth = bool(self.client_id and self.client_secret)

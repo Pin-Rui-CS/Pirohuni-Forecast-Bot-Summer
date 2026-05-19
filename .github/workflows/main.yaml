@@ -1,6 +1,6 @@
 name: Forecast on new AI tournament questions
 
-on:
+"on":
   workflow_dispatch:
   schedule:
     - cron: "4 * * * *" # every hour at 4 minutes past the hour

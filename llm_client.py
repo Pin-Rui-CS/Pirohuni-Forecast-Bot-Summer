@@ -8,11 +8,21 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
+from typing import Any
 
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
 
 from config import OPENROUTER_API_KEY, llm_rate_limiter
 from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
+
+
+OPENROUTER_MAX_ATTEMPTS = max(1, int(os.getenv("OPENROUTER_MAX_ATTEMPTS", "3")))
+OPENROUTER_RETRY_BASE_SECONDS = float(os.getenv("OPENROUTER_RETRY_BASE_SECONDS", "2.0"))
+
+
+class RetryableLLMResponseError(RuntimeError):
+    """Raised when OpenRouter returns an empty or malformed completion."""
 
 
 def log_prediction_prompt(question_type: str, title: str, prompt: str) -> None:
@@ -140,6 +150,235 @@ def execute_python_code(code: str) -> str:
             pass
 
 
+async def _create_chat_completion_with_retries(
+    client: AsyncOpenAI,
+    *,
+    label: str,
+    model: str,
+    request_payload: dict[str, Any],
+    validate_response: Callable[[Any], str | None],
+) -> Any:
+    last_problem = "OpenRouter request did not run"
+    for attempt in range(1, OPENROUTER_MAX_ATTEMPTS + 1):
+        retry_after_exception = False
+        async with llm_rate_limiter:
+            usage_handle = MonetaryCostManager.start_openrouter_call(
+                label,
+                model,
+                request_payload,
+            )
+            try:
+                response = await client.chat.completions.create(
+                    model=model,
+                    **request_payload,
+                )
+            except (APIConnectionError, APIStatusError, APITimeoutError, RateLimitError) as exc:
+                problem = _format_openrouter_exception(exc)
+                usage_handle.record_output(problem)
+                last_problem = problem
+                print(
+                    f"[OpenRouter] {label} attempt {attempt}/{OPENROUTER_MAX_ATTEMPTS} "
+                    f"failed: {problem}"
+                )
+                if attempt >= OPENROUTER_MAX_ATTEMPTS or not _is_retryable_openrouter_exception(exc):
+                    raise RuntimeError(
+                        f"OpenRouter request failed for {label}: {problem}"
+                    ) from exc
+                retry_after_exception = True
+
+        if retry_after_exception:
+            await asyncio.sleep(_retry_delay_seconds(attempt))
+            continue
+
+        usage_handle.record_response(response)
+        problem = validate_response(response)
+        if problem is None:
+            if attempt > 1:
+                print(f"[OpenRouter] {label} recovered on attempt {attempt}.")
+            return response
+
+        last_problem = problem
+        print(
+            f"[OpenRouter] {label} attempt {attempt}/{OPENROUTER_MAX_ATTEMPTS} "
+            f"returned unusable response: {problem}\n"
+            f"{_describe_openrouter_response(response)}"
+        )
+        if attempt < OPENROUTER_MAX_ATTEMPTS:
+            await asyncio.sleep(_retry_delay_seconds(attempt))
+
+    raise RetryableLLMResponseError(
+        f"OpenRouter returned unusable response for {label} after "
+        f"{OPENROUTER_MAX_ATTEMPTS} attempt(s): {last_problem}"
+    )
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    return OPENROUTER_RETRY_BASE_SECONDS * (2 ** max(0, attempt - 1))
+
+
+def _is_retryable_openrouter_exception(exc: Exception) -> bool:
+    if isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError)):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    return status_code in {408, 409, 429, 500, 502, 503, 504}
+
+
+def _format_openrouter_exception(exc: Exception) -> str:
+    status_code = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    response_text = getattr(response, "text", None)
+    pieces = [exc.__class__.__name__]
+    if status_code is not None:
+        pieces.append(f"status={status_code}")
+    pieces.append(str(exc))
+    if response_text:
+        pieces.append(f"body={_truncate_text(response_text, 1000)}")
+    return " | ".join(pieces)
+
+
+def _validate_text_completion_response(response: Any) -> str | None:
+    problem = _validate_common_openrouter_response(response)
+    if problem:
+        return problem
+    choice = _get_field(response, "choices")[0]
+    message = _get_field(choice, "message")
+    content = _get_field(message, "content")
+    if content is None or not str(content).strip():
+        return "assistant message content is empty"
+    return None
+
+
+def _validate_tool_loop_response(response: Any) -> str | None:
+    problem = _validate_common_openrouter_response(response)
+    if problem:
+        return problem
+
+    choice = _get_field(response, "choices")[0]
+    finish_reason = _get_field(choice, "finish_reason")
+    message = _get_field(choice, "message")
+    if message is None:
+        return "choice has no message"
+
+    if finish_reason == "tool_calls":
+        tool_calls = _get_field(message, "tool_calls")
+        if not tool_calls:
+            return "finish_reason=tool_calls but message.tool_calls is empty"
+        return None
+
+    content = _get_field(message, "content")
+    if content is None or not str(content).strip():
+        return f"finish_reason={finish_reason!r} but assistant content is empty"
+    return None
+
+
+def _validate_common_openrouter_response(response: Any) -> str | None:
+    response_error = _extract_openrouter_error(response)
+    if response_error:
+        return f"OpenRouter/provider error: {response_error}"
+
+    choices = _get_field(response, "choices")
+    if not isinstance(choices, list) or not choices:
+        return f"choices is {type(choices).__name__ if choices is not None else 'None'}"
+
+    choice = choices[0]
+    finish_reason = _get_field(choice, "finish_reason")
+    if finish_reason == "error":
+        return f"finish_reason=error: {_format_value(_get_field(choice, 'error'))}"
+
+    if _get_field(choice, "message") is None:
+        return "choice has no message"
+
+    return None
+
+
+def _extract_openrouter_error(response: Any) -> str | None:
+    top_level_error = _get_field(response, "error")
+    if top_level_error:
+        return _format_value(top_level_error)
+
+    choices = _get_field(response, "choices")
+    if isinstance(choices, list):
+        for index, choice in enumerate(choices):
+            choice_error = _get_field(choice, "error")
+            if choice_error:
+                return f"choice[{index}].error={_format_value(choice_error)}"
+    return None
+
+
+def _describe_openrouter_response(response: Any) -> str:
+    lines = [
+        "[OpenRouter diagnostic]",
+        f"response_id={_get_field(response, 'id')!r}",
+        f"model={_get_field(response, 'model')!r}",
+        f"provider={_get_field(response, 'provider')!r}",
+        f"usage={_format_value(_get_field(response, 'usage'))}",
+        f"top_level_error={_format_value(_get_field(response, 'error'))}",
+    ]
+    choices = _get_field(response, "choices")
+    if not isinstance(choices, list):
+        lines.append(f"choices={_format_value(choices)}")
+        return "\n".join(lines)
+
+    lines.append(f"choices_count={len(choices)}")
+    for index, choice in enumerate(choices[:3]):
+        message = _get_field(choice, "message")
+        content = _get_field(message, "content")
+        tool_calls = _get_field(message, "tool_calls")
+        lines.append(
+            "choice[{index}]: finish_reason={finish!r}, native_finish_reason={native!r}, "
+            "content_chars={chars}, tool_calls={tool_count}, error={error}".format(
+                index=index,
+                finish=_get_field(choice, "finish_reason"),
+                native=_get_field(choice, "native_finish_reason"),
+                chars=len(content) if isinstance(content, str) else 0,
+                tool_count=len(tool_calls) if isinstance(tool_calls, list) else 0,
+                error=_format_value(_get_field(choice, "error")),
+            )
+        )
+    return "\n".join(lines)
+
+
+def _get_field(obj: Any, field_name: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(field_name)
+    if hasattr(obj, field_name):
+        return getattr(obj, field_name)
+    model_extra = getattr(obj, "model_extra", None)
+    if isinstance(model_extra, dict) and field_name in model_extra:
+        return model_extra[field_name]
+    if hasattr(obj, "model_dump"):
+        dumped = obj.model_dump()
+        if isinstance(dumped, dict):
+            return dumped.get(field_name)
+    return None
+
+
+def _format_value(value: Any) -> str:
+    if value is None:
+        return "None"
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=_json_default)
+    except (TypeError, ValueError):
+        text = str(value)
+    return _truncate_text(text, 1000)
+
+
+def _json_default(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "__dict__"):
+        return value.__dict__
+    return str(value)
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 30].rstrip() + "... [truncated]"
+
+
 async def call_llm(
     prompt: str,
     model: str = "anthropic/claude-opus-4.7",
@@ -171,19 +410,17 @@ async def call_llm(
         print(f"::group::[LLM CALL] {_label} | model={model}")
         print(f"[PROMPT]\n{prompt}\n[/PROMPT]")
         messages = [{"role": "user", "content": prompt}]
-        async with llm_rate_limiter:
-            usage_handle = MonetaryCostManager.start_openrouter_call(
-                _label,
-                model,
-                {"messages": messages},
-            )
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                stream=False,
-            )
-        usage_handle.record_response(response)
+        response = await _create_chat_completion_with_retries(
+            client,
+            label=_label,
+            model=model,
+            request_payload={
+                "messages": messages,
+                "temperature": temperature,
+                "stream": False,
+            },
+            validate_response=_validate_text_completion_response,
+        )
         answer = response.choices[0].message.content
         print(f"[RESPONSE]\n{answer}\n[/RESPONSE]")
         print("::endgroup::")
@@ -200,25 +437,19 @@ async def call_llm(
     print(f"[PROMPT]\n{prompt}\n[/PROMPT]")
     messages: list[dict] = [{"role": "user", "content": prompt}]
     for iteration in range(10):
-        async with llm_rate_limiter:
-            usage_handle = MonetaryCostManager.start_openrouter_call(
-                f"{_label}/tool-loop-{iteration + 1}",
-                model,
-                {
-                    "messages": messages,
-                    "tools": [RUN_PYTHON_CODE_TOOL],
-                    "tool_choice": "auto",
-                },
-            )
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                stream=False,
-                tools=[RUN_PYTHON_CODE_TOOL],
-                tool_choice="auto",
-            )
-        usage_handle.record_response(response)
+        response = await _create_chat_completion_with_retries(
+            client,
+            label=f"{_label}/tool-loop-{iteration + 1}",
+            model=model,
+            request_payload={
+                "messages": messages,
+                "temperature": temperature,
+                "stream": False,
+                "tools": [RUN_PYTHON_CODE_TOOL],
+                "tool_choice": "auto",
+            },
+            validate_response=_validate_tool_loop_response,
+        )
         choice = response.choices[0]
 
         if choice.finish_reason != "tool_calls":

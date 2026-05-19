@@ -132,6 +132,11 @@ Output format:
 - Any final adjustment
 - **Final estimate: [central value] (90% CI: [low] – [high])**
 
+## Note: 
+The range should represent uncertainty about the final resolved value, not just uncertainty about the current estimate.
+It should widen when the event is less predictable, the resolution date is farther away, the evidence is weaker or conflicting, or the resolution method itself is noisy.
+It should narrow when the outcome is already strongly constrained by reliable evidence, the resolution date is near, and similar past forecasts/errors show low volatility.
+
 ---
 
 ## FINAL OUTPUT

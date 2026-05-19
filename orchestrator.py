@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import traceback
 
 from config import API_BASE_URL, OPENROUTER_API_KEY
 from forecasters.binary import get_binary_gpt_prediction
@@ -55,13 +56,11 @@ def forecast_is_already_made(post_details: dict) -> bool:
     Numeric: [cdf value 1, cdf value 2, ..., cdf value 201]
     Multiple Choice: [probability for option 1, probability for option 2, ...]
     """
-    try:
-        forecast_values = post_details["question"]["my_forecasts"]["latest"][
-            "forecast_values"
-        ]
-        return forecast_values is not None
-    except Exception:
-        return False
+    question_details = post_details.get("question") or {}
+    my_forecasts = question_details.get("my_forecasts") or {}
+    latest_forecast = my_forecasts.get("latest") or {}
+    forecast_values = latest_forecast.get("forecast_values")
+    return forecast_values is not None
 
 
 async def forecast_individual_question(
@@ -72,9 +71,13 @@ async def forecast_individual_question(
     skip_previously_forecasted_questions: bool,
 ) -> str:
     post_details = await get_post_details(post_id)
-    question_details = post_details["question"]
-    title = question_details["title"]
-    question_type = question_details["type"]
+    question_details = post_details.get("question")
+    if not isinstance(question_details, dict):
+        raise ValueError(f"Post {post_id} has no question payload")
+
+    title = question_details.get("title") or post_details.get("title") or "Untitled"
+    question_type = question_details.get("type")
+    question_status = question_details.get("status")
 
     summary_of_forecast = ""
     summary_of_forecast += (
@@ -85,8 +88,12 @@ async def forecast_individual_question(
         f"Post API URL: {API_BASE_URL}/posts/{post_id}/\n"
     )
 
+    if question_status != "open":
+        summary_of_forecast += f"Skipped: Question status is {question_status!r}, not 'open'.\n"
+        return summary_of_forecast
+
     if question_type == "multiple_choice":
-        options = question_details["options"]
+        options = question_details.get("options") or []
         summary_of_forecast += f"options: {options}\n"
 
     if forecast_is_already_made(post_details) and skip_previously_forecasted_questions:
@@ -189,10 +196,18 @@ async def forecast_questions(
     ):
         question_id, post_id = question_id_post_id
         if isinstance(forecast_summary, Exception):
+            formatted_traceback = "".join(
+                traceback.format_exception(
+                    type(forecast_summary),
+                    forecast_summary,
+                    forecast_summary.__traceback__,
+                )
+            ).rstrip()
             print(
                 f"-----------------------------------------------\nPost {post_id} Question {question_id}:\n"
                 f"Error: {forecast_summary.__class__.__name__} {forecast_summary}\n"
                 f"Post API URL: {API_BASE_URL}/posts/{post_id}/\n"
+                f"Traceback:\n{formatted_traceback}\n"
             )
             errors.append(forecast_summary)
         else:

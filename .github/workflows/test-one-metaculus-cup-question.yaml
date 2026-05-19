@@ -1,6 +1,6 @@
 name: Test Metaculus Cup questions
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       question_id:
