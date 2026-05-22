@@ -1216,13 +1216,22 @@ def _build_warnings(metrics: dict[str, Any], config: AdaptiveResearchConfig) -> 
         )
     if metrics.get("is_irrelevant"):
         warnings.append("Crawl4AI marked the query as potentially unrelated to the source.")
-    if metrics.get("query_expansion_error"):
+    query_expansion_error = _inline_warning_detail(metrics.get("query_expansion_error"))
+    if query_expansion_error:
         warnings.append(
-            "Query expansion failed, so the crawler fell back to the original query only."
+            "Query expansion failed, so the crawler fell back to the original query only. "
+            f"Error: {query_expansion_error}"
         )
     if not metrics.get("pages_crawled"):
         warnings.append("No pages were successfully crawled.")
     return warnings
+
+
+def _inline_warning_detail(value: Any, limit: int = 500) -> str:
+    detail = " ".join(str(value or "").split())
+    if len(detail) <= limit:
+        return detail
+    return detail[:limit].rstrip() + "..."
 
 
 def _format_metric(value: Any) -> str:

@@ -578,9 +578,6 @@ async def run_research(
         )
 
     async def resolution_sources_call() -> str:
-        if not resolution_criteria.strip():
-            return ""
-
         from resolution_criteria_scraper import scrape_resolution_sources
 
         question_context = title
@@ -595,7 +592,7 @@ async def run_research(
             use_llm_cleaning=True,
         )
 
-    async def serpapi_call() -> str:
+    async def serpapi_call(asknews_research: str = "") -> str:
         from research.serp_research import run_serp_research
 
         return await run_serp_research(
@@ -603,6 +600,7 @@ async def run_research(
             resolution_criteria=resolution_criteria,
             background=background,
             fine_print=fine_print,
+            asknews_research=asknews_research,
         )
 
     async def manifold_call() -> str:
@@ -611,13 +609,42 @@ async def run_research(
     async def polymarket_call() -> str:
         return await asyncio.to_thread(scrape_polymarket, title)
 
-    results = await asyncio.gather(
-        run_provider("Resolution Criteria Sources", resolution_sources_call),
-        run_provider("SerpAPI Google", serpapi_call),
-        run_provider("Manifold", manifold_call),
-        run_provider("Polymarket", polymarket_call),
-        run_provider("AskNews", asknews_call),
+    asknews_task = asyncio.create_task(run_provider("AskNews", asknews_call))
+    other_provider_tasks = [
+        asyncio.create_task(run_provider("Resolution Criteria Sources", resolution_sources_call)),
+        asyncio.create_task(run_provider("Manifold", manifold_call)),
+        asyncio.create_task(run_provider("Polymarket", polymarket_call)),
+    ]
+
+    try:
+        asknews_result = await asknews_task
+    except Exception:
+        for task in other_provider_tasks:
+            task.cancel()
+        await asyncio.gather(*other_provider_tasks, return_exceptions=True)
+        raise
+
+    asknews_name, asknews_content = asknews_result
+    serpapi_asknews_research = (
+        asknews_content
+        if should_include_provider_result(asknews_name, asknews_content)
+        else ""
     )
+    serpapi_result, *other_results = await asyncio.gather(
+        run_provider(
+            "SerpAPI Google",
+            lambda: serpapi_call(serpapi_asknews_research),
+        ),
+        *other_provider_tasks,
+    )
+    resolution_sources_result, manifold_result, polymarket_result = other_results
+    results = [
+        resolution_sources_result,
+        serpapi_result,
+        manifold_result,
+        polymarket_result,
+        asknews_result,
+    ]
 
     sections = []
     included_results: list[tuple[str, str]] = []

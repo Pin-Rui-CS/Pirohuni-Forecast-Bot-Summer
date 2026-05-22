@@ -70,7 +70,7 @@ compatibility, but the value is now interpreted as estimated tokens. A value of
 
 ## Research
 
-Research is handled by `llm_client.run_research()`. It gathers market/news context from the providers under `research/` and also scrapes any source URLs embedded in the question's resolution criteria via `resolution_criteria_scraper.py`. Resolution-source scraping uses URL-specific adapters first, then falls back to the local Crawl4AI research crawler.
+Research is handled by `llm_client.run_research()`. It gathers market/news context from the providers under `research/` and also scrapes source URLs embedded anywhere in the question text, background, fine print, or resolution criteria via `resolution_criteria_scraper.py`. Source scraping uses URL-specific adapters first, including Metaculus, Google Trends, and Wikipedia, then falls back to the local Crawl4AI research crawler.
 
 ## Setup
 

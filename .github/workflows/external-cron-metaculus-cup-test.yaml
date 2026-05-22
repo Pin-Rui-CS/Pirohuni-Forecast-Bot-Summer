@@ -1,0 +1,242 @@
+name: Test one Metaculus Cup question via external cron
+
+"on":
+  workflow_dispatch:
+    inputs:
+      num_runs:
+        description: "Number of LLM runs for the selected question"
+        required: false
+        default: "1"
+        type: string
+      cost_limit:
+        description: "OpenRouter cost hard limit for this run; blank uses repo defaults"
+        required: false
+        default: ""
+        type: string
+      no_submit:
+        description: "Run without submitting prediction/comment to Metaculus"
+        required: false
+        default: false
+        type: boolean
+      skip_previously_forecasted:
+        description: "Select the first open Cup question this account has not forecasted"
+        required: false
+        default: true
+        type: boolean
+
+# Prevent overlapping one-question Metaculus Cup test runs.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  forecast_one_metaculus_cup_question:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check Python version
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+
+      - name: Load cached venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
+
+      - name: Install Python dependencies (Poetry)
+        run: poetry install --no-interaction --no-root
+
+      - name: Install Playwright browser dependencies
+        run: poetry run playwright install --with-deps chromium
+
+      - name: Verify secrets are configured
+        run: |
+          echo "::group::API Key Configuration"
+          echo "METACULUS_TOKEN:      $([ -n '${{ secrets.METACULUS_TOKEN }}'      ] && echo 'SET' || echo 'MISSING')"
+          echo "OPENROUTER_API_KEY:   $([ -n '${{ secrets.OPENROUTER_API_KEY }}'   ] && echo 'SET' || echo 'MISSING')"
+          echo "ASKNEWS_CLIENT_ID:    $([ -n '${{ secrets.ASKNEWS_CLIENT_ID }}'    ] && echo 'SET' || echo 'MISSING')"
+          echo "ASKNEWS_SECRET:       $([ -n '${{ secrets.ASKNEWS_SECRET }}'       ] && echo 'SET' || echo 'MISSING')"
+          echo "ASKNEWS_API_KEY:      $([ -n '${{ secrets.ASKNEWS_API_KEY }}'      ] && echo 'SET' || echo 'MISSING')"
+          echo "SERPAPI_API_KEY:      $([ -n '${{ secrets.SERPAPI_API_KEY }}'      ] && echo 'SET' || echo 'MISSING')"
+          echo "::endgroup::"
+
+      - name: Show optional runtime configuration
+        run: |
+          echo "::group::Runtime Configuration"
+          echo "TOURNAMENT=metaculus-cup"
+          echo "MAX_QUESTIONS=1"
+          echo "METACULUS_MAX_CONCURRENT_REQUESTS=${METACULUS_MAX_CONCURRENT_REQUESTS}"
+          echo "METACULUS_REQUEST_INTERVAL=${METACULUS_REQUEST_INTERVAL}"
+          echo "INITIAL_API_GET_RETRY_WAIT_SECONDS=${INITIAL_API_GET_RETRY_WAIT_SECONDS}"
+          echo "ASKNEWS_CACHE_MODE=${ASKNEWS_CACHE_MODE}"
+          echo "OPENROUTER_COST_HARD_LIMIT_USD=${OPENROUTER_COST_HARD_LIMIT_USD}"
+          echo "DISPATCH_NUM_RUNS=${DISPATCH_NUM_RUNS:-1}"
+          echo "DISPATCH_COST_LIMIT=${DISPATCH_COST_LIMIT:-repo default}"
+          echo "DISPATCH_NO_SUBMIT=${DISPATCH_NO_SUBMIT}"
+          echo "DISPATCH_SKIP_PREVIOUSLY_FORECASTED=${DISPATCH_SKIP_PREVIOUSLY_FORECASTED}"
+          echo "::endgroup::"
+        env:
+          METACULUS_MAX_CONCURRENT_REQUESTS: ${{ vars.METACULUS_MAX_CONCURRENT_REQUESTS || '1' }}
+          METACULUS_REQUEST_INTERVAL: ${{ vars.METACULUS_REQUEST_INTERVAL || '3.0' }}
+          INITIAL_API_GET_RETRY_WAIT_SECONDS: ${{ vars.INITIAL_API_GET_RETRY_WAIT_SECONDS || '3.0' }}
+          ASKNEWS_CACHE_MODE: ${{ vars.ASKNEWS_CACHE_MODE || 'no_cache' }}
+          OPENROUTER_COST_HARD_LIMIT_USD: ${{ vars.OPENROUTER_COST_HARD_LIMIT_USD || '0' }}
+          DISPATCH_NUM_RUNS: ${{ inputs.num_runs || '1' }}
+          DISPATCH_COST_LIMIT: ${{ inputs.cost_limit }}
+          DISPATCH_NO_SUBMIT: ${{ inputs.no_submit && 'true' || 'false' }}
+          DISPATCH_SKIP_PREVIOUSLY_FORECASTED: ${{ inputs.skip_previously_forecasted && 'true' || 'false' }}
+
+      - name: Run one Metaculus Cup forecast
+        run: |
+          set -o pipefail
+
+          poetry run python - <<'PY' 2>&1 | tee bot_run.log
+          import asyncio
+          import os
+
+          from config import (
+              CURRENT_METACULUS_CUP_ID,
+              NUM_RUNS_PER_QUESTION,
+              OPENROUTER_COST_HARD_LIMIT_USD,
+          )
+          from forecasting_bot import validate_runtime_configuration
+          from metaculus_client import get_open_question_ids_from_tournament
+          from metaculus_client import get_post_details
+          from orchestrator import forecast_is_already_made
+          from orchestrator import forecast_questions
+
+
+          def parse_bool(value: str) -> bool:
+              return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+          def parse_num_runs() -> int:
+              value = os.getenv("DISPATCH_NUM_RUNS", "").strip()
+              parsed = int(value) if value else NUM_RUNS_PER_QUESTION
+              if parsed < 1:
+                  raise RuntimeError("DISPATCH_NUM_RUNS must be at least 1.")
+              return parsed
+
+
+          def parse_cost_limit() -> float:
+              value = os.getenv("DISPATCH_COST_LIMIT", "").strip()
+              return float(value) if value else float(OPENROUTER_COST_HARD_LIMIT_USD)
+
+
+          async def select_one_open_question(
+              candidates: list[tuple[int, int]],
+              skip_previously_forecasted: bool,
+          ) -> list[tuple[int, int]]:
+              if not skip_previously_forecasted:
+                  return candidates[:1]
+
+              for question_id, post_id in candidates:
+                  post_details = await get_post_details(post_id)
+                  if forecast_is_already_made(post_details):
+                      print(
+                          "Skipping candidate because this account already forecasted it: "
+                          f"question_id={question_id}, post_id={post_id}"
+                      )
+                      continue
+                  return [(question_id, post_id)]
+
+              return []
+
+
+          async def main() -> None:
+              validate_runtime_configuration()
+
+              submit_prediction = not parse_bool(os.getenv("DISPATCH_NO_SUBMIT", "false"))
+              skip_previously_forecasted = parse_bool(
+                  os.getenv("DISPATCH_SKIP_PREVIOUSLY_FORECASTED", "true")
+              )
+              num_runs = parse_num_runs()
+              cost_limit = parse_cost_limit()
+
+              cup_questions = get_open_question_ids_from_tournament(CURRENT_METACULUS_CUP_ID)
+              if not cup_questions:
+                  print("No open Metaculus Cup questions found.")
+                  return
+
+              selected_questions = await select_one_open_question(
+                  cup_questions,
+                  skip_previously_forecasted=skip_previously_forecasted,
+              )
+              if not selected_questions:
+                  print(
+                      "No eligible open Metaculus Cup question found. "
+                      f"skip_previously_forecasted={skip_previously_forecasted}"
+                  )
+                  return
+
+              selected_question_list = ", ".join(
+                  f"{question_id}/{post_id}" for question_id, post_id in selected_questions
+              )
+              print(
+                  "Running one Metaculus Cup forecast: "
+                  f"questions={len(selected_questions)} [{selected_question_list}], "
+                  f"submit={submit_prediction}, num_runs={num_runs}, "
+                  f"skip_previously_forecasted={skip_previously_forecasted}, "
+                  f"cost_limit={cost_limit:.0f}"
+              )
+
+              await forecast_questions(
+                  selected_questions,
+                  submit_prediction,
+                  num_runs,
+                  skip_previously_forecasted,
+                  cost_limit,
+              )
+
+
+          asyncio.run(main())
+          PY
+
+          echo "Clean LLM result files created:"
+          find "docs/LLM results" -type f -name "*.txt" -print 2>/dev/null || true
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONFAULTHANDLER: "1"
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+          METACULUS_MAX_CONCURRENT_REQUESTS: ${{ vars.METACULUS_MAX_CONCURRENT_REQUESTS || '1' }}
+          METACULUS_REQUEST_INTERVAL: ${{ vars.METACULUS_REQUEST_INTERVAL || '3.0' }}
+          INITIAL_API_GET_RETRY_WAIT_SECONDS: ${{ vars.INITIAL_API_GET_RETRY_WAIT_SECONDS || '3.0' }}
+          ASKNEWS_CACHE_MODE: ${{ vars.ASKNEWS_CACHE_MODE || 'no_cache' }}
+          OPENROUTER_COST_HARD_LIMIT_USD: ${{ vars.OPENROUTER_COST_HARD_LIMIT_USD || '0' }}
+          DISPATCH_NUM_RUNS: ${{ inputs.num_runs || '1' }}
+          DISPATCH_COST_LIMIT: ${{ inputs.cost_limit }}
+          DISPATCH_NO_SUBMIT: ${{ inputs.no_submit && 'true' || 'false' }}
+          DISPATCH_SKIP_PREVIOUSLY_FORECASTED: ${{ inputs.skip_previously_forecasted && 'true' || 'false' }}
+
+      - name: Upload bot log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metaculus-cup-one-bot-run-log-${{ github.run_id }}
+          path: bot_run.log
+          retention-days: 14
+
+      - name: Upload clean LLM result logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metaculus-cup-one-llm-results-${{ github.run_id }}
+          path: "docs/LLM results/**/*.txt"
+          if-no-files-found: warn
+          retention-days: 14

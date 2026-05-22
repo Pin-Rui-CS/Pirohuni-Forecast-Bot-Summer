@@ -1,8 +1,8 @@
-"""Resolution criteria scraper.
+"""Question source URL scraper.
 
-Takes the resolution criteria text of a forecast question, extracts any URLs
-embedded in it, scrapes those URLs, and returns clean formatted content ready
-for an LLM to read when making a forecast.
+Takes the full forecast question context, extracts any URLs embedded in it,
+scrapes those URLs, and returns clean formatted content ready for an LLM to
+read when making a forecast.
 
 Integrated into forecasting_bot.py (imported at module level, called with use_llm_cleaning=True
 for binary, numeric, and multiple-choice question types).
@@ -24,7 +24,6 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse
 
 from config import OPENROUTER_API_KEY, llm_rate_limiter  # noqa: E402
 from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager  # noqa: E402
@@ -48,29 +47,15 @@ def _log_openrouter_call(label: str, model: str) -> None:
 
 _URL_PATTERN = re.compile(r'https?://[^\s\)\]\'"<>]+', re.IGNORECASE)
 
-# Forecasting platform links point to other questions, not source data — skip them
-_EXCLUDED_DOMAINS = {
-    "metaculus.com",
-    "goodjudgment.com",
-    "gjopen.com",
-    "polymarket.com",
-    "manifold.markets",
-}
+def extract_urls(text: str) -> list[str]:
+    """Return unique HTTP/HTTPS URLs found in the supplied question text.
 
-
-def extract_urls(resolution_criteria: str) -> list[str]:
-    """Return unique HTTP/HTTPS URLs found in the resolution criteria text.
-
-    Strips trailing punctuation, deduplicates, and filters out forecasting
-    platform links that aren't useful source material.
+    Strips trailing punctuation and deduplicates while preserving order.
     """
     seen: set[str] = set()
     urls: list[str] = []
-    for url in _URL_PATTERN.findall(resolution_criteria):
+    for url in _URL_PATTERN.findall(text):
         url = url.rstrip(".,;:!?)")
-        domain = urlparse(url).netloc.lower().removeprefix("www.")
-        if any(excl in domain for excl in _EXCLUDED_DOMAINS):
-            continue
         if url not in seen:
             seen.add(url)
             urls.append(url)
@@ -308,10 +293,7 @@ def _extract_follow_up_links(llm_response: str) -> tuple[str, list[str]]:
     for line in match.group(1).splitlines():
         line = line.strip().lstrip("- ").strip()
         if line.startswith("http"):
-            # Apply the same domain exclusions as extract_urls
-            domain = urlparse(line).netloc.lower().removeprefix("www.")
-            if not any(excl in domain for excl in _EXCLUDED_DOMAINS):
-                urls.append(line)
+            urls.append(line)
 
     cleaned = llm_response[: match.start()].rstrip()
     return cleaned, urls
@@ -460,8 +442,8 @@ async def _scrape_resolution_url(
         from Crawl4AI.crawl import AdaptiveResearchConfig, adaptive_research_crawl
 
         config = AdaptiveResearchConfig.from_env()
-        config.max_pages = 4
-        config.max_depth = 1
+        config.max_pages = 10
+        config.max_depth = 3
         config.top_k_links = 2
         config.top_k_content = 4
         config.max_chars_per_page = 16_000
@@ -520,11 +502,11 @@ async def scrape_resolution_sources(
     max_concurrent: int = 3,
     timeout: int = 30,
 ) -> str:
-    """Extract URLs from resolution criteria, scrape them, return clean content.
+    """Extract URLs from the full question context, scrape them, return clean content.
 
     Args:
         resolution_criteria: Full resolution criteria text of the question.
-        question_text:        The forecast question (used as context for LLM cleaning).
+        question_text:        Forecast question context, usually title/background/fine print.
         use_llm_cleaning:     If True, pass each page through an LLM to extract
                               only the forecast-relevant parts. Requires OPENROUTER_API_KEY.
         llm_model:            OpenRouter model ID to use when use_llm_cleaning=True.
@@ -536,12 +518,13 @@ async def scrape_resolution_sources(
         appending to an LLM forecasting prompt. Empty string if no URLs found
         or all scrapes failed.
     """
-    urls = extract_urls(resolution_criteria)
+    source_text = "\n\n".join(part for part in [question_text, resolution_criteria] if part)
+    urls = extract_urls(source_text)
     if not urls:
-        logger.info("No external URLs found in resolution criteria.")
+        logger.info("No external URLs found in question text or resolution criteria.")
         return ""
 
-    logger.info("Found %d URL(s) in resolution criteria: %s", len(urls), urls)
+    logger.info("Found %d URL(s) in question text/resolution criteria: %s", len(urls), urls)
 
     sections: list[str] = []
     # Accumulates (url, summary) pairs for the final compilation step.
