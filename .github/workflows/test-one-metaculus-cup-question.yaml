@@ -89,7 +89,8 @@ jobs:
 
       - name: Run Metaculus Cup test
         run: |
-          poetry run python - <<'PY' > "$RUNNER_TEMP/metaculus_cup_raw.log" 2>&1
+          set -o pipefail
+          poetry run python - <<'PY' 2>&1 | tee bot_run.log
           import asyncio
           import os
 
@@ -268,6 +269,14 @@ jobs:
           INITIAL_API_GET_RETRY_WAIT_SECONDS: ${{ vars.INITIAL_API_GET_RETRY_WAIT_SECONDS || '3.0' }}
           ASKNEWS_CACHE_MODE: ${{ vars.ASKNEWS_CACHE_MODE || 'no_cache' }}
           OPENROUTER_COST_HARD_LIMIT_USD: ${{ vars.OPENROUTER_COST_HARD_LIMIT_USD || '0' }}
+
+      - name: Upload bot log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metaculus-cup-bot-run-log-${{ github.run_id }}
+          path: bot_run.log
+          retention-days: 14
 
       - name: Upload clean LLM result logs as artifact
         if: always()

@@ -46,6 +46,27 @@ Today is {today}.
 
 ---
 
+## Phase 0 — Research Audit
+
+Before forecasting, audit the research material. Answer briefly:
+
+1. Are the resolution criteria clear?
+2. Is the research current enough for the question?
+3. Are any important sections incomplete, truncated, contradictory, or duplicated?
+4. Are any sources weak, stale, or likely misinterpreted?
+5. Which facts are strongest and most decision-relevant?
+6. Which important facts are missing?
+
+If the research material is insufficient, say so explicitly and lower confidence. Do not fill gaps with invented certainty.
+
+Output:
+- Research quality: High / Medium / Low
+- Main research limitations
+- Most important reliable facts
+- Missing information that could change the forecast
+
+---
+
 ## PHASE 1 — OUTSIDE VIEW (Base Rate)
 
 Establish a starting probability using base rates and reference classes.
