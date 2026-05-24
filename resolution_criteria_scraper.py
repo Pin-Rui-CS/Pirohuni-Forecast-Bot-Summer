@@ -98,9 +98,9 @@ def _strip_md_links(content: str) -> str:
 def _inline_md_links(content: str) -> str:
     """Convert [text](url) → text (url) and remove ![img](url) entirely.
 
-    Preserves the URL as plain text so the LLM can identify follow-up links,
-    while still removing markdown syntax so the boilerplate filter (which
-    matches raw [text](url) lines) does not accidentally drop useful entries.
+    Preserves the URL as plain text while still removing markdown syntax so
+    the boilerplate filter (which matches raw [text](url) lines) does not
+    accidentally drop useful entries.
     """
     def _replace(m: re.Match) -> str:
         if m.group(0).startswith('!'):
@@ -142,6 +142,54 @@ def _clean_content(content: str, max_chars: int = _MAX_CONTENT_CHARS, keep_urls:
 # ===========================================================================
 
 _LLM_MAX_INPUT = 100_000  # chars sent to the LLM
+
+
+def _build_resolution_summary_prompt(
+    question_text: str,
+    resolution_criteria: str,
+    url: str,
+    content: str,
+    key_terms: list[str] | None = None,
+) -> str:
+    key_terms_section = ""
+    if key_terms:
+        terms_list = ", ".join(f'"{t}"' for t in key_terms)
+        key_terms_section = (
+            f"## Key Terms to Search For\n"
+            f"The resolution criteria require entries matching these specific terms/labels: "
+            f"{terms_list}\n"
+            f"Search the scraped content for these exact strings and report how many times "
+            f"each appears, and in what context.\n\n"
+        )
+
+    return (
+        "You are a research assistant helping a forecaster understand the official "
+        "resolution source material for a forecasting question.\n\n"
+        f"## Forecast Question\n{question_text}\n\n"
+        f"## Resolution Criteria\n{resolution_criteria}\n\n"
+        f"{key_terms_section}"
+        f"## Scraped Resolution Source Content ({url})\n{content[:_LLM_MAX_INPUT]}\n\n"
+        "## Task\n"
+        "Write one structured summary of the scraped resolution source content. "
+        "Use exactly these four sections:\n\n"
+        "**1. CURRENT STATE:** What does the source currently show? Include exact "
+        "dates, labels, values, or status fields that matter for resolution.\n\n"
+        "**2. GAP TO RESOLUTION:** What exactly would need to appear or change on "
+        "the source for this question to resolve? Has any part of the criteria "
+        "already been met?\n\n"
+        "**3. HISTORICAL PATTERN:** If the scraped content contains relevant past "
+        "entries, list the most relevant dates and describe the cadence. If not, "
+        "state that the pattern is not present in the scraped content.\n\n"
+        "**4. KEY AMBIGUITY:** Flag any mismatch between the resolution criteria "
+        "and what the scraped source actually displays, including labels, date "
+        "ranges, formatting, or scoping issues.\n\n"
+        "## Important Rules\n"
+        "- Base your summary only on the scraped content provided above.\n"
+        "- Do not search for, identify, request, or recommend additional links.\n"
+        "- Do not use external knowledge to fill gaps in the scraped data.\n"
+        "- If information is missing, say 'not present in scraped content'.\n"
+        "- Quote exact strings where they are important to the resolution criteria."
+    )
 
 
 def _build_summary_prompt(
@@ -203,22 +251,12 @@ def _build_summary_prompt(
         "**4. KEY AMBIGUITY:** Is there any mismatch between what the resolution criteria "
         "require (exact labels, specific page, date ranges) and what the source actually "
         "displays? Flag any labeling, formatting, or scoping issues.\n\n"
-        "### Step 3: IDENTIFY FOLLOW-UP LINKS\n"
-        "If this page appears to be an index, table of contents, or search results page "
-        "that links to more detailed sub-pages containing the actual historical data "
-        "(rather than containing the data directly), identify up to 10 relevant linked "
-        "URLs from the page content. Include ALL historical data links (e.g. every "
-        "weekly report listed) — older entries matter as much as recent ones for "
-        "establishing a pattern. Only include absolute HTTP/HTTPS URLs present in the "
-        "page content. If the page already contains the data directly, omit this section.\n\n"
-        "If follow-up links are warranted, append them at the very end of your response "
-        "in this exact format (nothing after it):\n\n"
-        "## FOLLOW_UP_LINKS\n"
-        "- https://example.com/relevant-page-1\n"
-        "- https://example.com/relevant-page-2\n\n"
         "## IMPORTANT RULES\n"
         "- Base your summary ONLY on what is actually present in the web page content "
         "provided above.\n"
+        "- Do not identify, request, or recommend follow-up links. The crawler has "
+        "already gathered the source material to use.\n"
+        "weekly report listed) — older entries matter as much as recent ones for "
         "- If a field or label is visible in the content, cite it exactly as it appears "
         "(including if it is inside markdown link syntax like [Label](url)).\n"
         "- If information is missing from the scrape, say 'not present in scraped content' "
@@ -249,7 +287,7 @@ async def _llm_summarize(
         api_key=_get_openrouter_api_key(),
     )
 
-    prompt = _build_summary_prompt(question_text, resolution_criteria, url, content, key_terms)
+    prompt = _build_resolution_summary_prompt(question_text, resolution_criteria, url, content, key_terms)
     messages = [{"role": "user", "content": prompt}]
 
     async with llm_rate_limiter:
@@ -394,62 +432,44 @@ def _truncate_scrape_content(content: str, max_chars: int = _CRAWL4AI_CONTENT_BU
     return content[: max_chars - 80].rstrip() + "\n\n[Truncated for resolution-source scraping.]"
 
 
+def _format_combined_resolution_content(sources: list[tuple[str, str]]) -> str:
+    return "\n\n---\n\n".join(
+        f"## Source: {url}\n\n{content}" for url, content in sources
+    )
+
+
 async def _scrape_resolution_url(
     url: str,
     question_text: str,
     resolution_criteria: str,
     timeout: int,
 ) -> _ResolutionScrapeResult:
-    """Scrape one resolution URL using the SerpAPI-style route.
-
-    URL-specific adapters get first refusal. Generic URLs then use the focused
-    Crawl4AI adaptive crawler with the same crawl settings used by SerpAPI
-    research scraping.
-    """
+    """Scrape one resolution URL through Crawl4AI only."""
     query = _build_crawl_query(question_text, resolution_criteria)
 
-    adapter = None
     try:
-        from Adapters import find_adapter
-
-        adapter = find_adapter(url)
-    except Exception as exc:
-        logger.warning("Adapter registry unavailable for %s: %s: %s", url, type(exc).__name__, exc)
-
-    if adapter is not None:
-        try:
-            logger.info("Routing resolution source %s to adapter %s", url, adapter.name)
-            result = await adapter.extract(url, query=query, timeout=float(timeout))
-            content = _truncate_scrape_content(result.content)
-            return _ResolutionScrapeResult(
-                url=url,
-                provider_used=f"{result.adapter} adapter",
-                success=bool(content.strip()),
-                content=content,
-                error="" if content.strip() else f"{result.adapter} adapter returned no content.",
-            )
-        except HardLimitExceededError:
-            raise
-        except Exception as exc:
-            return _ResolutionScrapeResult(
-                url=url,
-                provider_used=f"{adapter.name} adapter",
-                success=False,
-                error=f"adapter failed: {type(exc).__name__}: {exc}",
-            )
-
-    try:
-        from Crawl4AI.crawl import AdaptiveResearchConfig, adaptive_research_crawl
+        from Crawl4AI.crawl import (
+            AdaptiveResearchConfig,
+            adaptive_research_crawl,
+            is_duplicate_scrape_payload,
+        )
 
         config = AdaptiveResearchConfig.from_env()
-        config.max_pages = 10
-        config.max_depth = 3
+        config.max_pages = 4
+        config.max_depth = 1
         config.top_k_links = 2
         config.top_k_content = 4
         config.max_chars_per_page = 16_000
         config.max_total_chars = 40_000
         config.content_budget = _CRAWL4AI_CONTENT_BUDGET
         content = await adaptive_research_crawl(url, query, config=config)
+        if is_duplicate_scrape_payload(content):
+            return _ResolutionScrapeResult(
+                url=url,
+                provider_used="dedupe registry",
+                success=False,
+                error="skipped duplicate: URL has already been scraped in this process",
+            )
         content = _truncate_scrape_content(content)
         return _ResolutionScrapeResult(
             url=url,
@@ -494,7 +514,7 @@ async def _scrape_resolution_urls(
 # 6. Main pipeline
 # ===========================================================================
 
-async def scrape_resolution_sources(
+async def _legacy_scrape_resolution_sources_with_followups(
     resolution_criteria: str,
     question_text: str = "",
     use_llm_cleaning: bool = False,
@@ -681,5 +701,87 @@ async def scrape_resolution_sources(
             raise
         except Exception as exc:
             logger.warning("Compilation step failed: %s — returning individual summaries", exc)
+
+    return "# Resolution Criteria Sources\n\n" + "\n\n---\n\n".join(sections)
+
+
+async def scrape_resolution_sources(
+    resolution_criteria: str,
+    question_text: str = "",
+    use_llm_cleaning: bool = False,
+    llm_model: str = "anthropic/claude-sonnet-4.6",
+    max_concurrent: int = 3,
+    timeout: int = 30,
+) -> str:
+    """Scrape explicit resolution-source URLs and summarize them once.
+
+    The resolution-source path is intentionally narrow: it uses URLs from the
+    resolution criteria first, falls back to URLs in the question context only
+    when the criteria has none, and never asks the LLM to discover follow-up
+    links.
+    """
+
+    urls = extract_urls(resolution_criteria)
+    if not urls:
+        urls = extract_urls(question_text)
+    if not urls:
+        logger.info("No external URLs found in question text or resolution criteria.")
+        return ""
+
+    logger.info("Found %d resolution URL(s): %s", len(urls), urls)
+    results = await _scrape_resolution_urls(
+        list(urls),
+        question_text=question_text,
+        resolution_criteria=resolution_criteria,
+        max_concurrent=max_concurrent,
+        timeout=timeout,
+    )
+
+    sections: list[str] = []
+    cleaned_sources: list[tuple[str, str]] = []
+    for result in results:
+        if not result.success:
+            logger.warning("Failed to scrape %s: %s", result.url, result.error)
+            sections.append(f"## Source: {result.url}\n_Scrape failed: {result.error}_")
+            continue
+
+        heuristic_max = _LLM_MAX_INPUT if use_llm_cleaning else _MAX_CONTENT_CHARS
+        cleaned = _clean_content(result.content, max_chars=heuristic_max, keep_urls=False)
+        if not cleaned.strip():
+            sections.append(f"## Source: {result.url}\n_No usable content extracted._")
+            continue
+
+        cleaned_sources.append((result.url, cleaned))
+        sections.append(
+            f"## Source: {result.url}\n"
+            f"_Scraped via {result.provider_used}_\n\n"
+            f"{cleaned}"
+        )
+
+    if not sections:
+        return ""
+
+    if use_llm_cleaning and cleaned_sources:
+        try:
+            combined_content = _format_combined_resolution_content(cleaned_sources)
+            summary = await _llm_summarize(
+                url=", ".join(url for url, _ in cleaned_sources),
+                content=combined_content,
+                question_text=question_text,
+                resolution_criteria=resolution_criteria,
+                model=llm_model,
+            )
+            source_lines = "\n".join(f"- {url}" for url, _ in cleaned_sources)
+            return (
+                "# Resolution Criteria Sources\n\n"
+                "## Summary\n\n"
+                f"{summary}\n\n"
+                "## Scraped Sources\n\n"
+                f"{source_lines}"
+            )
+        except HardLimitExceededError:
+            raise
+        except Exception as exc:
+            logger.warning("LLM summary failed: %s - returning heuristic output", exc)
 
     return "# Resolution Criteria Sources\n\n" + "\n\n---\n\n".join(sections)

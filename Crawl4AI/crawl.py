@@ -8,11 +8,13 @@ import os
 import random
 import re
 import sys
+from contextvars import ContextVar
+from threading import Lock
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 # Keep Crawl4AI/Playwright text handling sane on Windows terminals.
 os.environ.setdefault("PYTHONUTF8", "1")
@@ -35,6 +37,13 @@ DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_QUERY_MODEL = "openrouter/google/gemini-2.5-flash-lite"
 DEFAULT_RUNTIME_BASE_DIR = Path(__file__).resolve().parent / ".runtime"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
+_SCRAPED_URL_KEYS: set[str] = set()
+_SCRAPED_URL_LOCK = Lock()
+_DUPLICATE_SCRAPE_MARKER = "Crawl4AI duplicate scrape skipped"
+_SCRAPE_DEDUPE_SCOPE: ContextVar[str] = ContextVar(
+    "crawl4ai_scrape_dedupe_scope",
+    default="global",
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -159,6 +168,21 @@ async def adaptive_research_crawl_result(
     load_dotenv()
     config = config or AdaptiveResearchConfig.from_env()
     _validate_inputs(url, query)
+    duplicate_payload = claim_scrape_url(url)
+    if duplicate_payload is not None:
+        return AdaptiveResearchResult(
+            source_url=url,
+            query=query,
+            markdown=duplicate_payload,
+            relevant_pages=[],
+            crawled_urls=[],
+            metrics={
+                "duplicate_scrape_skipped": True,
+                "pages_crawled": 0,
+                "stopped_reason": "duplicate scrape skipped",
+            },
+        )
+
     api_key = config.openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
     os.environ.setdefault("CRAWL4_AI_BASE_DIRECTORY", str(config.runtime_base_dir))
     os.environ.setdefault(
@@ -256,6 +280,79 @@ def _validate_inputs(url: str, query: str) -> None:
         raise ValueError(f"Expected an absolute http(s) URL, got: {url!r}")
     if not query or not query.strip():
         raise ValueError("query must be a non-empty string")
+
+
+def claim_scrape_url(url: str) -> str | None:
+    """Reserve a URL for scraping.
+
+    Returns a tiny duplicate payload when this process has already attempted the
+    canonical URL. The payload intentionally omits scraped content so callers can
+    log the duplicate without bloating downstream LLM prompts.
+    """
+
+    scope = _SCRAPE_DEDUPE_SCOPE.get()
+    key = _scoped_scrape_key(url, scope)
+    with _SCRAPED_URL_LOCK:
+        if key in _SCRAPED_URL_KEYS:
+            return duplicate_scrape_payload(url)
+        _SCRAPED_URL_KEYS.add(key)
+    return None
+
+
+def canonical_scrape_url(url: str) -> str:
+    parts = urlsplit(str(url).strip())
+    if not parts.scheme or not parts.netloc:
+        return " ".join(str(url).strip().split())
+    return urlunsplit(
+        (
+            parts.scheme.lower(),
+            parts.netloc.lower(),
+            parts.path.rstrip("/"),
+            parts.query,
+            "",
+        )
+    )
+
+
+def set_scrape_dedupe_scope(scope: str) -> Any:
+    """Set the process-local dedupe scope for newly created async tasks."""
+
+    cleaned = " ".join(str(scope or "global").split()) or "global"
+    return _SCRAPE_DEDUPE_SCOPE.set(cleaned)
+
+
+def reset_scrape_dedupe_scope(token: Any) -> None:
+    _SCRAPE_DEDUPE_SCOPE.reset(token)
+
+
+def _scoped_scrape_key(url: str, scope: str) -> str:
+    return f"{scope}\0{canonical_scrape_url(url)}"
+
+
+def duplicate_scrape_payload(url: str) -> str:
+    return (
+        f"{_DUPLICATE_SCRAPE_MARKER}\n"
+        f"Source URL: {url}\n"
+        "Status: already_scraped\n"
+        "Duplicate page content omitted."
+    )
+
+
+def is_duplicate_scrape_payload(content: str) -> bool:
+    return str(content or "").lstrip().startswith(_DUPLICATE_SCRAPE_MARKER)
+
+
+def reset_scrape_dedupe_registry(scope: str | None = None) -> None:
+    """Clear the process-local scrape registry. Intended for tests/manual runs."""
+
+    with _SCRAPED_URL_LOCK:
+        if scope is None:
+            _SCRAPED_URL_KEYS.clear()
+            return
+        prefix = f"{scope}\0"
+        stale_keys = [key for key in _SCRAPED_URL_KEYS if key.startswith(prefix)]
+        for key in stale_keys:
+            _SCRAPED_URL_KEYS.remove(key)
 
 
 def _build_research_adaptive_crawler(

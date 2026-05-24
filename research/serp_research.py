@@ -611,6 +611,19 @@ async def _scrape_targets(
             print(f"[adapter] registry unavailable for {item.url}: {type(exc).__name__}: {exc}")
 
         if adapter is not None:
+            from Crawl4AI.crawl import claim_scrape_url
+
+            duplicate_payload = claim_scrape_url(item.url)
+            if duplicate_payload is not None:
+                return Scrape(
+                    cycle=0,
+                    group=group.group,
+                    group_purpose=group.group_purpose,
+                    url=item.url,
+                    purpose=item.purpose,
+                    ok=False,
+                    error="skipped duplicate: URL has already been scraped in this process",
+                )
             try:
                 print(f"[adapter] {adapter.name} handling {item.url}")
                 result = await adapter.extract(item.url, query=query)
@@ -636,7 +649,11 @@ async def _scrape_targets(
                 )
 
         try:
-            from Crawl4AI.crawl import AdaptiveResearchConfig, adaptive_research_crawl
+            from Crawl4AI.crawl import (
+                AdaptiveResearchConfig,
+                adaptive_research_crawl,
+                is_duplicate_scrape_payload,
+            )
 
             config = AdaptiveResearchConfig.from_env()
             config.max_pages = 4
@@ -647,6 +664,16 @@ async def _scrape_targets(
             config.max_total_chars = 40_000
             config.content_budget = _MAX_SCRAPE_CHARS
             content = await adaptive_research_crawl(item.url, query, config=config)
+            if is_duplicate_scrape_payload(content):
+                return Scrape(
+                    cycle=0,
+                    group=group.group,
+                    group_purpose=group.group_purpose,
+                    url=item.url,
+                    purpose=item.purpose,
+                    ok=False,
+                    error="skipped duplicate: URL has already been scraped in this process",
+                )
             return Scrape(
                 cycle=0,
                 group=group.group,
@@ -700,7 +727,8 @@ def _build_extract_prompt(
         f"- {group.group}: {group.group_purpose}"
         for group in groups
     )
-    scrape_text = _format_scrapes_for_prompt(cycles)
+    prompt_cycles = cycles[-1:] if previous_report else cycles
+    scrape_text = _format_scrapes_for_prompt(prompt_cycles)
     scrape_text = _truncate_text(scrape_text, _MAX_EXTRACT_INPUT_CHARS)
 
     return f"""
@@ -746,7 +774,7 @@ Return only valid JSON in this exact shape:
 Previous compiled report:
 {previous_report or "No previous report yet."}
 
-New and prior scrape packets:
+New scrape packets:
 {scrape_text or "No scrape packets available."}
 """.strip()
 
@@ -767,10 +795,51 @@ def _format_scrapes_for_prompt(cycles: list[Cycle]) -> str:
             )
             if scrape.error:
                 parts.append(f"Error: {scrape.error}")
-            if scrape.content:
-                parts.extend(["Content:", scrape.content])
+            if not scrape.ok:
+                parts.append("Content omitted.")
+            elif scrape.content:
+                content = _compact_scrape_content_for_prompt(scrape.content)
+                if content:
+                    parts.extend(["Extracted content:", content])
+                else:
+                    parts.append("No usable content extracted.")
             parts.append("")
     return "\n".join(parts).strip()
+
+
+def _compact_scrape_content_for_prompt(content: str) -> str:
+    content = str(content or "").strip()
+    if not content:
+        return ""
+
+    if content.startswith("Crawl4AI duplicate scrape skipped"):
+        return ""
+
+    if content.startswith("# Adaptive Crawl Research Packet"):
+        return _compact_adaptive_crawl_packet(content)
+
+    return content
+
+
+def _compact_adaptive_crawl_packet(content: str) -> str:
+    relevant_marker = "## Relevant Findings"
+    start = content.find(relevant_marker)
+    if start < 0:
+        return ""
+
+    relevant = content[start + len(relevant_marker) :].strip()
+    crawled_marker = "## Crawled URLs"
+    end = relevant.find(crawled_marker)
+    if end >= 0:
+        relevant = relevant[:end].strip()
+
+    cleaned_lines: list[str] = []
+    for line in relevant.splitlines():
+        if line.strip().startswith("Relevance score"):
+            continue
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip()
 
 
 def _crawl_query(

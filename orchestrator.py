@@ -16,6 +16,8 @@ from metaculus_client import (
 )
 from monetary_cost_manager import MonetaryCostManager, get_openrouter_key_usage
 
+QUESTION_TIMEOUT_SECONDS = 20 * 60
+
 
 async def get_openrouter_usage_summary() -> str:
     try:
@@ -70,6 +72,9 @@ async def forecast_individual_question(
     num_runs_per_question: int,
     skip_previously_forecasted_questions: bool,
 ) -> str:
+    from Crawl4AI.crawl import set_scrape_dedupe_scope
+
+    set_scrape_dedupe_scope(f"question:{question_id}:{post_id}")
     post_details = await get_post_details(post_id)
     question_details = post_details.get("question")
     if not isinstance(question_details, dict):
@@ -154,6 +159,32 @@ async def forecast_individual_question(
     return summary_of_forecast
 
 
+async def forecast_individual_question_with_timeout(
+    question_id: int,
+    post_id: int,
+    submit_prediction: bool,
+    num_runs_per_question: int,
+    skip_previously_forecasted_questions: bool,
+    timeout_seconds: int = QUESTION_TIMEOUT_SECONDS,
+) -> str:
+    try:
+        return await asyncio.wait_for(
+            forecast_individual_question(
+                question_id,
+                post_id,
+                submit_prediction,
+                num_runs_per_question,
+                skip_previously_forecasted_questions,
+            ),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(
+            f"Question {question_id} (post {post_id}) timed out after "
+            f"{timeout_seconds // 60} minutes"
+        ) from exc
+
+
 async def forecast_questions(
     open_question_id_post_id: list[tuple[int, int]],
     submit_prediction: bool,
@@ -165,7 +196,7 @@ async def forecast_questions(
 
     with MonetaryCostManager(hard_limit=cost_hard_limit_usd) as run_cost_manager:
         forecast_tasks = [
-            forecast_individual_question(
+            forecast_individual_question_with_timeout(
                 question_id,
                 post_id,
                 submit_prediction,

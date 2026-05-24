@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
 CHARACTERS_PER_TOKEN = 4
+DEFAULT_INPUT_TOKEN_HARD_LIMIT = 250_000
+DEFAULT_OUTPUT_TOKEN_HARD_LIMIT = 50_000
 
 
 class HardLimitExceededError(Exception):
@@ -82,11 +84,19 @@ class MonetaryCostManager:
     def __init__(
         self,
         hard_limit: float = 0,
+        input_token_hard_limit: int = DEFAULT_INPUT_TOKEN_HARD_LIMIT,
+        output_token_hard_limit: int = DEFAULT_OUTPUT_TOKEN_HARD_LIMIT,
         log_usage_when_called: bool = False,
     ) -> None:
         if hard_limit < 0:
             raise ValueError("hard_limit must be positive or zero")
+        if input_token_hard_limit < 0:
+            raise ValueError("input_token_hard_limit must be positive or zero")
+        if output_token_hard_limit < 0:
+            raise ValueError("output_token_hard_limit must be positive or zero")
         self.hard_limit: Final[float] = hard_limit
+        self.input_token_hard_limit: Final[int] = input_token_hard_limit
+        self.output_token_hard_limit: Final[int] = output_token_hard_limit
         self._log_usage_when_called = log_usage_when_called
         self._records: list[OpenRouterUsageRecord] = []
         self._lock = threading.RLock()
@@ -159,9 +169,12 @@ class MonetaryCostManager:
             f"{key}:",
             f"  total_input_characters: {self.total_input_characters}",
             f"  total_input_tokens: {self.total_input_tokens}",
+            f"  input_token_hard_limit: {self.input_token_hard_limit}",
             f"  total_output_characters: {self.total_output_characters}",
             f"  total_output_tokens: {self.total_output_tokens}",
+            f"  output_token_hard_limit: {self.output_token_hard_limit}",
             f"  total_tokens: {self.total_tokens}",
+            f"  total_token_hard_limit: {self.hard_limit}",
             "  table: |",
         ]
         lines.extend(f"    {line}" for line in table.splitlines())
@@ -179,14 +192,27 @@ class MonetaryCostManager:
         if amount_to_check_room_for < 0:
             raise ValueError("amount_to_check_room_for must be positive or zero")
         for manager in cls._active_managers.get():
+            next_total_input_tokens = (
+                manager.total_input_tokens + amount_to_check_room_for
+            )
+            if (
+                manager.input_token_hard_limit
+                and next_total_input_tokens > manager.input_token_hard_limit
+            ):
+                raise HardLimitExceededError(
+                    f"Estimated input token usage {amount_to_check_room_for:.0f} would push "
+                    f"total input tokens to {next_total_input_tokens:.0f}, exceeding the "
+                    f"input token hard limit of {manager.input_token_hard_limit}"
+                )
+
             if manager.hard_limit == 0:
                 continue
-            limit_would_be_reached = (
+            combined_limit_would_be_reached = (
                 manager.amount_left <= 0
                 if amount_to_check_room_for == 0
                 else manager.amount_left < amount_to_check_room_for
             )
-            if limit_would_be_reached:
+            if combined_limit_would_be_reached:
                 raise HardLimitExceededError(
                     f"Estimated token usage {amount_to_check_room_for:.0f} would push "
                     f"current usage to {manager.current_usage + amount_to_check_room_for:.0f}, "
@@ -243,13 +269,25 @@ class MonetaryCostManager:
     @classmethod
     def _check_active_limits_after_usage_update(cls) -> None:
         for manager in cls._active_managers.get():
+            if (
+                manager.output_token_hard_limit
+                and manager.total_output_tokens > manager.output_token_hard_limit
+            ):
+                raise HardLimitExceededError(
+                    f"Estimated output token usage reached {manager.total_output_tokens}, "
+                    f"exceeding the output token hard limit of "
+                    f"{manager.output_token_hard_limit}"
+                )
+
             if manager.hard_limit == 0:
                 continue
             if manager.current_usage > manager.hard_limit:
-                logger.warning(
-                    "Estimated token usage %.0f exceeded hard limit %.0f",
+                raise HardLimitExceededError(
+                    "Estimated token usage %.0f exceeded hard limit %.0f"
+                    % (
                     manager.current_usage,
                     manager.hard_limit,
+                    )
                 )
 
 
