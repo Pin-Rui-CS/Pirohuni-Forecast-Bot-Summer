@@ -180,7 +180,7 @@ def _clean_provider_content(provider_name: str, content: str | None) -> str:
         if articles:
             return _format_articles_for_compiler(articles)
 
-    if "manifold" in lowered_name or "polymarket" in lowered_name:
+    if "kalshi" in lowered_name or "manifold" in lowered_name or "polymarket" in lowered_name:
         return _clean_market_text(text)
 
     return _truncate_text(text, _MAX_PROVIDER_CHARS)
@@ -211,6 +211,17 @@ def _clean_market_text(text: str) -> str:
         "active sub-markets",
         "- ",
         "odds",
+        "ticker",
+        "event ticker",
+        "yes probability",
+        "bid/ask",
+        "last price",
+        "24h volume",
+        "open interest",
+        "close time",
+        "api url",
+        "subtitle",
+        "rules",
     )
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -440,7 +451,7 @@ Output exactly these Markdown sections:
 - Prefer facts that directly bear on the resolution criteria.
 
 ## Market Signals
-- Reformat Polymarket and Manifold signals, including relevance scores, odds, volume, liquidity, and URLs.
+- Reformat Polymarket, Kalshi, and Manifold signals, including relevance scores, odds, volume, liquidity, open interest, bid/ask spreads when present, and URLs. Treat Polymarket and Kalshi as real-money market signals; treat Manifold as a play-money crowd signal.
 - If no useful market signal exists, say so in one bullet.
 
 ## Resolution Source Findings
@@ -472,7 +483,7 @@ def _build_heuristic_report(
     key_evidence = _select_key_evidence(title, resolution_criteria, sections)
     market_sections = [
         content for provider, content in sections
-        if provider.lower() in {"manifold", "polymarket"}
+        if provider.lower() in {"kalshi", "manifold", "polymarket"}
     ]
     resolution_sections = [
         content for provider, content in sections
@@ -485,7 +496,7 @@ def _build_heuristic_report(
     other_sections = [
         (provider, content)
         for provider, content in sections
-        if provider.lower() not in {"manifold", "polymarket", "asknews"}
+        if provider.lower() not in {"kalshi", "manifold", "polymarket", "asknews"}
         and "resolution" not in provider.lower()
     ]
 
@@ -499,7 +510,7 @@ def _build_heuristic_report(
     if market_sections:
         lines.append(_join_compact(market_sections, max_chars=8_000))
     else:
-        lines.append("- No useful Polymarket or Manifold signal found.")
+        lines.append("- No useful Polymarket, Kalshi, or Manifold signal found.")
 
     lines.extend(["", "## Resolution Source Findings"])
     if resolution_sections:
@@ -541,7 +552,7 @@ def _select_key_evidence(
 
     for provider, content in sections:
         provider_bonus = 2.0 if "resolution" in provider.lower() else 0.0
-        provider_bonus += 1.0 if provider.lower() in {"polymarket", "manifold"} else 0.0
+        provider_bonus += 1.0 if provider.lower() in {"polymarket", "kalshi", "manifold"} else 0.0
         for item in _candidate_evidence_items(content):
             normalised = _normalise_for_dedupe(item)
             if not normalised or normalised in seen:

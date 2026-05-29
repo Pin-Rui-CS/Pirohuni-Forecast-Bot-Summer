@@ -76,6 +76,7 @@ Establish a starting distribution using base rates and reference classes.
 - If the options are asymmetric in their prior likelihood, reflect that in your distribution.
 - **Use the `run_python_code` tool to compute your base rate distribution numerically.** Hard-code the reference class frequencies or priors you have identified (e.g. historical win rates, Dirichlet concentration parameters), run the calculation with numpy/scipy, and use the printed result as your starting distribution. Ensure probabilities are normalised to sum to 100%.
 - State your initial distribution based purely on the outside view.
+- Treat prediction market data carefully: Polymarket and Kalshi are real-money market priors weighted by their volume, liquidity, bid/ask spread, and relevance to the question; Manifold is a play-money crowd signal and should be discounted relative to comparable real-money markets.
 
 Output format:
 - Reference class(es) and base rate reasoning
@@ -99,8 +100,6 @@ Guard against these biases:
 - Narrative bias: A compelling story is not the same as strong evidence
 - Availability bias: Vivid or recent information is not automatically more important
 - Anchoring too tightly to the base rate OR abandoning it too quickly
-
-Treat prediction market data (Polymarket, Manifold) as calibrated priors weighted by their volume and liquidity.
 
 Output format:
 - Evidence item → which option(s) it favours → magnitude → reasoning

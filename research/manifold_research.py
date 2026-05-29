@@ -313,7 +313,7 @@ def _format_output(input_question: str, markets: list[dict], scores: list[float]
         "=" * 70,
         "MANIFOLD MARKETS RESEARCH",
         "=" * 70,
-        "Manifold percentages are real-money crowd-implied probabilities. Use them as a calibrated prior, but weight their relevance by the market's trading volume and liquidity: high-volume, liquid markets produce more reliable signals; thin or illiquid markets should be discounted accordingly.",
+        "Manifold percentages are play-money crowd-implied probabilities. Use them as a directional crowd signal rather than a real-money price, and weight their relevance by the market's trading volume, liquidity, and question fit: high-volume, liquid markets produce more reliable signals; thin or illiquid markets should be discounted accordingly.",
         "",
         f"Found {len(markets)} relevant market(s) on Manifold:\n",
     ]

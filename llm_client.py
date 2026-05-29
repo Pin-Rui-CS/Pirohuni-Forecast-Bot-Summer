@@ -381,7 +381,7 @@ def _truncate_text(text: str, max_chars: int) -> str:
 
 async def call_llm(
     prompt: str,
-    model: str = "anthropic/claude-opus-4.7",
+    model: str = "anthropic/claude-opus-4.8",
     temperature: float = 0.3,
     use_tools: bool = False,
     _label: str = "forecast",
@@ -536,6 +536,7 @@ async def run_research(
     fine_print: str = "",
 ) -> str:
     from research.asknews_research import run_asknews_research
+    from research.kalshi_research import scrape_kalshi
     from research.manifold_research import scrape_manifold
     from research.polymarket_research import scrape_polymarket
 
@@ -559,10 +560,11 @@ async def run_research(
         lowered = content.lower()
         if "research unavailable" in lowered:
             return False
-        if name in {"Manifold", "Polymarket"}:
+        if name in {"Kalshi", "Manifold", "Polymarket"}:
             no_result_markers = (
                 "no sufficiently relevant",
                 "no active",
+                "no kalshi markets results",
                 "no manifold markets results",
                 "no polymarket results",
             )
@@ -603,6 +605,9 @@ async def run_research(
             asknews_research=asknews_research,
         )
 
+    async def kalshi_call() -> str:
+        return await asyncio.to_thread(scrape_kalshi, title)
+
     async def manifold_call() -> str:
         return await asyncio.to_thread(scrape_manifold, title)
 
@@ -612,6 +617,7 @@ async def run_research(
     asknews_task = asyncio.create_task(run_provider("AskNews", asknews_call))
     other_provider_tasks = [
         asyncio.create_task(run_provider("Resolution Criteria Sources", resolution_sources_call)),
+        asyncio.create_task(run_provider("Kalshi", kalshi_call)),
         asyncio.create_task(run_provider("Manifold", manifold_call)),
         asyncio.create_task(run_provider("Polymarket", polymarket_call)),
     ]
@@ -637,10 +643,11 @@ async def run_research(
         ),
         *other_provider_tasks,
     )
-    resolution_sources_result, manifold_result, polymarket_result = other_results
+    resolution_sources_result, kalshi_result, manifold_result, polymarket_result = other_results
     results = [
         resolution_sources_result,
         serpapi_result,
+        kalshi_result,
         manifold_result,
         polymarket_result,
         asknews_result,

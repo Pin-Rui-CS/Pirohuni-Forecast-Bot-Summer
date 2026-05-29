@@ -84,6 +84,7 @@ Establish a starting distribution using base rates and reference classes.
 - Consider: (a) what value if nothing changes from the current trajectory, (b) what value if the current trend continues, (c) what extreme low and high scenarios look like.
 - **Use the `run_python_code` tool to compute your base rate distribution numerically.** Choose an appropriate statistical model (e.g. fit a normal/lognormal to historical data, compute mean ± std from reference class values, or use scipy to derive a 90% CI). Hard-code the reference class data you have identified, run the calculation, and use the printed result as your starting estimate.
 - State your initial central estimate and 90% confidence interval based purely on the outside view.
+- Treat prediction market data carefully: Polymarket and Kalshi are real-money market priors weighted by their volume, liquidity, bid/ask spread, and relevance to the question; Manifold is a play-money crowd signal and should be discounted relative to comparable real-money markets.
 
 Output format:
 - Reference class(es) and historical range
@@ -109,8 +110,6 @@ Guard against these biases:
 - Availability bias: Vivid or recent data is not automatically more important
 - Anchoring too tightly to the base rate OR abandoning it too quickly
 - Precision bias: Do not report spurious precision; good forecasters set wide intervals to account for unknown unknowns
-
-Treat prediction market data (Polymarket, Manifold) as calibrated priors weighted by their volume and liquidity.
 
 Output format:
 - Evidence item → direction of shift → magnitude → reasoning
