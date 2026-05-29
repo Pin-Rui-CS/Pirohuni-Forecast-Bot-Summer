@@ -71,6 +71,7 @@ async def forecast_individual_question(
     submit_prediction: bool,
     num_runs_per_question: int,
     skip_previously_forecasted_questions: bool,
+    per_question_token_hard_limit: float = 0,
 ) -> str:
     from Crawl4AI.crawl import set_scrape_dedupe_scope
 
@@ -105,7 +106,7 @@ async def forecast_individual_question(
         summary_of_forecast += f"Skipped: Forecast already made\n"
         return summary_of_forecast
 
-    with MonetaryCostManager() as question_cost_manager:
+    with MonetaryCostManager(hard_limit=per_question_token_hard_limit) as question_cost_manager:
         if question_type == "binary":
             forecast, comment, prompt, raw_responses = await get_binary_gpt_prediction(
                 question_details, num_runs_per_question
@@ -165,6 +166,7 @@ async def forecast_individual_question_with_timeout(
     submit_prediction: bool,
     num_runs_per_question: int,
     skip_previously_forecasted_questions: bool,
+    per_question_token_hard_limit: float = 0,
     timeout_seconds: int = QUESTION_TIMEOUT_SECONDS,
 ) -> str:
     try:
@@ -175,6 +177,7 @@ async def forecast_individual_question_with_timeout(
                 submit_prediction,
                 num_runs_per_question,
                 skip_previously_forecasted_questions,
+                per_question_token_hard_limit,
             ),
             timeout=timeout_seconds,
         )
@@ -190,11 +193,14 @@ async def forecast_questions(
     submit_prediction: bool,
     num_runs_per_question: int,
     skip_previously_forecasted_questions: bool,
-    cost_hard_limit_usd: float = 0,
+    per_question_token_hard_limit: float = 0,
 ) -> None:
     print(await get_openrouter_usage_summary())
 
-    with MonetaryCostManager(hard_limit=cost_hard_limit_usd) as run_cost_manager:
+    with MonetaryCostManager(
+        input_token_hard_limit=0,
+        output_token_hard_limit=0,
+    ) as run_cost_manager:
         forecast_tasks = [
             forecast_individual_question_with_timeout(
                 question_id,
@@ -202,6 +208,7 @@ async def forecast_questions(
                 submit_prediction,
                 num_runs_per_question,
                 skip_previously_forecasted_questions,
+                per_question_token_hard_limit,
             )
             for question_id, post_id in open_question_id_post_id
         ]

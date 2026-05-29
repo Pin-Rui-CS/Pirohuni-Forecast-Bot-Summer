@@ -58,15 +58,15 @@ use the character/token ledger.
 | `format_usage_yaml_table()` | YAML-compatible log block containing the requested usage table |
 
 The orchestrator wraps each forecast in a per-question `MonetaryCostManager()`
-and wraps the whole run in a parent manager. Forecast summaries include
-per-question token usage, and the final run summary includes a YAML-compatible
-table with columns for no., task name, input/output characters, input/output
-tokens, and model used.
+and wraps the whole run in a parent manager used only as a pooled ledger.
+Forecast summaries include per-question token usage, and the final run summary
+includes a YAML-compatible table with columns for no., task name, input/output
+characters, input/output tokens, and model used.
 
 A hard limit can be set with either `OPENROUTER_COST_HARD_LIMIT_USD` or the
 `--token-limit` / `--cost-limit` CLI flag. The old env var name is kept for
-compatibility, but the value is now interpreted as estimated tokens. A value of
-`0` disables enforcement while still tracking usage.
+compatibility, but the value is now interpreted as estimated tokens per
+question. A value of `0` disables enforcement while still tracking usage.
 
 ## Research
 
@@ -141,7 +141,7 @@ poetry run python forecasting_bot.py --mode tournament --tournament metaculus-cu
 | `--tournament` | `metaculus-cup-summer-2026` | One or more tournament aliases or raw integer IDs |
 | `--no-submit` | off | Dry run; no forecasts or comments are posted |
 | `--num-runs` | `3` | Number of LLM runs per question; must be at least 1 |
-| `--token-limit`, `--cost-limit` | `OPENROUTER_COST_HARD_LIMIT_USD` | Optional OpenRouter estimated-token hard limit; `0` tracks only |
+| `--token-limit`, `--cost-limit` | `OPENROUTER_COST_HARD_LIMIT_USD` | Optional OpenRouter estimated-token hard limit per question; `0` tracks only |
 
 ## Tournament aliases
 

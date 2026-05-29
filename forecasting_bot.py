@@ -77,7 +77,7 @@ Examples:
         type=float,
         default=OPENROUTER_COST_HARD_LIMIT_USD,
         help=(
-            "Optional OpenRouter estimated-token hard limit for this run. "
+            "Optional OpenRouter estimated-token hard limit per question. "
             "Use 0 to track usage without enforcing a limit "
             f"(default: {OPENROUTER_COST_HARD_LIMIT_USD})"
         ),
@@ -179,7 +179,7 @@ if __name__ == "__main__":
         print("Running in TEST mode - predictions will NOT be submitted to Metaculus")
 
     print(f"Using {args.num_runs} runs per question")
-    print(f"OpenRouter estimated-token hard limit: {args.cost_limit:.0f}" if args.cost_limit else "OpenRouter usage hard limit: disabled")
+    print(f"OpenRouter per-question estimated-token hard limit: {args.cost_limit:.0f}" if args.cost_limit else "OpenRouter usage hard limit: disabled")
     print(f"Skip previously forecasted: {SKIP_PREVIOUSLY_FORECASTED_QUESTIONS}\n")
 
     asyncio.run(
