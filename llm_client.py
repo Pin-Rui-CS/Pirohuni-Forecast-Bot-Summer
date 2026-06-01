@@ -13,7 +13,15 @@ from typing import Any
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
 
-from config import OPENROUTER_API_KEY, llm_rate_limiter
+from config import (
+    ENABLE_ASKNEWS_RESEARCH,
+    ENABLE_FIRECRAWL_RESEARCH,
+    ENABLE_PREDICTION_MARKET_RESEARCH,
+    ENABLE_RESOLUTION_SOURCE_RESEARCH,
+    ENABLE_SERPAPI_RESEARCH,
+    OPENROUTER_API_KEY,
+    llm_rate_limiter,
+)
 from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
 
 
@@ -535,10 +543,12 @@ async def run_research(
     background: str = "",
     fine_print: str = "",
 ) -> str:
-    from research.asknews_research import run_asknews_research
-    from research.kalshi_research import scrape_kalshi
-    from research.manifold_research import scrape_manifold
-    from research.polymarket_research import scrape_polymarket
+    if ENABLE_ASKNEWS_RESEARCH:
+        from research.asknews_research import run_asknews_research
+    if ENABLE_PREDICTION_MARKET_RESEARCH:
+        from research.kalshi_research import scrape_kalshi
+        from research.manifold_research import scrape_manifold
+        from research.polymarket_research import scrape_polymarket
 
     async def run_provider(name: str, research_call) -> tuple[str, str | None]:
         try:
@@ -605,6 +615,17 @@ async def run_research(
             asknews_research=asknews_research,
         )
 
+    async def firecrawl_call(asknews_research: str = "") -> str:
+        from research.firecrawl_research import run_firecrawl_research
+
+        return await run_firecrawl_research(
+            title=title,
+            resolution_criteria=resolution_criteria,
+            background=background,
+            fine_print=fine_print,
+            asknews_research=asknews_research,
+        )
+
     async def kalshi_call() -> str:
         return await asyncio.to_thread(scrape_kalshi, title)
 
@@ -614,42 +635,64 @@ async def run_research(
     async def polymarket_call() -> str:
         return await asyncio.to_thread(scrape_polymarket, title)
 
-    asknews_task = asyncio.create_task(run_provider("AskNews", asknews_call))
-    other_provider_tasks = [
-        asyncio.create_task(run_provider("Resolution Criteria Sources", resolution_sources_call)),
-        asyncio.create_task(run_provider("Kalshi", kalshi_call)),
-        asyncio.create_task(run_provider("Manifold", manifold_call)),
-        asyncio.create_task(run_provider("Polymarket", polymarket_call)),
-    ]
+    asknews_task = (
+        asyncio.create_task(run_provider("AskNews", asknews_call))
+        if ENABLE_ASKNEWS_RESEARCH
+        else None
+    )
+    other_provider_tasks = []
+    if ENABLE_RESOLUTION_SOURCE_RESEARCH:
+        other_provider_tasks.append(
+            asyncio.create_task(run_provider("Resolution Criteria Sources", resolution_sources_call))
+        )
+    if ENABLE_PREDICTION_MARKET_RESEARCH:
+        other_provider_tasks.append(asyncio.create_task(run_provider("Kalshi", kalshi_call)))
+        other_provider_tasks.append(asyncio.create_task(run_provider("Manifold", manifold_call)))
+        other_provider_tasks.append(asyncio.create_task(run_provider("Polymarket", polymarket_call)))
 
-    try:
-        asknews_result = await asknews_task
-    except Exception:
-        for task in other_provider_tasks:
-            task.cancel()
-        await asyncio.gather(*other_provider_tasks, return_exceptions=True)
-        raise
+    if asknews_task is not None:
+        try:
+            asknews_result = await asknews_task
+        except Exception:
+            for task in other_provider_tasks:
+                task.cancel()
+            await asyncio.gather(*other_provider_tasks, return_exceptions=True)
+            raise
+    else:
+        asknews_result = ("AskNews", None)
 
     asknews_name, asknews_content = asknews_result
-    serpapi_asknews_research = (
+    search_asknews_research = (
         asknews_content
         if should_include_provider_result(asknews_name, asknews_content)
         else ""
     )
-    serpapi_result, *other_results = await asyncio.gather(
-        run_provider(
-            "SerpAPI Google",
-            lambda: serpapi_call(serpapi_asknews_research),
-        ),
+    search_provider_tasks = []
+    if ENABLE_SERPAPI_RESEARCH:
+        search_provider_tasks.append(
+            asyncio.create_task(
+                run_provider(
+                    "SerpAPI Google",
+                    lambda: serpapi_call(search_asknews_research),
+                )
+            )
+        )
+    if ENABLE_FIRECRAWL_RESEARCH:
+        search_provider_tasks.append(
+            asyncio.create_task(
+                run_provider(
+                    "Firecrawl Search",
+                    lambda: firecrawl_call(search_asknews_research),
+                )
+            )
+        )
+
+    remaining_results = await asyncio.gather(
+        *search_provider_tasks,
         *other_provider_tasks,
     )
-    resolution_sources_result, kalshi_result, manifold_result, polymarket_result = other_results
     results = [
-        resolution_sources_result,
-        serpapi_result,
-        kalshi_result,
-        manifold_result,
-        polymarket_result,
+        *remaining_results,
         asknews_result,
     ]
 

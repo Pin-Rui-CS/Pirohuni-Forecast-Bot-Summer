@@ -69,6 +69,7 @@ jobs:
           echo "ASKNEWS_SECRET:       $([ -n '${{ secrets.ASKNEWS_SECRET }}'       ] && echo 'SET' || echo 'MISSING')"
           echo "ASKNEWS_API_KEY:      $([ -n '${{ secrets.ASKNEWS_API_KEY }}'      ] && echo 'SET' || echo 'MISSING')"
           echo "SERPAPI_API_KEY:      $([ -n '${{ secrets.SERPAPI_API_KEY }}'      ] && echo 'SET' || echo 'MISSING')"
+          echo "FIRECRAWL_API_KEY:    $([ -n '${{ secrets.FIRECRAWL_API_KEY }}'    ] && echo 'SET' || echo 'MISSING')"
           echo "::endgroup::"
 
       - name: Show optional runtime configuration
@@ -83,6 +84,12 @@ jobs:
           echo "DISPATCH_NUM_RUNS=${DISPATCH_NUM_RUNS:-repo default}"
           echo "DISPATCH_COST_LIMIT=${DISPATCH_COST_LIMIT:-repo default}"
           echo "DISPATCH_NO_SUBMIT=${DISPATCH_NO_SUBMIT}"
+          echo "ENABLE_ASKNEWS_RESEARCH=${ENABLE_ASKNEWS_RESEARCH}"
+          echo "ENABLE_RESOLUTION_SOURCE_RESEARCH=${ENABLE_RESOLUTION_SOURCE_RESEARCH}"
+          echo "ENABLE_SERPAPI_RESEARCH=${ENABLE_SERPAPI_RESEARCH}"
+          echo "ENABLE_FIRECRAWL_RESEARCH=${ENABLE_FIRECRAWL_RESEARCH}"
+          echo "ENABLE_PREDICTION_MARKET_RESEARCH=${ENABLE_PREDICTION_MARKET_RESEARCH}"
+          echo "FIRECRAWL_SEARCH_TBS=${FIRECRAWL_SEARCH_TBS}"
           echo "::endgroup::"
         env:
           METACULUS_MAX_CONCURRENT_REQUESTS: ${{ vars.METACULUS_MAX_CONCURRENT_REQUESTS || '1' }}
@@ -90,6 +97,12 @@ jobs:
           INITIAL_API_GET_RETRY_WAIT_SECONDS: ${{ vars.INITIAL_API_GET_RETRY_WAIT_SECONDS || '3.0' }}
           ASKNEWS_CACHE_MODE: ${{ vars.ASKNEWS_CACHE_MODE || 'no_cache' }}
           OPENROUTER_COST_HARD_LIMIT_USD: ${{ vars.OPENROUTER_COST_HARD_LIMIT_USD || '0' }}
+          ENABLE_ASKNEWS_RESEARCH: ${{ vars.ENABLE_ASKNEWS_RESEARCH || 'true' }}
+          ENABLE_RESOLUTION_SOURCE_RESEARCH: ${{ vars.ENABLE_RESOLUTION_SOURCE_RESEARCH || 'true' }}
+          ENABLE_SERPAPI_RESEARCH: ${{ vars.ENABLE_SERPAPI_RESEARCH || 'false' }}
+          ENABLE_FIRECRAWL_RESEARCH: ${{ vars.ENABLE_FIRECRAWL_RESEARCH || 'true' }}
+          ENABLE_PREDICTION_MARKET_RESEARCH: ${{ vars.ENABLE_PREDICTION_MARKET_RESEARCH || 'true' }}
+          FIRECRAWL_SEARCH_TBS: ${{ vars.FIRECRAWL_SEARCH_TBS || '' }}
           DISPATCH_TOURNAMENT: ${{ inputs.tournament || 'summer-2026-ai' }}
           DISPATCH_NUM_RUNS: ${{ inputs.num_runs }}
           DISPATCH_COST_LIMIT: ${{ inputs.cost_limit }}
@@ -130,11 +143,18 @@ jobs:
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
           SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+          FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
           METACULUS_MAX_CONCURRENT_REQUESTS: ${{ vars.METACULUS_MAX_CONCURRENT_REQUESTS || '1' }}
           METACULUS_REQUEST_INTERVAL: ${{ vars.METACULUS_REQUEST_INTERVAL || '3.0' }}
           INITIAL_API_GET_RETRY_WAIT_SECONDS: ${{ vars.INITIAL_API_GET_RETRY_WAIT_SECONDS || '3.0' }}
           ASKNEWS_CACHE_MODE: ${{ vars.ASKNEWS_CACHE_MODE || 'no_cache' }}
           OPENROUTER_COST_HARD_LIMIT_USD: ${{ vars.OPENROUTER_COST_HARD_LIMIT_USD || '0' }}
+          ENABLE_ASKNEWS_RESEARCH: ${{ vars.ENABLE_ASKNEWS_RESEARCH || 'true' }}
+          ENABLE_RESOLUTION_SOURCE_RESEARCH: ${{ vars.ENABLE_RESOLUTION_SOURCE_RESEARCH || 'true' }}
+          ENABLE_SERPAPI_RESEARCH: ${{ vars.ENABLE_SERPAPI_RESEARCH || 'false' }}
+          ENABLE_FIRECRAWL_RESEARCH: ${{ vars.ENABLE_FIRECRAWL_RESEARCH || 'true' }}
+          ENABLE_PREDICTION_MARKET_RESEARCH: ${{ vars.ENABLE_PREDICTION_MARKET_RESEARCH || 'true' }}
+          FIRECRAWL_SEARCH_TBS: ${{ vars.FIRECRAWL_SEARCH_TBS || '' }}
           DISPATCH_TOURNAMENT: ${{ inputs.tournament || 'summer-2026-ai' }}
           DISPATCH_NUM_RUNS: ${{ inputs.num_runs }}
           DISPATCH_COST_LIMIT: ${{ inputs.cost_limit }}

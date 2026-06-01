@@ -175,6 +175,7 @@ Choose the distribution type that best captures the shape of your reasoning:
 - "normal": {{"mean": float, "std": float}}
 - "mixture_normal": {{"weights": [float, ...], "means": [float, ...], "stds": [float, ...]}}
 - "skew_normal": {{"location": float, "scale": float, "alpha": float}}
+- "student_t": {{"df": float, "location": float, "scale": float}}
 - "beta": {{"a": float, "b": float, "lower": float, "upper": float}}
 - "log_normal": {{"mu": float, "sigma": float}}
 - "uniform": {{"lower": float, "upper": float}}
@@ -227,6 +228,12 @@ def build_distribution(spec: dict):
         if p["scale"] <= 0:
             raise ValueError(f"skew_normal: scale must be > 0, got {p['scale']}")
         return stats.skewnorm(p["alpha"], loc=p["location"], scale=p["scale"])
+    elif t == "student_t":
+        if p["df"] <= 0:
+            raise ValueError(f"student_t: df must be > 0, got {p['df']}")
+        if p["scale"] <= 0:
+            raise ValueError(f"student_t: scale must be > 0, got {p['scale']}")
+        return stats.t(p["df"], loc=p["location"], scale=p["scale"])
     elif t == "beta":
         if p["a"] <= 0 or p["b"] <= 0:
             raise ValueError(f"beta: a and b must be > 0, got a={p['a']}, b={p['b']}")
