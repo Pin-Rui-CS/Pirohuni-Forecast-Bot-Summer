@@ -169,6 +169,7 @@ async def build_firecrawl_research_result(
 async def fetch_firecrawl_search_results(
     queries: list[str],
     total_results_per_query: int = DEFAULT_FIRECRAWL_TOTAL_RESULTS_PER_QUERY,
+    sources: tuple[str, ...] | list[str] | None = None,
     tbs: str = "",
     api_key: str | None = None,
 ) -> list[FirecrawlSearchResult]:
@@ -177,7 +178,7 @@ async def fetch_firecrawl_search_results(
     if not api_key:
         raise ValueError("Missing FIRECRAWL_API_KEY for Firecrawl search research.")
 
-    firecrawl_sources = DEFAULT_FIRECRAWL_SEARCH_SOURCES
+    firecrawl_sources = tuple(sources or DEFAULT_FIRECRAWL_SEARCH_SOURCES)
     per_source_limit = _per_source_limit(total_results_per_query, firecrawl_sources)
     async with httpx.AsyncClient(timeout=45) as client:
         responses = await _gather_firecrawl_queries(
