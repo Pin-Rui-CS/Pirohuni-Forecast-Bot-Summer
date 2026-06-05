@@ -19,9 +19,9 @@ name: Test one Metaculus Cup question via external cron
         default: false
         type: boolean
       skip_previously_forecasted:
-        description: "Select the first open Cup question this account has not forecasted"
+        description: "Skip open Cup questions this account has already forecasted"
         required: false
-        default: true
+        default: false
         type: boolean
 
 # Prevent overlapping one-question Metaculus Cup test runs.

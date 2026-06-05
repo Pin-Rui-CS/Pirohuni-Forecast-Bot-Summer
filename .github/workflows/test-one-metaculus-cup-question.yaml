@@ -28,7 +28,7 @@ name: Test Metaculus Cup questions
       skip_previously_forecasted:
         description: "Skip if this account has already forecasted the question"
         required: true
-        default: true
+        default: false
         type: boolean
       max_questions:
         description: "Maximum number of eligible questions to run"

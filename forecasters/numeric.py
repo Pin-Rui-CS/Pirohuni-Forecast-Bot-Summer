@@ -253,12 +253,149 @@ def build_distribution(spec: dict):
         raise ValueError(f"Unknown distribution type: {t}")
 
 
+def _distribution_location_values(spec: dict) -> list[float]:
+    """Return distribution parameters that live on the outcome-value axis."""
+    t = spec["type"]
+    p = spec.get("params") or {k: v for k, v in spec.items() if k != "type"}
+
+    if t == "normal":
+        values = [p.get("mean")]
+    elif t == "mixture_normal":
+        values = p.get("means") or []
+    elif t == "skew_normal":
+        values = [p.get("location")]
+    elif t == "student_t":
+        values = [p.get("location")]
+    elif t == "beta":
+        values = [p.get("lower"), p.get("upper")]
+    elif t == "uniform":
+        values = [p.get("lower"), p.get("upper")]
+    elif t == "log_normal":
+        mu = p.get("mu")
+        values = [np.exp(mu)] if isinstance(mu, (int, float)) else []
+    else:
+        values = []
+
+    return [
+        float(value)
+        for value in values
+        if isinstance(value, (int, float)) and np.isfinite(float(value))
+    ]
+
+
+def _distribution_uses_millions_against_raw_grid(
+    spec: dict,
+    raw_grid: np.ndarray,
+    *,
+    open_upper_bound: bool,
+    open_lower_bound: bool,
+) -> bool:
+    value_axis_params = _distribution_location_values(spec)
+    if not value_axis_params:
+        return False
+
+    raw_min = float(np.nanmin(raw_grid))
+    raw_max = float(np.nanmax(raw_grid))
+    max_abs_raw = max(abs(raw_min), abs(raw_max))
+    max_abs_param = max(abs(value) for value in value_axis_params)
+
+    if max_abs_raw < 1_000_000 or max_abs_param <= 0:
+        return False
+
+    # Metaculus returns some money/population quantities as raw units while LLMs
+    # often express the same outcome in millions. Require a clear 1e6-scale gap
+    # and that the model's location-like parameters are plausible on x/1e6.
+    if max_abs_param >= max_abs_raw / 1_000:
+        return False
+
+    scaled_min = raw_min / 1_000_000
+    scaled_max = raw_max / 1_000_000
+    scaled_low = min(scaled_min, scaled_max)
+    scaled_high = max(scaled_min, scaled_max)
+    scaled_range = max(scaled_high - scaled_low, 1.0)
+    compatibility_low = -np.inf if open_lower_bound else scaled_low - 2 * scaled_range
+    compatibility_high = np.inf if open_upper_bound else scaled_high + 2 * scaled_range
+
+    return any(
+        compatibility_low <= value <= compatibility_high
+        for value in value_axis_params
+    )
+
+
+def grid_for_distribution_units(
+    spec: dict,
+    raw_grid: np.ndarray,
+    *,
+    open_upper_bound: bool,
+    open_lower_bound: bool,
+) -> tuple[np.ndarray, str]:
+    if _distribution_uses_millions_against_raw_grid(
+        spec,
+        raw_grid,
+        open_upper_bound=open_upper_bound,
+        open_lower_bound=open_lower_bound,
+    ):
+        return (
+            raw_grid / 1_000_000,
+            "Metaculus grid appears to be raw units; distribution parameters appear to be in millions. Evaluating CDF on x/1,000,000.",
+        )
+    return raw_grid, "Metaculus grid and distribution parameters appear to use the same units."
+
+
 def spec_to_cdf(spec: dict, grid: np.ndarray) -> list[float]:
     """Evaluate the distribution CDF on a grid and return as a list."""
     dist = build_distribution(spec)
     cdf_values = dist.cdf(grid)
     cdf_values = np.maximum.accumulate(np.clip(cdf_values, 0.0, 1.0))
     return cdf_values.tolist()
+
+
+def cdf_triplet(cdf: list[float]) -> tuple[float, float, float]:
+    return cdf[0], cdf[len(cdf) // 2], cdf[-1]
+
+
+def print_numeric_cdf_sanity_checks(
+    spec: dict,
+    eval_grid: np.ndarray,
+    cdf: list[float],
+) -> None:
+    first, _, last = cdf_triplet(cdf)
+    if first > 0.98 and last - first < 0.02:
+        value_axis_params = _distribution_location_values(spec)
+        distribution_below_first_x = (
+            bool(value_axis_params)
+            and max(value_axis_params) < float(eval_grid[0])
+        )
+        if distribution_below_first_x:
+            print(
+                "sanity check:",
+                "CDF is almost flat near 1.0 because distribution parameters are below the first x-value.",
+            )
+        else:
+            print(
+                "sanity check warning:",
+                "CDF is almost flat near 1.0 across the grid; check numeric units and bounds.",
+            )
+
+    representative_values = _distribution_location_values(spec)
+    if not representative_values:
+        return
+
+    representative_value = float(np.median(representative_values))
+    if float(eval_grid[0]) <= representative_value <= float(eval_grid[-1]):
+        nearest_index = int(np.argmin(np.abs(eval_grid - representative_value)))
+        print(
+            "sanity check cdf near representative distribution value:",
+            {
+                "x": float(eval_grid[nearest_index]),
+                "cdf": cdf[nearest_index],
+            },
+        )
+        if abs(cdf[nearest_index] - 0.5) > 0.4:
+            print(
+                "sanity check warning:",
+                "CDF near the representative distribution value is far from 0.5; verify distribution shape and units.",
+            )
 
 
 class NumericDefaults:
@@ -762,7 +899,21 @@ async def get_numeric_gpt_prediction(
             raise ValueError(f"LLM response missing 'distribution' key. Keys present: {list(parsed.keys())}")
         reasoning_text = parsed.get("reasoning", "")
 
-        cdf = spec_to_cdf(spec, grid)
+        eval_grid, unit_conversion_note = grid_for_distribution_units(
+            spec,
+            grid,
+            open_upper_bound=open_upper_bound,
+            open_lower_bound=open_lower_bound,
+        )
+        raw_cdf = spec_to_cdf(spec, eval_grid)
+        print("question title:", title)
+        print("bounds/raw x first/last:", float(grid[0]), float(grid[-1]))
+        print("cdf eval x first/last:", float(eval_grid[0]), float(eval_grid[-1]))
+        print("unit conversion:", unit_conversion_note)
+        print("distribution params:", json.dumps(spec))
+        print("raw cdf first/middle/last:", cdf_triplet(raw_cdf))
+        print_numeric_cdf_sanity_checks(spec, eval_grid, raw_cdf)
+        cdf = raw_cdf
         dummy = NumericDistribution(
             declared_percentiles=[
                 Percentile(percentile=0.01, value=lower_bound + 0.001 * (upper_bound - lower_bound)),
@@ -778,8 +929,11 @@ async def get_numeric_gpt_prediction(
             strict_validation=False,
         )
         cdf = dummy._standardize_cdf(cdf)
+        print("standardized cdf first/middle/last:", cdf_triplet(cdf))
+        print_numeric_cdf_sanity_checks(spec, eval_grid, cdf)
         comment = (
             f"Distribution spec: {json.dumps(spec)}\n"
+            f"Unit conversion: {unit_conversion_note}\n"
             f"CDF ({cdf_size} points, first 5: {cdf[:5]})\n\n"
             f"{reasoning_text}"
         )
@@ -794,5 +948,9 @@ async def get_numeric_gpt_prediction(
     all_pmfs = np.diff(all_cdfs, prepend=0, axis=1)
     mean_pmf = np.mean(all_pmfs, axis=0)
     final_cdf: list[float] = np.cumsum(mean_pmf).tolist()
+    print("question title:", title)
+    print("bounds/raw x first/last:", float(grid[0]), float(grid[-1]))
+    print("distribution params:", f"aggregated from {len(cdfs)} run(s)")
+    print("cdf first/middle/last:", cdf_triplet(final_cdf))
     final_comment = f"Aggregated CDF: `{str(final_cdf)[:100]}...`\n\n" + "\n\n".join(final_comment_sections)
     return final_cdf, final_comment, reasoning_prompt, raw_responses
