@@ -43,6 +43,7 @@ This question's outcome will be determined by the specific criteria below. These
 Units for answer: {units}
 {lower_bound_message}
 {upper_bound_message}
+{distribution_guidance}
 
 Today is {today}.
 
@@ -172,6 +173,7 @@ Summarise your forecast in this structure:
 }}
 
 Choose the distribution type that best captures the shape of your reasoning:
+- "pmf": {{"values": [number, ...], "probabilities": [float, ...]}} for discrete or integer-count questions. Probabilities must be nonnegative and sum to 1 after normalization. Use the open-ended upper-tail value when the question has one.
 - "normal": {{"mean": float, "std": float}}
 - "mixture_normal": {{"weights": [float, ...], "means": [float, ...], "stds": [float, ...]}}
 - "skew_normal": {{"location": float, "scale": float, "alpha": float}}
@@ -258,7 +260,9 @@ def _distribution_location_values(spec: dict) -> list[float]:
     t = spec["type"]
     p = spec.get("params") or {k: v for k, v in spec.items() if k != "type"}
 
-    if t == "normal":
+    if t == "pmf":
+        values, _ = _parse_pmf_params(p)
+    elif t == "normal":
         values = [p.get("mean")]
     elif t == "mixture_normal":
         values = p.get("means") or []
@@ -344,10 +348,63 @@ def grid_for_distribution_units(
 
 def spec_to_cdf(spec: dict, grid: np.ndarray) -> list[float]:
     """Evaluate the distribution CDF on a grid and return as a list."""
+    if spec.get("type") == "pmf":
+        return pmf_spec_to_cdf(spec, grid)
     dist = build_distribution(spec)
     cdf_values = dist.cdf(grid)
     cdf_values = np.maximum.accumulate(np.clip(cdf_values, 0.0, 1.0))
     return cdf_values.tolist()
+
+
+def pmf_spec_to_cdf(spec: dict, grid: np.ndarray) -> list[float]:
+    p = spec.get("params") or {k: v for k, v in spec.items() if k != "type"}
+    values, probabilities = _parse_pmf_params(p)
+    if not values or not probabilities:
+        raise ValueError("pmf: values and probabilities must be nonempty")
+    if len(values) != len(probabilities):
+        raise ValueError(
+            f"pmf: values and probabilities must have the same length, got "
+            f"{len(values)} and {len(probabilities)}"
+        )
+
+    probs = np.array(probabilities, dtype=float)
+    if np.any(~np.isfinite(probs)) or np.any(probs < 0):
+        raise ValueError(f"pmf: probabilities must be finite and nonnegative, got {probabilities}")
+    total = float(probs.sum())
+    if total <= 0:
+        raise ValueError("pmf: probabilities must sum to a positive number")
+    probs = probs / total
+
+    xs = np.array(values, dtype=float)
+    cdf_values = [float(probs[xs <= threshold].sum()) for threshold in grid]
+    return np.maximum.accumulate(np.clip(cdf_values, 0.0, 1.0)).tolist()
+
+
+def _parse_pmf_params(params: dict) -> tuple[list[float], list[float]]:
+    values = params.get("values")
+    probabilities = params.get("probabilities")
+    if values is not None and probabilities is not None:
+        return [_coerce_pmf_value(value) for value in values], [float(p) for p in probabilities]
+
+    pmf = params.get("pmf") or params.get("probability_by_value")
+    if isinstance(pmf, dict):
+        parsed = [
+            (_coerce_pmf_value(value), float(probability))
+            for value, probability in pmf.items()
+        ]
+        parsed.sort(key=lambda item: item[0])
+        return [value for value, _ in parsed], [probability for _, probability in parsed]
+
+    return [], []
+
+
+def _coerce_pmf_value(value) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if text.endswith("+"):
+        text = text[:-1]
+    return float(text)
 
 
 def cdf_triplet(cdf: list[float]) -> tuple[float, float, float]:
@@ -396,6 +453,48 @@ def print_numeric_cdf_sanity_checks(
                 "sanity check warning:",
                 "CDF near the representative distribution value is far from 0.5; verify distribution shape and units.",
             )
+
+
+def distribution_guidance_for_question(
+    question_type: str,
+    lower_bound: float,
+    upper_bound: float,
+    cdf_size: int,
+    open_upper_bound: bool,
+) -> str:
+    if question_type != "discrete":
+        return ""
+
+    grid = np.linspace(lower_bound, upper_bound, cdf_size)
+    outcome_values = [int(round(value + 0.5)) for value in grid[:-1]]
+    if open_upper_bound and outcome_values:
+        tail_label = f"{outcome_values[-1] + 1}+"
+    else:
+        tail_label = ""
+    value_text = ", ".join(str(value) for value in outcome_values[:20])
+    if len(outcome_values) > 20:
+        value_text += ", ..."
+    if tail_label:
+        value_text += f", {tail_label}"
+
+    return (
+        "\nDiscrete/count guidance: this is a discrete question. Prefer a native "
+        '"pmf" distribution over continuous families such as log_normal or normal. '
+        f"Use probability masses over outcome values like: {value_text}. "
+        "The code will convert that PMF to the Metaculus CDF grid."
+    )
+
+
+def print_cdf_summary(label: str, grid: np.ndarray, cdf: list[float]) -> None:
+    pmf = np.diff(np.array(cdf, dtype=float), prepend=0.0, append=1.0)
+    print(
+        label,
+        {
+            "cdf_first_middle_last": cdf_triplet(cdf),
+            "pmf_first_values": np.round(pmf[: min(10, len(pmf))], 4).tolist(),
+            "tail_mass_after_last_grid": round(float(pmf[-1]), 4),
+        },
+    )
 
 
 class NumericDefaults:
@@ -862,6 +961,13 @@ async def get_numeric_gpt_prediction(
         lower_bound_message = f"The outcome can not be lower than {lower_bound}."
 
     grid = np.linspace(lower_bound, upper_bound, cdf_size)
+    distribution_guidance = distribution_guidance_for_question(
+        question_type=question_type,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        cdf_size=cdf_size,
+        open_upper_bound=open_upper_bound,
+    )
 
     summary_report = await run_research(title, resolution_criteria, background, fine_print)
 
@@ -874,6 +980,7 @@ async def get_numeric_gpt_prediction(
         summary_report=summary_report,
         lower_bound_message=lower_bound_message,
         upper_bound_message=upper_bound_message,
+        distribution_guidance=distribution_guidance,
         units=unit_of_measure,
     )
     log_prediction_prompt(question_type, title, reasoning_prompt)
@@ -898,6 +1005,11 @@ async def get_numeric_gpt_prediction(
         if spec is None:
             raise ValueError(f"LLM response missing 'distribution' key. Keys present: {list(parsed.keys())}")
         reasoning_text = parsed.get("reasoning", "")
+        if question_type == "discrete" and spec.get("type") != "pmf":
+            print(
+                "sanity check warning:",
+                "Discrete question used a continuous distribution family. Prefer type='pmf' for count questions.",
+            )
 
         eval_grid, unit_conversion_note = grid_for_distribution_units(
             spec,
@@ -912,6 +1024,7 @@ async def get_numeric_gpt_prediction(
         print("unit conversion:", unit_conversion_note)
         print("distribution params:", json.dumps(spec))
         print("raw cdf first/middle/last:", cdf_triplet(raw_cdf))
+        print_cdf_summary("raw distribution summary:", grid, raw_cdf)
         print_numeric_cdf_sanity_checks(spec, eval_grid, raw_cdf)
         cdf = raw_cdf
         dummy = NumericDistribution(
@@ -930,6 +1043,7 @@ async def get_numeric_gpt_prediction(
         )
         cdf = dummy._standardize_cdf(cdf)
         print("standardized cdf first/middle/last:", cdf_triplet(cdf))
+        print_cdf_summary("standardized distribution summary:", grid, cdf)
         print_numeric_cdf_sanity_checks(spec, eval_grid, cdf)
         comment = (
             f"Distribution spec: {json.dumps(spec)}\n"
@@ -952,5 +1066,6 @@ async def get_numeric_gpt_prediction(
     print("bounds/raw x first/last:", float(grid[0]), float(grid[-1]))
     print("distribution params:", f"aggregated from {len(cdfs)} run(s)")
     print("cdf first/middle/last:", cdf_triplet(final_cdf))
+    print_cdf_summary("aggregated distribution summary:", grid, final_cdf)
     final_comment = f"Aggregated CDF: `{str(final_cdf)[:100]}...`\n\n" + "\n\n".join(final_comment_sections)
     return final_cdf, final_comment, reasoning_prompt, raw_responses

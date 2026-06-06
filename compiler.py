@@ -450,8 +450,29 @@ Output exactly these Markdown sections:
 - Each bullet must include dates, counts, odds, source names, or URLs when present.
 - Prefer facts that directly bear on the resolution criteria.
 
+## Required Evidence Artifact
+- State the artifact the Evidence Plan says is most important.
+- State whether the raw research appears to have found it completely, partially, or not at all.
+- If it is a table/list/time series, preserve rows or fields that were extracted.
+
+## Direct Evidence
+- Evidence that directly measures, resolves, or is identical to the forecast target.
+- Put exact prediction markets, official records, resolution sources, and primary datasets here.
+
+## Near Proxy Evidence
+- Evidence that is close to the target but not identical.
+- Explain briefly why each item is a proxy rather than direct evidence.
+
+## Weak Proxy Evidence
+- Evidence that is indirectly related and should receive little weight.
+- Adjacent markets, AI capability markets for human-contestant questions, and broad commentary belong here unless the raw source directly matches the resolution criteria.
+
+## Background Color
+- Context useful for understanding the setting but not enough to materially move the forecast by itself.
+
 ## Market Signals
 - Reformat Polymarket, Kalshi, and Manifold signals, including relevance scores, odds, volume, liquidity, open interest, bid/ask spreads when present, and URLs. Treat Polymarket and Kalshi as real-money market signals; treat Manifold as a play-money crowd signal.
+- Put exact/direct markets before proxy markets. If an exact market appears to exist but odds were not extracted, say that plainly.
 - If no useful market signal exists, say so in one bullet.
 
 ## Resolution Source Findings
@@ -466,6 +487,7 @@ Output exactly these Markdown sections:
 
 ## Uncertainties And Gaps
 - List missing facts, stale data, conflicting reports, or watchpoints using minimal wording changes.
+- Highlight contradictions between sources and missing required-artifact rows/fields.
 
 Rules:
 - Do not make a probability estimate.
@@ -485,6 +507,10 @@ def _build_heuristic_report(
         content for provider, content in sections
         if provider.lower() in {"kalshi", "manifold", "polymarket"}
     ]
+    evidence_plan_sections = [
+        content for provider, content in sections
+        if provider.lower() == "evidence plan"
+    ]
     resolution_sections = [
         content for provider, content in sections
         if "resolution" in provider.lower()
@@ -496,7 +522,7 @@ def _build_heuristic_report(
     other_sections = [
         (provider, content)
         for provider, content in sections
-        if provider.lower() not in {"kalshi", "manifold", "polymarket", "asknews"}
+        if provider.lower() not in {"kalshi", "manifold", "polymarket", "asknews", "evidence plan"}
         and "resolution" not in provider.lower()
     ]
 
@@ -505,6 +531,30 @@ def _build_heuristic_report(
         lines.extend(f"- {item}" for item in key_evidence)
     else:
         lines.append("- No high-signal evidence could be extracted from the research providers.")
+
+    lines.extend(["", "## Required Evidence Artifact"])
+    if evidence_plan_sections:
+        lines.append(_join_compact(evidence_plan_sections, max_chars=5_000))
+    else:
+        lines.append("- No evidence plan was available.")
+
+    lines.extend(["", "## Direct Evidence"])
+    if resolution_sections:
+        lines.append(_join_compact(resolution_sections, max_chars=5_000))
+    else:
+        lines.append("- No direct resolution-source evidence was available.")
+
+    lines.extend(["", "## Near Proxy Evidence"])
+    lines.append("- Review market and scraped-search sections below for close-but-not-identical evidence.")
+
+    lines.extend(["", "## Weak Proxy Evidence"])
+    lines.append("- Treat adjacent markets, broad commentary, and indirect technical/context signals cautiously unless they directly match the resolution criteria.")
+
+    lines.extend(["", "## Background Color"])
+    if news_sections:
+        lines.append("- AskNews and general scraped evidence may provide useful context, but should not override missing direct base-rate artifacts.")
+    else:
+        lines.append("- No background news context was available.")
 
     lines.extend(["", "## Market Signals"])
     if market_sections:

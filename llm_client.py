@@ -597,6 +597,8 @@ async def run_research(
             question_context += f"\n\nBackground:\n{background.strip()}"
         if fine_print.strip():
             question_context += f"\n\nFine print:\n{fine_print.strip()}"
+        if evidence_plan.strip():
+            question_context += f"\n\nEvidence plan:\n{evidence_plan.strip()}"
 
         return await scrape_resolution_sources(
             resolution_criteria=resolution_criteria,
@@ -627,19 +629,53 @@ async def run_research(
         )
 
     async def kalshi_call() -> str:
-        return await asyncio.to_thread(scrape_kalshi, title)
+        return await asyncio.to_thread(scrape_kalshi, market_question)
 
     async def manifold_call() -> str:
-        return await asyncio.to_thread(scrape_manifold, title)
+        return await asyncio.to_thread(scrape_manifold, market_question)
 
     async def polymarket_call() -> str:
-        return await asyncio.to_thread(scrape_polymarket, title)
+        return await asyncio.to_thread(scrape_polymarket, market_question)
 
     asknews_task = (
         asyncio.create_task(run_provider("AskNews", asknews_call))
         if ENABLE_ASKNEWS_RESEARCH
         else None
     )
+
+    if asknews_task is not None:
+        asknews_result = await asknews_task
+    else:
+        asknews_result = ("AskNews", None)
+
+    asknews_name, asknews_content = asknews_result
+    usable_asknews_research = (
+        asknews_content
+        if should_include_provider_result(asknews_name, asknews_content)
+        else ""
+    )
+
+    from research.evidence_plan import build_evidence_plan
+
+    evidence_plan = await build_evidence_plan(
+        title=title,
+        resolution_criteria=resolution_criteria,
+        background=background,
+        fine_print=fine_print,
+        asknews_research=usable_asknews_research,
+    )
+    print("[research] Evidence Plan: completed")
+    evidence_plan_result = ("Evidence Plan", evidence_plan)
+    search_asknews_research = _join_research_context(
+        ("AskNews research", usable_asknews_research),
+        ("Evidence plan", evidence_plan),
+    )
+    market_question = _join_research_context(
+        ("Forecasting question", title),
+        ("Evidence plan for direct market search", evidence_plan),
+        max_chars=4_000,
+    )
+
     other_provider_tasks = []
     if ENABLE_RESOLUTION_SOURCE_RESEARCH:
         other_provider_tasks.append(
@@ -650,23 +686,6 @@ async def run_research(
         other_provider_tasks.append(asyncio.create_task(run_provider("Manifold", manifold_call)))
         other_provider_tasks.append(asyncio.create_task(run_provider("Polymarket", polymarket_call)))
 
-    if asknews_task is not None:
-        try:
-            asknews_result = await asknews_task
-        except Exception:
-            for task in other_provider_tasks:
-                task.cancel()
-            await asyncio.gather(*other_provider_tasks, return_exceptions=True)
-            raise
-    else:
-        asknews_result = ("AskNews", None)
-
-    asknews_name, asknews_content = asknews_result
-    search_asknews_research = (
-        asknews_content
-        if should_include_provider_result(asknews_name, asknews_content)
-        else ""
-    )
     search_provider_tasks = []
     if ENABLE_SERPAPI_RESEARCH:
         search_provider_tasks.append(
@@ -692,6 +711,7 @@ async def run_research(
         *other_provider_tasks,
     )
     results = [
+        evidence_plan_result,
         *remaining_results,
         asknews_result,
     ]
@@ -716,3 +736,15 @@ async def run_research(
         fine_print=fine_print,
         provider_results=included_results,
     )
+
+
+def _join_research_context(*parts: tuple[str, str | None], max_chars: int = 18_000) -> str:
+    chunks = []
+    for label, content in parts:
+        text = str(content or "").strip()
+        if text:
+            chunks.append(f"## {label}\n{text}")
+    joined = "\n\n".join(chunks).strip()
+    if len(joined) <= max_chars:
+        return joined
+    return joined[:max_chars].rstrip() + "\n\n[Truncated for research context.]"

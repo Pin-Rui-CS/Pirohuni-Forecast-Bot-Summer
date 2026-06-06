@@ -42,17 +42,17 @@ Background:
 Fine print:
 {fine_print}
 
-AskNews research already gathered:
+AskNews research and evidence plan already gathered:
 {asknews_research}
 
 Create up to {max_queries} Google search queries.
 
 Search Queries Priorities:
-1. Info about Key stakeholders 
-2. Establishing a base-rate using historical trends and market predictions
-3. Checking for recent events that are unique to this instance
-4. Statistical evidence and values
-5. Violatility of the event
+1. Find the required evidence artifact named in the evidence plan, especially official or primary-source data.
+2. Establish a base-rate using historical trends and direct market predictions.
+3. Check for recent events that are unique to this instance.
+4. Find statistical evidence and concrete values.
+5. Check volatility and uncertainty drivers.
 
 Style of Queries:
 1. Concise enough to work well in Google.
