@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import threading
+import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Final
@@ -33,6 +34,7 @@ class OpenRouterUsageRecord:
     output_characters: int
     output_tokens: int
     model_used: str
+    duration_seconds: float = 0.0
 
 
 class OpenRouterUsageHandle:
@@ -41,6 +43,7 @@ class OpenRouterUsageHandle:
     def __init__(self, records: list[OpenRouterUsageRecord]) -> None:
         self._records = records
         self._finished = False
+        self._started_at = time.monotonic()
 
     @property
     def input_characters(self) -> int:
@@ -62,9 +65,11 @@ class OpenRouterUsageHandle:
         if output_characters < 0:
             raise ValueError("output_characters must be positive or zero")
         output_tokens = estimate_tokens_from_characters(output_characters)
+        duration_seconds = time.monotonic() - self._started_at
         for record in self._records:
             record.output_characters = output_characters
             record.output_tokens = output_tokens
+            record.duration_seconds = duration_seconds
         MonetaryCostManager._check_active_limits_after_usage_update()
         self._finished = True
 
@@ -160,6 +165,7 @@ class MonetaryCostManager:
                     output_characters=record.output_characters,
                     output_tokens=record.output_tokens,
                     model_used=record.model_used,
+                    duration_seconds=record.duration_seconds,
                 )
                 for record in self._records
             ]
@@ -177,6 +183,7 @@ class MonetaryCostManager:
             f"  output_token_hard_limit: {self.output_token_hard_limit}",
             f"  total_tokens: {self.total_tokens}",
             f"  total_token_hard_limit: {self.hard_limit}",
+            f"  total_llm_call_seconds: {sum(r.duration_seconds for r in records):.1f}  # sum of per-call durations; parallel calls overlap in wall time",
             "  table: |",
         ]
         lines.extend(f"    {line}" for line in table.splitlines())
@@ -328,8 +335,8 @@ def count_openrouter_output_characters(response: Any) -> int:
 
 def _format_usage_markdown_table(records: list[OpenRouterUsageRecord]) -> str:
     lines = [
-        "| no. | name of task | input characters | input tokens | output characters | output tokens | model used |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | --- |",
+        "| no. | name of task | input characters | input tokens | output characters | output tokens | seconds | model used |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for record in records:
         lines.append(
@@ -340,6 +347,7 @@ def _format_usage_markdown_table(records: list[OpenRouterUsageRecord]) -> str:
             f"{record.input_tokens} | "
             f"{record.output_characters} | "
             f"{record.output_tokens} | "
+            f"{record.duration_seconds:.1f} | "
             f"{_table_cell(record.model_used)} |"
         )
     return "\n".join(lines)

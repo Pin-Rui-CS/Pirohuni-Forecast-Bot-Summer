@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import traceback
 
 from artifacts import QuestionArtifacts
@@ -138,6 +139,7 @@ async def forecast_individual_question(
         return summary_of_forecast
 
     artifacts = QuestionArtifacts(question_id, post_id, title, question_type or "unknown")
+    question_started = time.monotonic()
 
     with MonetaryCostManager(hard_limit=per_question_token_hard_limit) as question_cost_manager:
         research_bundle = await run_research(
@@ -146,6 +148,7 @@ async def forecast_individual_question(
             background=question_details["description"],
             fine_print=question_details["fine_print"],
         )
+        research_seconds = time.monotonic() - question_started
         artifacts.save_research(
             evidence_plan=research_bundle.evidence_plan,
             provider_results=research_bundle.provider_results,
@@ -153,6 +156,7 @@ async def forecast_individual_question(
             artifact_check=research_bundle.artifact_check,
         )
 
+        forecast_started = time.monotonic()
         if question_type == "binary":
             result: ForecastResult = await get_binary_gpt_prediction(
                 question_details, num_runs_per_question, research_bundle.compiled_report
@@ -167,8 +171,23 @@ async def forecast_individual_question(
             )
         else:
             raise ValueError(f"Unknown question type: {question_type}")
+        forecast_seconds = time.monotonic() - forecast_started
+        total_seconds = time.monotonic() - question_started
         estimated_tokens = question_cost_manager.total_tokens
         usage_yaml_table = question_cost_manager.format_usage_yaml_table()
+
+    timings = {
+        "research_seconds": round(research_seconds, 1),
+        "forecast_seconds": round(forecast_seconds, 1),
+        "total_seconds": round(total_seconds, 1),
+    }
+    logger.info(
+        "Question %s wall time: research %.1fs + forecast %.1fs = %.1fs total",
+        question_id,
+        research_seconds,
+        forecast_seconds,
+        total_seconds,
+    )
 
     logger.info(
         "-----------------------------------------------\nPost %s Question %s:",
@@ -183,6 +202,10 @@ async def forecast_individual_question(
         summary_of_forecast += f"Forecast: {result.forecast}\n"
 
     summary_of_forecast += f"Comment:\n```\n{result.comment[:200]}...\n```\n\n"
+    summary_of_forecast += (
+        f"Wall time: research {research_seconds:.1f}s + forecast {forecast_seconds:.1f}s "
+        f"= {total_seconds:.1f}s total\n"
+    )
     summary_of_forecast += f"Estimated OpenRouter LLM tokens: {estimated_tokens}\n"
     summary_of_forecast += f"{usage_yaml_table}\n"
 
@@ -202,6 +225,7 @@ async def forecast_individual_question(
             "forecast_payload": forecast_payload,
             "extra": result.extra,
             "estimated_tokens": estimated_tokens,
+            "timings": timings,
             "usage_yaml_table": usage_yaml_table,
             "submitted": submit_prediction,
         }
@@ -250,6 +274,15 @@ async def forecast_questions(
     skip_previously_forecasted_questions: bool,
     per_question_token_hard_limit: float = 0,
 ) -> None:
+    # Self-initialize logging so entry points that call forecast_questions
+    # directly (e.g. the inline-Python CI workflows) still get console INFO
+    # output — including the per-question token/cost usage tables — and the
+    # run.log file. No-op when forecasting_bot.py already configured it.
+    from artifacts import run_log_file_path
+    from run_logging import setup_run_logging
+
+    setup_run_logging(run_log_file_path())
+
     logger.info(await get_openrouter_usage_summary())
 
     with MonetaryCostManager(

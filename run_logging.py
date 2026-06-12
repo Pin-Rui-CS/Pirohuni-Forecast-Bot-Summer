@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 _NOISY_LOGGERS = (
@@ -46,6 +47,7 @@ _PROJECT_LOGGER_PREFIXES = {
 }
 
 _CONFIGURED = False
+_CONFIGURED_FILE_PATHS: set[str] = set()
 
 
 class _ProjectDebugOnlyFilter(logging.Filter):
@@ -75,13 +77,16 @@ def setup_run_logging(log_file_path: str | None = None) -> None:
         _CONFIGURED = True
 
     if log_file_path:
-        file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.addFilter(_ProjectDebugOnlyFilter())
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s | %(message)s")
-        )
-        root.addHandler(file_handler)
+        resolved = os.path.abspath(log_file_path)
+        if resolved not in _CONFIGURED_FILE_PATHS:
+            file_handler = logging.FileHandler(resolved, encoding="utf-8")
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.addFilter(_ProjectDebugOnlyFilter())
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s %(levelname)s %(name)s | %(message)s")
+            )
+            root.addHandler(file_handler)
+            _CONFIGURED_FILE_PATHS.add(resolved)
 
     for name in _NOISY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 
 from config import (
@@ -53,18 +54,24 @@ async def run_research(
         from research.polymarket_research import scrape_polymarket
 
     async def run_provider(name: str, research_call) -> tuple[str, str | None]:
+        started = time.monotonic()
         try:
             result = await research_call()
+            elapsed = time.monotonic() - started
             if result is None or not str(result).strip():
-                logger.info("[research] %s: no usable result", name)
+                logger.info("[research] %s: no usable result (%.1fs)", name, elapsed)
                 return name, None
-            logger.info("[research] %s: completed", name)
+            logger.info("[research] %s: completed (%.1fs)", name, elapsed)
             return name, str(result).strip()
         except HardLimitExceededError:
             raise
         except Exception as exc:
             logger.warning(
-                "[research] %s: unavailable (%s: %s)", name, type(exc).__name__, exc
+                "[research] %s: unavailable after %.1fs (%s: %s)",
+                name,
+                time.monotonic() - started,
+                type(exc).__name__,
+                exc,
             )
             return name, f"{name} research unavailable: {type(exc).__name__}: {exc}"
 

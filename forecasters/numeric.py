@@ -9,6 +9,7 @@ from collections import Counter
 import numpy as np
 from pydantic import BaseModel, Field, model_validator
 from scipy import stats
+from scipy.interpolate import PchipInterpolator
 
 from forecasters.base import ForecastResult, gather_forecast_runs
 
@@ -1012,6 +1013,41 @@ def _sanitize_declared_percentiles(
     ]
 
 
+def _pchip_cdf_on_grid(distribution: NumericDistribution, cdf_size: int) -> np.ndarray:
+    """Evaluate declared percentiles as a smooth CDF on the location grid.
+
+    The legacy path linearly interpolated between percentile knots, which made
+    the PMF a step function (flat shelves with sharp corners on the Metaculus
+    plot). Monotone cubic (PCHIP) interpolation passes through exactly the
+    same knots — declared percentiles plus the bound anchors — but curves
+    smoothly between them and cannot overshoot monotonicity.
+    """
+    bounded = distribution._add_explicit_upper_lower_bound_percentiles(
+        distribution.declared_percentiles
+    )
+    knot_locations: list[float] = []
+    knot_probabilities: list[float] = []
+    for point in bounded:
+        location = distribution._nominal_location_to_cdf_location(point.value)
+        probability = float(point.percentile)
+        if knot_locations and location <= knot_locations[-1] + 1e-12:
+            # Collapse duplicate locations (e.g. several values clamped to a
+            # closed bound) keeping the upper CDF envelope.
+            knot_probabilities[-1] = max(knot_probabilities[-1], probability)
+            continue
+        knot_locations.append(location)
+        knot_probabilities.append(probability)
+
+    if len(knot_locations) < 2:
+        raise ValueError(f"Not enough distinct percentile knots: {bounded}")
+
+    interpolator = PchipInterpolator(knot_locations, knot_probabilities)
+    locations = np.linspace(0.0, 1.0, cdf_size)
+    clipped = np.clip(locations, knot_locations[0], knot_locations[-1])
+    values = np.asarray(interpolator(clipped), dtype=float)
+    return np.clip(np.maximum.accumulate(values), 0.0, 1.0)
+
+
 def percentiles_to_cdf(
     percentiles: dict,
     *,
@@ -1023,7 +1059,7 @@ def percentiles_to_cdf(
     cdf_size: int,
     value_scale: float = 1.0,
 ) -> np.ndarray:
-    """Evaluate declared percentiles as a raw (unstandardized) CDF on the grid."""
+    """Evaluate declared percentiles as a raw (unstandardized) smooth CDF."""
     declared = _sanitize_declared_percentiles(percentiles, zero_point, value_scale)
     distribution = NumericDistribution(
         declared_percentiles=declared,
@@ -1036,12 +1072,7 @@ def percentiles_to_cdf(
         standardize_cdf=False,
         strict_validation=False,
     )
-    cdf_points = distribution.get_cdf()
-    return np.clip(
-        np.maximum.accumulate(np.array([point.percentile for point in cdf_points])),
-        0.0,
-        1.0,
-    )
+    return _pchip_cdf_on_grid(distribution, cdf_size)
 
 
 def parse_scenarios(forecast: dict) -> list[dict]:
@@ -1174,6 +1205,12 @@ def quantile_average_cdfs(cdfs: list[np.ndarray]) -> np.ndarray:
     consensus the way PMF averaging does when runs disagree on location.
     Operates in grid-index space, which equals Metaculus's scaled-location
     space for both linear and log-scaled questions.
+
+    Out-of-bound probability mass (cdf[0] > 0 below an open lower bound,
+    cdf[-1] < 1 above an open upper bound) is averaged separately and
+    recomposed afterwards. Quantile-inverting the full CDF directly would
+    clamp that tail mass onto the first/last grid cell, which showed up on
+    Metaculus as a huge spurious spike at the extreme.
     """
     if len(cdfs) == 1:
         return cdfs[0]
@@ -1182,22 +1219,43 @@ def quantile_average_cdfs(cdfs: list[np.ndarray]) -> np.ndarray:
     xs = np.arange(size, dtype=float)
     levels = np.linspace(0.0, 1.0, 4 * size + 1)[1:-1]
 
-    average_positions = np.zeros_like(levels)
+    lower_masses: list[float] = []
+    upper_masses: list[float] = []
+    conditionals: list[np.ndarray] = []
     for cdf in cdfs:
         clean = np.maximum.accumulate(np.clip(np.asarray(cdf, dtype=float), 0.0, 1.0))
-        clean = _strictly_increasing(clean)
-        average_positions += np.interp(levels, clean, xs, left=0.0, right=size - 1.0)
-    average_positions /= len(cdfs)
+        lower_mass = float(clean[0])
+        upper_mass = float(1.0 - clean[-1])
+        span = float(clean[-1] - clean[0])
+        if span <= 1e-9:
+            conditional = np.linspace(0.0, 1.0, size)
+        else:
+            conditional = (clean - clean[0]) / span
+        lower_masses.append(lower_mass)
+        upper_masses.append(upper_mass)
+        conditionals.append(conditional)
+
+    average_lower = float(np.mean(lower_masses))
+    average_upper = float(np.mean(upper_masses))
+
+    average_positions = np.zeros_like(levels)
+    for conditional in conditionals:
+        average_positions += np.interp(levels, _strictly_increasing(conditional), xs)
+    average_positions /= len(conditionals)
 
     average_positions = np.maximum.accumulate(average_positions)
-    out = np.interp(
+    average_conditional = np.interp(
         xs,
         _strictly_increasing(average_positions),
         levels,
         left=0.0,
         right=1.0,
     )
-    return np.clip(np.maximum.accumulate(out), 0.0, 1.0)
+    average_conditional = np.clip(np.maximum.accumulate(average_conditional), 0.0, 1.0)
+    average_conditional[0] = 0.0
+    average_conditional[-1] = 1.0
+
+    return average_lower + (1.0 - average_lower - average_upper) * average_conditional
 
 
 def aggregate_run_cdfs(cdfs: list[np.ndarray], question_type: str) -> np.ndarray:
