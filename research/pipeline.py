@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 
 from config import (
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 ARTIFACT_CHECK_MODEL = "anthropic/claude-sonnet-4.6"
 _MAX_ARTIFACT_CHECK_INPUT_CHARS = 40_000
 _MAX_RETRY_QUERIES = 4
+ARTIFACT_RETRY_TIMEOUT_SECONDS = float(os.getenv("ARTIFACT_RETRY_TIMEOUT_SECONDS", "150"))
 
 
 @dataclass
@@ -139,7 +141,21 @@ async def run_research(
     async def polymarket_call(market_question: str) -> str:
         return await asyncio.to_thread(scrape_polymarket, market_question)
 
-    # Stage 1: AskNews first; its output feeds the evidence plan.
+    # Stage 1: AskNews and the resolution-source scraper start immediately.
+    # The scraper is usually the slowest provider and only needs the question
+    # fields, so keeping it off the AskNews -> evidence-plan critical path
+    # saves its head start (~1 minute of wall clock per question).
+    resolution_task = (
+        asyncio.create_task(
+            run_provider(
+                "Resolution Criteria Sources",
+                lambda: resolution_sources_call(""),
+            )
+        )
+        if ENABLE_RESOLUTION_SOURCE_RESEARCH
+        else None
+    )
+
     if ENABLE_ASKNEWS_RESEARCH:
         asknews_result = await run_provider("AskNews", asknews_call)
     else:
@@ -175,15 +191,8 @@ async def run_research(
 
     # Stage 3: remaining providers in parallel.
     other_provider_tasks = []
-    if ENABLE_RESOLUTION_SOURCE_RESEARCH:
-        other_provider_tasks.append(
-            asyncio.create_task(
-                run_provider(
-                    "Resolution Criteria Sources",
-                    lambda: resolution_sources_call(evidence_plan),
-                )
-            )
-        )
+    if resolution_task is not None:
+        other_provider_tasks.append(resolution_task)
     if ENABLE_PREDICTION_MARKET_RESEARCH:
         other_provider_tasks.append(
             asyncio.create_task(run_provider("Kalshi", lambda: kalshi_call(market_question)))
@@ -252,22 +261,27 @@ async def run_research(
         ]
         if retry_queries:
             logger.info(
-                "[research] Required artifact %s; running focused retry with %d queries",
+                "[research] Required artifact %s; running focused retry with %d queries "
+                "(time budget %.0fs)",
                 artifact_check.get("status"),
                 len(retry_queries),
+                ARTIFACT_RETRY_TIMEOUT_SECONDS,
             )
             from research.firecrawl_research import run_firecrawl_research
 
             retry_result = await run_provider(
                 "Focused Artifact Retry",
-                lambda: run_firecrawl_research(
-                    title=title,
-                    resolution_criteria=resolution_criteria,
-                    background=background,
-                    fine_print=fine_print,
-                    asknews_research=search_asknews_research,
-                    preset_queries=retry_queries,
-                    max_scrape_cycles=2,
+                lambda: asyncio.wait_for(
+                    run_firecrawl_research(
+                        title=title,
+                        resolution_criteria=resolution_criteria,
+                        background=background,
+                        fine_print=fine_print,
+                        asknews_research=search_asknews_research,
+                        preset_queries=retry_queries,
+                        max_scrape_cycles=1,
+                    ),
+                    timeout=ARTIFACT_RETRY_TIMEOUT_SECONDS,
                 ),
             )
             if should_include_provider_result(*retry_result):
@@ -319,6 +333,10 @@ Rules:
 - "complete" only if the artifact's actual values/rows appear in the research text.
 - Mentions that the artifact exists, without its values, count as "partial" at best.
 - Retry queries must be materially different from generic restatements of the question.
+- If the missing value simply does not exist yet (a future data release, an outcome
+  that has not happened, an unpublished statistic), return an empty retry_queries
+  list — searching cannot find numbers that have not been published. Suggest retry
+  queries only when the artifact plausibly already exists somewhere online.
 """.strip()
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import traceback
 
 from artifacts import QuestionArtifacts
@@ -21,7 +22,7 @@ from research.pipeline import run_research
 
 logger = logging.getLogger(__name__)
 
-QUESTION_TIMEOUT_SECONDS = 20 * 60
+QUESTION_TIMEOUT_SECONDS = int(os.getenv("QUESTION_TIMEOUT_SECONDS", str(20 * 60)))
 
 _QUESTION_SNAPSHOT_KEYS = (
     "id",

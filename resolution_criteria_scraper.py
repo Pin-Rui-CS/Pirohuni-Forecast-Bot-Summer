@@ -462,6 +462,9 @@ async def _scrape_resolution_url(
         config.max_chars_per_page = 16_000
         config.max_total_chars = 40_000
         config.content_budget = _CRAWL4AI_CONTENT_BUDGET
+        # Fewer embedding query variations: resolution scraping is a targeted
+        # lookup, not broad exploration, and each variation costs crawl time.
+        config.n_query_variations = 4
         content = await adaptive_research_crawl(url, query, config=config)
         if is_duplicate_scrape_payload(content):
             return _ResolutionScrapeResult(
@@ -712,13 +715,16 @@ async def scrape_resolution_sources(
     llm_model: str = "anthropic/claude-sonnet-4.6",
     max_concurrent: int = 3,
     timeout: int = 30,
+    max_urls: int = 3,
 ) -> str:
     """Scrape explicit resolution-source URLs and summarize them once.
 
     The resolution-source path is intentionally narrow: it uses URLs from the
     resolution criteria first, falls back to URLs in the question context only
     when the criteria has none, and never asks the LLM to discover follow-up
-    links.
+    links. At most ``max_urls`` URLs are scraped; URLs from the resolution
+    criteria are authoritative, while question-text URLs are usually just
+    background links and not worth a long crawl each.
     """
 
     urls = extract_urls(resolution_criteria)
@@ -728,6 +734,11 @@ async def scrape_resolution_sources(
         logger.info("No external URLs found in question text or resolution criteria.")
         return ""
 
+    if len(urls) > max_urls:
+        logger.info(
+            "Found %d resolution URL(s); scraping only the first %d.", len(urls), max_urls
+        )
+        urls = urls[:max_urls]
     logger.info("Found %d resolution URL(s): %s", len(urls), urls)
     results = await _scrape_resolution_urls(
         list(urls),
