@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import traceback
 
+from artifacts import QuestionArtifacts
 from config import API_BASE_URL, OPENROUTER_API_KEY
+from forecasters.base import ForecastResult
 from forecasters.binary import get_binary_gpt_prediction
 from forecasters.multiple_choice import get_multiple_choice_gpt_prediction
 from forecasters.numeric import get_numeric_gpt_prediction
-from llm_client import save_llm_result
 from metaculus_client import (
     create_forecast_payload,
     get_post_details,
@@ -15,8 +17,28 @@ from metaculus_client import (
     post_question_prediction,
 )
 from monetary_cost_manager import MonetaryCostManager, get_openrouter_key_usage
+from research.pipeline import run_research
+
+logger = logging.getLogger(__name__)
 
 QUESTION_TIMEOUT_SECONDS = 20 * 60
+
+_QUESTION_SNAPSHOT_KEYS = (
+    "id",
+    "title",
+    "type",
+    "resolution_criteria",
+    "description",
+    "fine_print",
+    "options",
+    "scaling",
+    "open_upper_bound",
+    "open_lower_bound",
+    "unit",
+    "status",
+    "scheduled_close_time",
+    "scheduled_resolve_time",
+)
 
 
 async def get_openrouter_usage_summary() -> str:
@@ -65,6 +87,14 @@ def forecast_is_already_made(post_details: dict) -> bool:
     return forecast_values is not None
 
 
+def _question_snapshot(question_details: dict) -> dict:
+    return {
+        key: question_details.get(key)
+        for key in _QUESTION_SNAPSHOT_KEYS
+        if question_details.get(key) is not None
+    }
+
+
 async def forecast_individual_question(
     question_id: int,
     post_id: int,
@@ -103,58 +133,82 @@ async def forecast_individual_question(
         summary_of_forecast += f"options: {options}\n"
 
     if forecast_is_already_made(post_details) and skip_previously_forecasted_questions:
-        summary_of_forecast += f"Skipped: Forecast already made\n"
+        summary_of_forecast += "Skipped: Forecast already made\n"
         return summary_of_forecast
 
+    artifacts = QuestionArtifacts(question_id, post_id, title, question_type or "unknown")
+
     with MonetaryCostManager(hard_limit=per_question_token_hard_limit) as question_cost_manager:
+        research_bundle = await run_research(
+            title=question_details["title"],
+            resolution_criteria=question_details["resolution_criteria"],
+            background=question_details["description"],
+            fine_print=question_details["fine_print"],
+        )
+        artifacts.save_research(
+            evidence_plan=research_bundle.evidence_plan,
+            provider_results=research_bundle.provider_results,
+            compiled_report=research_bundle.compiled_report,
+            artifact_check=research_bundle.artifact_check,
+        )
+
         if question_type == "binary":
-            forecast, comment, prompt, raw_responses = await get_binary_gpt_prediction(
-                question_details, num_runs_per_question
+            result: ForecastResult = await get_binary_gpt_prediction(
+                question_details, num_runs_per_question, research_bundle.compiled_report
             )
         elif question_type in ("numeric", "discrete"):
-            forecast, comment, prompt, raw_responses = await get_numeric_gpt_prediction(
-                question_details, num_runs_per_question
+            result = await get_numeric_gpt_prediction(
+                question_details, num_runs_per_question, research_bundle.compiled_report
             )
         elif question_type == "multiple_choice":
-            forecast, comment, prompt, raw_responses = await get_multiple_choice_gpt_prediction(
-                question_details, num_runs_per_question
+            result = await get_multiple_choice_gpt_prediction(
+                question_details, num_runs_per_question, research_bundle.compiled_report
             )
         else:
             raise ValueError(f"Unknown question type: {question_type}")
         estimated_tokens = question_cost_manager.total_tokens
         usage_yaml_table = question_cost_manager.format_usage_yaml_table()
 
-    print(
-        f"-----------------------------------------------\nPost {post_id} Question {question_id}:\n"
+    logger.info(
+        "-----------------------------------------------\nPost %s Question %s:",
+        post_id,
+        question_id,
     )
-    print(f"Forecast for post {post_id} (question {question_id}):\n{forecast}")
-    print(f"Comment for post {post_id} (question {question_id}):\n{comment}")
+    logger.info("Forecast for post %s (question %s): %s", post_id, question_id, str(result.forecast)[:200])
 
     if question_type in ("numeric", "discrete"):
-        summary_of_forecast += f"Forecast: {str(forecast)[:200]}...\n"
+        summary_of_forecast += f"Forecast: {str(result.forecast)[:200]}...\n"
     else:
-        summary_of_forecast += f"Forecast: {forecast}\n"
+        summary_of_forecast += f"Forecast: {result.forecast}\n"
 
-    summary_of_forecast += f"Comment:\n```\n{comment[:200]}...\n```\n\n"
+    summary_of_forecast += f"Comment:\n```\n{result.comment[:200]}...\n```\n\n"
     summary_of_forecast += f"Estimated OpenRouter LLM tokens: {estimated_tokens}\n"
     summary_of_forecast += f"{usage_yaml_table}\n"
 
-    forecast_payload = create_forecast_payload(forecast, question_type)
-    save_llm_result(
-        question_id,
-        post_id,
-        title,
-        question_type,
-        prompt,
-        raw_responses,
-        forecast,
-        forecast_payload,
-        usage_yaml_table=usage_yaml_table,
+    forecast_payload = create_forecast_payload(result.forecast, question_type)
+
+    artifacts.save_runs(
+        prompt=result.prompt,
+        run_sections=result.run_transcripts,
+        final_summary=result.comment,
+    )
+    artifacts.save_forecast_json(
+        {
+            "question_details": _question_snapshot(question_details),
+            "artifact_check": research_bundle.artifact_check,
+            "run_values": result.run_values,
+            "final_forecast": result.forecast,
+            "forecast_payload": forecast_payload,
+            "extra": result.extra,
+            "estimated_tokens": estimated_tokens,
+            "usage_yaml_table": usage_yaml_table,
+            "submitted": submit_prediction,
+        }
     )
 
     if submit_prediction:
         await post_question_prediction(question_id, forecast_payload)
-        await post_question_comment(post_id, comment)
+        await post_question_comment(post_id, result.comment)
         summary_of_forecast += "Posted: Forecast was posted to Metaculus.\n"
 
     return summary_of_forecast
@@ -195,7 +249,7 @@ async def forecast_questions(
     skip_previously_forecasted_questions: bool,
     per_question_token_hard_limit: float = 0,
 ) -> None:
-    print(await get_openrouter_usage_summary())
+    logger.info(await get_openrouter_usage_summary())
 
     with MonetaryCostManager(
         input_token_hard_limit=0,
@@ -222,11 +276,13 @@ async def forecast_questions(
     average_estimated_tokens = (
         total_estimated_tokens / completed_count if completed_count else 0
     )
-    print("\n", "#" * 100, "\nForecast Summaries\n", "#" * 100)
-    print(f"Total estimated OpenRouter LLM tokens: {total_estimated_tokens}")
-    print(f"Average estimated tokens per completed question: {average_estimated_tokens:.1f}\n")
-    print(run_usage_yaml_table)
-    print(await get_openrouter_usage_summary())
+    logger.info("\n%s\nForecast Summaries\n%s", "#" * 100, "#" * 100)
+    logger.info("Total estimated OpenRouter LLM tokens: %s", total_estimated_tokens)
+    logger.info(
+        "Average estimated tokens per completed question: %.1f", average_estimated_tokens
+    )
+    logger.info(run_usage_yaml_table)
+    logger.info(await get_openrouter_usage_summary())
 
     errors = []
     for question_id_post_id, forecast_summary in zip(
@@ -241,18 +297,25 @@ async def forecast_questions(
                     forecast_summary.__traceback__,
                 )
             ).rstrip()
-            print(
-                f"-----------------------------------------------\nPost {post_id} Question {question_id}:\n"
-                f"Error: {forecast_summary.__class__.__name__} {forecast_summary}\n"
-                f"Post API URL: {API_BASE_URL}/posts/{post_id}/\n"
-                f"Traceback:\n{formatted_traceback}\n"
+            logger.error(
+                "-----------------------------------------------\nPost %s Question %s:\n"
+                "Error: %s %s\n"
+                "Post API URL: %s/posts/%s/\n"
+                "Traceback:\n%s",
+                post_id,
+                question_id,
+                forecast_summary.__class__.__name__,
+                forecast_summary,
+                API_BASE_URL,
+                post_id,
+                formatted_traceback,
             )
             errors.append(forecast_summary)
         else:
-            print(forecast_summary)
+            logger.info(forecast_summary)
 
     if errors:
-        print("\n", "#" * 100, f"\n{len(errors)} question(s) FAILED:\n", "#" * 100)
+        logger.error("\n%s\n%d question(s) FAILED:\n%s", "#" * 100, len(errors), "#" * 100)
         for err in errors:
-            print(f"  {err.__class__.__name__}: {err}")
+            logger.error("  %s: %s", err.__class__.__name__, err)
         raise RuntimeError(f"{len(errors)} question(s) failed during forecasting")

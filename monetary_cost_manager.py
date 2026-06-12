@@ -10,6 +10,8 @@ from typing import Any, Final
 
 import httpx
 
+from utils import _get_field, _json_default
+
 logger = logging.getLogger(__name__)
 
 OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
@@ -258,15 +260,6 @@ class MonetaryCostManager:
         return OpenRouterUsageHandle(records)
 
     @classmethod
-    def increase_current_usage_in_parent_managers(cls, amount: float) -> None:
-        """Compatibility shim for old response-cost based call sites."""
-        if amount < 0:
-            raise ValueError("Cost must be positive or zero")
-        logger.debug(
-            "increase_current_usage_in_parent_managers is ignored by the character-based tracker"
-        )
-
-    @classmethod
     def _check_active_limits_after_usage_update(cls) -> None:
         for manager in cls._active_managers.get():
             if (
@@ -333,18 +326,6 @@ def count_openrouter_output_characters(response: Any) -> int:
     return count_serialized_characters(response)
 
 
-def track_openrouter_response_cost(response: Any) -> float:
-    """
-    Compatibility shim for old call sites.
-
-    OpenRouter response costs are no longer used. New call sites should call
-    MonetaryCostManager.start_openrouter_call(...) before the API request and
-    record the response on the returned handle.
-    """
-    logger.debug("OpenRouter usage.cost ignored; character-based tracking is active")
-    return 0.0
-
-
 def _format_usage_markdown_table(records: list[OpenRouterUsageRecord]) -> str:
     lines = [
         "| no. | name of task | input characters | input tokens | output characters | output tokens | model used |",
@@ -373,36 +354,6 @@ def _stable_string(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, sort_keys=True, default=_json_default)
     except (TypeError, ValueError):
         return str(value)
-
-
-def _json_default(value: Any) -> str:
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    if hasattr(value, "__dict__"):
-        return value.__dict__
-    return str(value)
-
-
-def _get_field(obj: Any, field_name: str) -> Any:
-    if obj is None:
-        return None
-
-    if isinstance(obj, dict):
-        return obj.get(field_name)
-
-    if hasattr(obj, field_name):
-        return getattr(obj, field_name)
-
-    model_extra = getattr(obj, "model_extra", None)
-    if isinstance(model_extra, dict) and field_name in model_extra:
-        return model_extra[field_name]
-
-    if hasattr(obj, "model_dump"):
-        dumped = obj.model_dump()
-        if isinstance(dumped, dict):
-            return dumped.get(field_name)
-
-    return None
 
 
 async def get_openrouter_key_usage(api_key: str) -> dict[str, Any]:

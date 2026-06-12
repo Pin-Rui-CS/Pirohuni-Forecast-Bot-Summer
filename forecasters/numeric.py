@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import datetime
 import json
+import logging
 import re
 from collections import Counter
 
@@ -10,7 +10,9 @@ import numpy as np
 from pydantic import BaseModel, Field, model_validator
 from scipy import stats
 
-from llm_client import call_llm, run_research, log_prediction_prompt
+from forecasters.base import ForecastResult, gather_forecast_runs
+
+logger = logging.getLogger(__name__)
 
 
 NUMERIC_PROMPT_TEMPLATE = """
@@ -18,13 +20,10 @@ You are a Superforecaster — a disciplined, calibrated prediction engine traine
 
 You must complete every phase below in order. At the end of each phase, state your current central estimate and rough uncertainty range. Show how your estimate shifts (or doesn't) as you move through each phase. Be explicit about the direction and magnitude of every adjustment.
 
----
-
-## TOOLS
-
-You have access to a `run_python_code` tool that executes Python 3.12 locally. numpy, scipy, pandas, scikit-learn, and statsmodels are available.
-
-**ALWAYS use this tool for any math, statistics, or probability calculation — never do mental arithmetic.** Choose the appropriate statistical model yourself. Write the code, run it, and report the verified numerical result. You MUST use this tool in Phase 1 to compute your base rate distribution.
+Discipline rules that apply to every phase:
+- The research material labels evidence items with IDs like [E1], [E2]. Every shift of your central estimate or your interval must cite the specific evidence item(s) that justify it. A shift with no citable evidence must be small and explicitly labelled as judgment.
+- Keep arithmetic simple and show it in-line. State the data values you use explicitly. Do not perform calculations you cannot show.
+- If the Required Artifact Status says the key evidence is missing or partial, your final 90% interval must be meaningfully wider than it would be with the artifact in hand. Say so explicitly. Do not fill gaps with invented certainty.
 
 ---
 
@@ -63,15 +62,15 @@ Before forecasting, audit the research material. Answer briefly:
 2. Is the research current enough for the question?
 3. Are any important sections incomplete, truncated, contradictory, or duplicated?
 4. Are any sources weak, stale, or likely misinterpreted?
-5. Which facts are strongest and most decision-relevant?
+5. Which evidence items are strongest and most decision-relevant (cite their IDs)?
 6. Which important facts are missing?
 
-If the research material is insufficient, say so explicitly and lower confidence. Do not fill gaps with invented certainty.
+If the research material is insufficient, say so explicitly and lower confidence.
 
 Output:
 - Research quality: High / Medium / Low
 - Main research limitations
-- Most important reliable facts
+- Most important reliable evidence items (by ID)
 - Missing information that could change the forecast
 
 ---
@@ -81,16 +80,13 @@ Output:
 Establish a starting distribution using base rates and reference classes.
 
 - Identify the most relevant reference class. What is the typical range of outcomes for this type of quantity?
-- Reason about the historical base rate distribution: central tendency, spread, and whether outcomes are skewed.
+- State the historical values you are using as an explicit list, with their source or evidence ID. Reason about central tendency, spread, and skew from those stated values, showing simple arithmetic in-line.
 - Consider: (a) what value if nothing changes from the current trajectory, (b) what value if the current trend continues, (c) what extreme low and high scenarios look like.
-- **Use the `run_python_code` tool to compute your base rate distribution numerically.** Choose an appropriate statistical model (e.g. fit a normal/lognormal to historical data, compute mean ± std from reference class values, or use scipy to derive a 90% CI). Hard-code the reference class data you have identified, run the calculation, and use the printed result as your starting estimate.
-- State your initial central estimate and 90% confidence interval based purely on the outside view.
 - Treat prediction market data carefully: Polymarket and Kalshi are real-money market priors weighted by their volume, liquidity, bid/ask spread, and relevance to the question; Manifold is a play-money crowd signal and should be discounted relative to comparable real-money markets.
 
 Output format:
-- Reference class(es) and historical range
-- Base rate reasoning
-- Python tool call with calculation
+- Reference class(es), the historical values used, and citations
+- Base rate reasoning with arithmetic shown
 - **Starting estimate: [central value] (90% CI: [low] – [high])**
 
 ---
@@ -100,9 +96,9 @@ Output format:
 Now examine the provided research material. Identify the specific facts, signals, and context that distinguish this particular case from the base rate distribution.
 
 For each significant piece of evidence:
-1. State the evidence clearly
+1. State the evidence clearly, citing its ID
 2. Assess its diagnostic value - which range or scenario it points toward, size of impact on result, dependent variables, and reliability of source
-3. Estimate how the evidence changes the likelihood of different ranges or scenarios, apply conservative likelihood weights across the distribution, then renormalize and report updated median, quantiles, and credible interval
+3. Estimate how the evidence changes the likelihood of different ranges or scenarios, and report your updated median and credible interval
 4. Compare the importance of each evidence item and size of update to the distribution
 5. Consider that events take time and favour a conservative update unless evidence is conclusive
 
@@ -113,7 +109,7 @@ Guard against these biases:
 - Precision bias: Do not report spurious precision; good forecasters set wide intervals to account for unknown unknowns
 
 Output format:
-- Evidence item → direction of shift → magnitude → reasoning
+- [E#] evidence item → direction of shift → magnitude → reasoning
 - **Updated estimate after inside view: [central value] (90% CI: [low] – [high])**
 
 ---
@@ -128,6 +124,7 @@ Before finalising, stress-test your current distribution by seeking the stronges
 - Are there important considerations the research material does NOT cover that could meaningfully change the picture?
 - Weigh these challenges honestly. Adjust your distribution if warranted.
 - Consider the duration till resolution.
+- If your reasoning here identifies genuinely distinct futures (e.g. "report published on time" vs "publication delayed"), name them — they become the scenarios of your final output.
 
 Output format:
 - Best case for a higher outcome
@@ -153,7 +150,7 @@ Output format:
 - Any final adjustment
 - **Final estimate: [central value] (90% CI: [low] – [high])**
 
-## Note: 
+## Note:
 The range should represent uncertainty about the final resolved value, not just uncertainty about the current estimate.
 It should widen when the event is less predictable, the resolution date is farther away, the evidence is weaker or conflicting, or the resolution method itself is noisy.
 It should narrow when the outcome is already strongly constrained by reliable evidence, the resolution date is near, and similar past forecasts/errors show low volatility.
@@ -162,27 +159,27 @@ It should narrow when the outcome is already strongly constrained by reliable ev
 
 ## FINAL OUTPUT
 
-Summarise your forecast in this structure:
+Return your forecast as JSON. It must be the very last thing you write:
 
 {{
-  "reasoning": "<one-paragraph summary of phases 1–4, including the estimate trajectory and the biggest uncertainty>",
-  "distribution": {{
-    "type": "<distribution_type>",
-    "params": {{ ... }}
+  "reasoning": "<one-paragraph summary of phases 1-4, including the estimate trajectory, the key evidence IDs, and the biggest uncertainty>",
+  "forecast": {{
+    "scenarios": [
+      {{
+        "name": "<short scenario label>",
+        "weight": 0.7,
+        "percentiles": {{"p5": <number>, "p25": <number>, "p50": <number>, "p75": <number>, "p95": <number>}}
+      }}
+    ]
   }}
 }}
 
-Choose the distribution type that best captures the shape of your reasoning:
-- "pmf": {{"values": [number, ...], "probabilities": [float, ...]}} for discrete or integer-count questions. Probabilities must be nonnegative and sum to 1 after normalization. Use the open-ended upper-tail value when the question has one.
-- "normal": {{"mean": float, "std": float}}
-- "mixture_normal": {{"weights": [float, ...], "means": [float, ...], "stds": [float, ...]}}
-- "skew_normal": {{"location": float, "scale": float, "alpha": float}}
-- "student_t": {{"df": float, "location": float, "scale": float}}
-- "beta": {{"a": float, "b": float, "lower": float, "upper": float}}
-- "log_normal": {{"mu": float, "sigma": float}}
-- "uniform": {{"lower": float, "upper": float}}
-
-Weights in mixture_normal must sum to 1.
+Rules for the forecast:
+- Express your final distribution as 1 to 3 weighted scenarios. Use one scenario when your reasoning points to a single regime. Use two or three when Phase 3/4 identified genuinely distinct futures; give each its own percentiles and a weight reflecting how likely that future is. Weights must sum to 1.
+- Each scenario's percentiles are your believed values of the FINAL RESOLVED quantity under that scenario, in the answer units stated above. "p5": v means a 5% chance the resolved value is below v in that scenario.
+- Percentile values must be non-decreasing from p5 to p95 within each scenario.
+- The percentiles must reproduce the 90% CI you stated in Phase 4 (blended across scenarios).
+{discrete_pmf_note}
 """
 
 
@@ -287,14 +284,13 @@ def _distribution_location_values(spec: dict) -> list[float]:
     ]
 
 
-def _distribution_uses_millions_against_raw_grid(
-    spec: dict,
+def _values_use_millions_against_raw_grid(
+    value_axis_params: list[float],
     raw_grid: np.ndarray,
     *,
     open_upper_bound: bool,
     open_lower_bound: bool,
 ) -> bool:
-    value_axis_params = _distribution_location_values(spec)
     if not value_axis_params:
         return False
 
@@ -333,8 +329,8 @@ def grid_for_distribution_units(
     open_upper_bound: bool,
     open_lower_bound: bool,
 ) -> tuple[np.ndarray, str]:
-    if _distribution_uses_millions_against_raw_grid(
-        spec,
+    if _values_use_millions_against_raw_grid(
+        _distribution_location_values(spec),
         raw_grid,
         open_upper_bound=open_upper_bound,
         open_lower_bound=open_lower_bound,
@@ -407,51 +403,68 @@ def _coerce_pmf_value(value) -> float:
     return float(text)
 
 
+def nominal_grid(
+    lower_bound: float,
+    upper_bound: float,
+    cdf_size: int,
+    zero_point: float | None,
+) -> np.ndarray:
+    """Nominal x-values for each of the Metaculus CDF slots.
+
+    Metaculus evaluates the CDF at equally spaced *scaled* locations. For
+    linear questions those map to a linear grid, but when ``zero_point`` is
+    set the axis is log-like and the nominal values are spaced by the
+    deriv_ratio formula from the Metaculus CDF docs. Evaluating a
+    distribution on a plain linspace for those questions distorts the
+    submitted CDF.
+    """
+    locations = np.linspace(0.0, 1.0, cdf_size)
+    if zero_point is None:
+        return lower_bound + (upper_bound - lower_bound) * locations
+    deriv_ratio = (upper_bound - zero_point) / (lower_bound - zero_point)
+    return lower_bound + (upper_bound - lower_bound) * (
+        np.power(deriv_ratio, locations) - 1
+    ) / (deriv_ratio - 1)
+
+
 def cdf_triplet(cdf: list[float]) -> tuple[float, float, float]:
     return cdf[0], cdf[len(cdf) // 2], cdf[-1]
 
 
-def print_numeric_cdf_sanity_checks(
-    spec: dict,
+def log_numeric_cdf_sanity_checks(
+    location_values: list[float],
     eval_grid: np.ndarray,
     cdf: list[float],
 ) -> None:
     first, _, last = cdf_triplet(cdf)
     if first > 0.98 and last - first < 0.02:
-        value_axis_params = _distribution_location_values(spec)
         distribution_below_first_x = (
-            bool(value_axis_params)
-            and max(value_axis_params) < float(eval_grid[0])
+            bool(location_values)
+            and max(location_values) < float(eval_grid[0])
         )
         if distribution_below_first_x:
-            print(
-                "sanity check:",
-                "CDF is almost flat near 1.0 because distribution parameters are below the first x-value.",
+            logger.info(
+                "sanity check: CDF is almost flat near 1.0 because distribution values are below the first x-value."
             )
         else:
-            print(
-                "sanity check warning:",
-                "CDF is almost flat near 1.0 across the grid; check numeric units and bounds.",
+            logger.warning(
+                "sanity check warning: CDF is almost flat near 1.0 across the grid; check numeric units and bounds."
             )
 
-    representative_values = _distribution_location_values(spec)
-    if not representative_values:
+    if not location_values:
         return
 
-    representative_value = float(np.median(representative_values))
+    representative_value = float(np.median(location_values))
     if float(eval_grid[0]) <= representative_value <= float(eval_grid[-1]):
         nearest_index = int(np.argmin(np.abs(eval_grid - representative_value)))
-        print(
-            "sanity check cdf near representative distribution value:",
-            {
-                "x": float(eval_grid[nearest_index]),
-                "cdf": cdf[nearest_index],
-            },
+        logger.info(
+            "sanity check cdf near representative value: x=%s cdf=%s",
+            float(eval_grid[nearest_index]),
+            cdf[nearest_index],
         )
         if abs(cdf[nearest_index] - 0.5) > 0.4:
-            print(
-                "sanity check warning:",
-                "CDF near the representative distribution value is far from 0.5; verify distribution shape and units.",
+            logger.warning(
+                "sanity check warning: CDF near the representative value is far from 0.5; verify distribution shape and units."
             )
 
 
@@ -461,9 +474,10 @@ def distribution_guidance_for_question(
     upper_bound: float,
     cdf_size: int,
     open_upper_bound: bool,
-) -> str:
+) -> tuple[str, str]:
+    """Return (header_guidance, final_output_pmf_note) for the prompt."""
     if question_type != "discrete":
-        return ""
+        return "", ""
 
     grid = np.linspace(lower_bound, upper_bound, cdf_size)
     outcome_values = [int(round(value + 0.5)) for value in grid[:-1]]
@@ -477,17 +491,25 @@ def distribution_guidance_for_question(
     if tail_label:
         value_text += f", {tail_label}"
 
-    return (
-        "\nDiscrete/count guidance: this is a discrete question. Prefer a native "
-        '"pmf" distribution over continuous families such as log_normal or normal. '
-        f"Use probability masses over outcome values like: {value_text}. "
-        "The code will convert that PMF to the Metaculus CDF grid."
+    header = (
+        "\nDiscrete/count guidance: this is a discrete question over outcome values "
+        f"like: {value_text}. Prefer a native probability mass function over "
+        "continuous percentiles."
     )
+    pmf_note = (
+        '- Because this is a discrete/count question, you may INSTEAD return '
+        '{"forecast": {"pmf": {"values": [<outcome values>], "probabilities": [<floats>]}}} '
+        f"using outcome values like: {value_text}. Probabilities must be nonnegative and "
+        "will be normalized. Use the open-ended upper-tail value when the question has one. "
+        "Prefer this pmf form for count questions."
+    )
+    return header, pmf_note
 
 
-def print_cdf_summary(label: str, grid: np.ndarray, cdf: list[float]) -> None:
+def log_cdf_summary(label: str, cdf: list[float]) -> None:
     pmf = np.diff(np.array(cdf, dtype=float), prepend=0.0, append=1.0)
-    print(
+    logger.info(
+        "%s %s",
         label,
         {
             "cdf_first_middle_last": cdf_triplet(cdf),
@@ -929,15 +951,273 @@ class NumericDistribution(BaseModel):
         return scaled_location
 
 
-async def get_numeric_gpt_prediction(
-    question_details: dict, num_runs: int,
-) -> tuple[list[float], str, str, list[str]]:
+# ---------------------------------------------------------------------------
+# Scenario / percentile elicitation
+# ---------------------------------------------------------------------------
 
+_PERCENTILE_KEY_PATTERN = re.compile(r"^p?\s*(\d+(?:\.\d+)?)\s*%?$", re.IGNORECASE)
+
+
+def _parse_percentile_key(key) -> float:
+    """Map 'p5', 'p50', '95', '2.5', 0.05 etc. to a fraction in (0, 1)."""
+    if isinstance(key, (int, float)):
+        number = float(key)
+    else:
+        match = _PERCENTILE_KEY_PATTERN.match(str(key).strip())
+        if not match:
+            raise ValueError(f"Unrecognized percentile key: {key!r}")
+        number = float(match.group(1))
+    if 0 < number < 1:
+        return number
+    if 1 <= number < 100:
+        return number / 100
+    raise ValueError(f"Percentile key out of range (0, 100): {key!r}")
+
+
+def _sanitize_declared_percentiles(
+    percentiles: dict,
+    zero_point: float | None,
+    value_scale: float = 1.0,
+) -> list[Percentile]:
+    parsed: list[tuple[float, float]] = []
+    for key, value in percentiles.items():
+        fraction = _parse_percentile_key(key)
+        parsed.append((fraction, float(value) * value_scale))
+    if len(parsed) < 2:
+        raise ValueError(f"Need at least 2 percentiles, got: {percentiles}")
+    parsed.sort(key=lambda pair: pair[0])
+
+    fractions = [pair[0] for pair in parsed]
+    values = [pair[1] for pair in parsed]
+    if any(values[i] > values[i + 1] for i in range(len(values) - 1)):
+        raise ValueError(f"Percentile values must be non-decreasing, got: {percentiles}")
+
+    # Nudge ties so interpolation never divides by zero.
+    value_span = max(abs(values[-1] - values[0]), abs(values[-1]), 1.0)
+    epsilon = value_span * 1e-9
+    for i in range(1, len(values)):
+        if values[i] <= values[i - 1]:
+            values[i] = values[i - 1] + epsilon
+
+    if zero_point is not None:
+        floor = zero_point + max(abs(zero_point), 1.0) * 1e-9
+        values = [max(value, floor) for value in values]
+        for i in range(1, len(values)):
+            if values[i] <= values[i - 1]:
+                values[i] = values[i - 1] + epsilon
+
+    return [
+        Percentile(percentile=fraction, value=value)
+        for fraction, value in zip(fractions, values)
+    ]
+
+
+def percentiles_to_cdf(
+    percentiles: dict,
+    *,
+    lower_bound: float,
+    upper_bound: float,
+    zero_point: float | None,
+    open_lower_bound: bool,
+    open_upper_bound: bool,
+    cdf_size: int,
+    value_scale: float = 1.0,
+) -> np.ndarray:
+    """Evaluate declared percentiles as a raw (unstandardized) CDF on the grid."""
+    declared = _sanitize_declared_percentiles(percentiles, zero_point, value_scale)
+    distribution = NumericDistribution(
+        declared_percentiles=declared,
+        open_upper_bound=open_upper_bound,
+        open_lower_bound=open_lower_bound,
+        upper_bound=upper_bound,
+        lower_bound=lower_bound,
+        zero_point=zero_point,
+        cdf_size=cdf_size,
+        standardize_cdf=False,
+        strict_validation=False,
+    )
+    cdf_points = distribution.get_cdf()
+    return np.clip(
+        np.maximum.accumulate(np.array([point.percentile for point in cdf_points])),
+        0.0,
+        1.0,
+    )
+
+
+def parse_scenarios(forecast: dict) -> list[dict]:
+    scenarios = forecast.get("scenarios")
+    if isinstance(forecast.get("percentiles"), dict) and not scenarios:
+        scenarios = [{"name": "single", "weight": 1.0, "percentiles": forecast["percentiles"]}]
+    if not isinstance(scenarios, list) or not scenarios:
+        raise ValueError(f"forecast must contain a nonempty 'scenarios' list, got keys: {list(forecast.keys())}")
+    if len(scenarios) > 5:
+        raise ValueError(f"too many scenarios: {len(scenarios)}")
+
+    cleaned = []
+    for scenario in scenarios:
+        if not isinstance(scenario, dict) or not isinstance(scenario.get("percentiles"), dict):
+            raise ValueError(f"each scenario needs a 'percentiles' dict, got: {scenario}")
+        weight = float(scenario.get("weight", 1.0))
+        if not np.isfinite(weight) or weight < 0:
+            raise ValueError(f"scenario weight must be a nonnegative number, got: {scenario.get('weight')}")
+        cleaned.append(
+            {
+                "name": str(scenario.get("name", "")).strip() or "scenario",
+                "weight": weight,
+                "percentiles": scenario["percentiles"],
+            }
+        )
+    total_weight = sum(scenario["weight"] for scenario in cleaned)
+    if total_weight <= 0:
+        raise ValueError("scenario weights must sum to a positive number")
+    for scenario in cleaned:
+        scenario["weight"] /= total_weight
+    return cleaned
+
+
+def scenarios_to_cdf(
+    scenarios: list[dict],
+    *,
+    lower_bound: float,
+    upper_bound: float,
+    zero_point: float | None,
+    open_lower_bound: bool,
+    open_upper_bound: bool,
+    cdf_size: int,
+    grid: np.ndarray,
+) -> tuple[np.ndarray, str]:
+    """Mix per-scenario percentile CDFs into one raw CDF on the grid."""
+    all_values = [
+        float(value)
+        for scenario in scenarios
+        for value in scenario["percentiles"].values()
+        if isinstance(value, (int, float)) and np.isfinite(float(value))
+    ]
+    value_scale = 1.0
+    unit_note = "Scenario percentile values appear to use the same units as the Metaculus grid."
+    if zero_point is None and _values_use_millions_against_raw_grid(
+        all_values,
+        grid,
+        open_upper_bound=open_upper_bound,
+        open_lower_bound=open_lower_bound,
+    ):
+        value_scale = 1_000_000.0
+        unit_note = (
+            "Metaculus grid appears to be raw units; scenario percentile values appear "
+            "to be in millions. Scaling values by 1,000,000."
+        )
+
+    mixed = np.zeros(cdf_size)
+    for scenario in scenarios:
+        mixed += scenario["weight"] * percentiles_to_cdf(
+            scenario["percentiles"],
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+            zero_point=zero_point,
+            open_lower_bound=open_lower_bound,
+            open_upper_bound=open_upper_bound,
+            cdf_size=cdf_size,
+            value_scale=value_scale,
+        )
+    return np.clip(np.maximum.accumulate(mixed), 0.0, 1.0), unit_note
+
+
+def parse_numeric_response(response: str) -> tuple[dict, str]:
+    """Parse the model's final JSON into ({'kind': ..., ...}, reasoning).
+
+    Supported forms:
+    - {"forecast": {"scenarios": [...]}} (preferred)
+    - {"forecast": {"percentiles": {...}}} (single implicit scenario)
+    - {"forecast": {"pmf": {"values": [...], "probabilities": [...]}}} (discrete)
+    - {"distribution": {"type": ..., "params": ...}} (legacy parametric fallback)
+    """
+    try:
+        parsed = json.loads(response)
+    except json.JSONDecodeError:
+        candidates = re.findall(r"\{.*\}", response, re.DOTALL)
+        if not candidates:
+            raise ValueError(f"Could not extract JSON from LLM response: {response[:300]}")
+        parsed = json.loads(candidates[-1])
+
+    reasoning = str(parsed.get("reasoning", ""))
+    forecast = parsed.get("forecast")
+    if isinstance(forecast, dict):
+        pmf = forecast.get("pmf")
+        if isinstance(pmf, dict):
+            return {"kind": "pmf", "pmf": pmf}, reasoning
+        if forecast.get("values") is not None and forecast.get("probabilities") is not None:
+            return {"kind": "pmf", "pmf": forecast}, reasoning
+        return {"kind": "scenarios", "scenarios": parse_scenarios(forecast)}, reasoning
+
+    spec = parsed.get("distribution")
+    if isinstance(spec, dict):
+        return {"kind": "spec", "spec": spec}, reasoning
+
+    raise ValueError(
+        f"LLM response missing 'forecast' or 'distribution'. Keys present: {list(parsed.keys())}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Aggregation across runs
+# ---------------------------------------------------------------------------
+
+def _strictly_increasing(values: np.ndarray, epsilon: float = 1e-12) -> np.ndarray:
+    ramp = np.arange(len(values)) * epsilon
+    return values + ramp
+
+
+def quantile_average_cdfs(cdfs: list[np.ndarray]) -> np.ndarray:
+    """Average run CDFs in quantile space (horizontal averaging).
+
+    Averaging quantiles preserves each run's spread instead of flattening the
+    consensus the way PMF averaging does when runs disagree on location.
+    Operates in grid-index space, which equals Metaculus's scaled-location
+    space for both linear and log-scaled questions.
+    """
+    if len(cdfs) == 1:
+        return cdfs[0]
+
+    size = len(cdfs[0])
+    xs = np.arange(size, dtype=float)
+    levels = np.linspace(0.0, 1.0, 4 * size + 1)[1:-1]
+
+    average_positions = np.zeros_like(levels)
+    for cdf in cdfs:
+        clean = np.maximum.accumulate(np.clip(np.asarray(cdf, dtype=float), 0.0, 1.0))
+        clean = _strictly_increasing(clean)
+        average_positions += np.interp(levels, clean, xs, left=0.0, right=size - 1.0)
+    average_positions /= len(cdfs)
+
+    average_positions = np.maximum.accumulate(average_positions)
+    out = np.interp(
+        xs,
+        _strictly_increasing(average_positions),
+        levels,
+        left=0.0,
+        right=1.0,
+    )
+    return np.clip(np.maximum.accumulate(out), 0.0, 1.0)
+
+
+def aggregate_run_cdfs(cdfs: list[np.ndarray], question_type: str) -> np.ndarray:
+    """Discrete questions average PMFs (natural for point masses); continuous
+    questions average quantiles to preserve per-run spread."""
+    arrays = [np.asarray(cdf, dtype=float) for cdf in cdfs]
+    if question_type == "discrete":
+        all_pmfs = np.diff(np.stack(arrays), prepend=0.0, axis=1)
+        mean_pmf = np.mean(all_pmfs, axis=0)
+        return np.clip(np.cumsum(mean_pmf), 0.0, 1.0)
+    return quantile_average_cdfs(arrays)
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def build_numeric_prompt(question_details: dict, summary_report: str) -> tuple[str, dict]:
+    """Return (prompt, question_geometry) for a numeric/discrete question."""
     today = datetime.datetime.now().strftime("%Y-%m-%d")
-    title = question_details["title"]
-    resolution_criteria = question_details["resolution_criteria"]
-    background = question_details["description"]
-    fine_print = question_details["fine_print"]
     question_type = question_details["type"]
     scaling = question_details["scaling"]
     open_upper_bound = question_details.get("open_upper_bound", scaling.get("open_upper_bound", False))
@@ -945,6 +1225,7 @@ async def get_numeric_gpt_prediction(
     unit_of_measure = question_details.get("unit") or "Not stated (please infer this)"
     upper_bound = scaling["range_max"]
     lower_bound = scaling["range_min"]
+    zero_point = scaling.get("zero_point")
     if question_type == "discrete":
         outcome_count = scaling.get("inbound_outcome_count") or int(upper_bound - lower_bound)
         cdf_size = outcome_count + 1
@@ -960,8 +1241,7 @@ async def get_numeric_gpt_prediction(
     else:
         lower_bound_message = f"The outcome can not be lower than {lower_bound}."
 
-    grid = np.linspace(lower_bound, upper_bound, cdf_size)
-    distribution_guidance = distribution_guidance_for_question(
+    guidance_header, pmf_note = distribution_guidance_for_question(
         question_type=question_type,
         lower_bound=lower_bound,
         upper_bound=upper_bound,
@@ -969,103 +1249,175 @@ async def get_numeric_gpt_prediction(
         open_upper_bound=open_upper_bound,
     )
 
-    summary_report = await run_research(title, resolution_criteria, background, fine_print)
-
-    reasoning_prompt = NUMERIC_PROMPT_TEMPLATE.format(
-        title=title,
+    prompt = NUMERIC_PROMPT_TEMPLATE.format(
+        title=question_details["title"],
         today=today,
-        background=background,
-        resolution_criteria=resolution_criteria,
-        fine_print=fine_print,
+        background=question_details["description"],
+        resolution_criteria=question_details["resolution_criteria"],
+        fine_print=question_details["fine_print"],
         summary_report=summary_report,
         lower_bound_message=lower_bound_message,
         upper_bound_message=upper_bound_message,
-        distribution_guidance=distribution_guidance,
+        distribution_guidance=guidance_header,
+        discrete_pmf_note=pmf_note,
         units=unit_of_measure,
     )
-    log_prediction_prompt(question_type, title, reasoning_prompt)
+    geometry = {
+        "question_type": question_type,
+        "lower_bound": lower_bound,
+        "upper_bound": upper_bound,
+        "zero_point": zero_point,
+        "open_lower_bound": open_lower_bound,
+        "open_upper_bound": open_upper_bound,
+        "cdf_size": cdf_size,
+    }
+    return prompt, geometry
 
-    async def ask_llm_to_get_cdf() -> tuple[list[float], str, str]:
-        response, transcript = await call_llm(
-            reasoning_prompt,
-            use_tools=True,
-            _label="numeric-forecast",
-            return_transcript=True,
-        )
 
-        try:
-            parsed = json.loads(response)
-        except json.JSONDecodeError:
-            match = re.search(r'\{.*\}', response, re.DOTALL)
-            if not match:
-                raise ValueError(f"Could not extract JSON from LLM response: {response[:300]}")
-            parsed = json.loads(match.group())
+def numeric_response_to_raw_cdf(
+    response: str,
+    geometry: dict,
+    grid: np.ndarray,
+) -> tuple[np.ndarray, dict, str, str]:
+    """Convert one run's response into a raw CDF on the grid.
 
-        spec = parsed.get("distribution")
-        if spec is None:
-            raise ValueError(f"LLM response missing 'distribution' key. Keys present: {list(parsed.keys())}")
-        reasoning_text = parsed.get("reasoning", "")
-        if question_type == "discrete" and spec.get("type") != "pmf":
-            print(
-                "sanity check warning:",
-                "Discrete question used a continuous distribution family. Prefer type='pmf' for count questions.",
-            )
+    Returns (raw_cdf, parsed_forecast, reasoning, unit_note).
+    """
+    parsed, reasoning = parse_numeric_response(response)
+    question_type = geometry["question_type"]
+    open_upper_bound = geometry["open_upper_bound"]
+    open_lower_bound = geometry["open_lower_bound"]
 
-        eval_grid, unit_conversion_note = grid_for_distribution_units(
-            spec,
-            grid,
-            open_upper_bound=open_upper_bound,
+    if parsed["kind"] == "scenarios":
+        raw_cdf, unit_note = scenarios_to_cdf(
+            parsed["scenarios"],
+            lower_bound=geometry["lower_bound"],
+            upper_bound=geometry["upper_bound"],
+            zero_point=geometry["zero_point"],
             open_lower_bound=open_lower_bound,
-        )
-        raw_cdf = spec_to_cdf(spec, eval_grid)
-        print("question title:", title)
-        print("bounds/raw x first/last:", float(grid[0]), float(grid[-1]))
-        print("cdf eval x first/last:", float(eval_grid[0]), float(eval_grid[-1]))
-        print("unit conversion:", unit_conversion_note)
-        print("distribution params:", json.dumps(spec))
-        print("raw cdf first/middle/last:", cdf_triplet(raw_cdf))
-        print_cdf_summary("raw distribution summary:", grid, raw_cdf)
-        print_numeric_cdf_sanity_checks(spec, eval_grid, raw_cdf)
-        cdf = raw_cdf
-        dummy = NumericDistribution(
-            declared_percentiles=[
-                Percentile(percentile=0.01, value=lower_bound + 0.001 * (upper_bound - lower_bound)),
-                Percentile(percentile=0.99, value=lower_bound + 0.999 * (upper_bound - lower_bound)),
-            ],
             open_upper_bound=open_upper_bound,
-            open_lower_bound=open_lower_bound,
-            upper_bound=upper_bound,
-            lower_bound=lower_bound,
-            zero_point=None,
-            cdf_size=None,
-            standardize_cdf=False,
-            strict_validation=False,
+            cdf_size=geometry["cdf_size"],
+            grid=grid,
         )
-        cdf = dummy._standardize_cdf(cdf)
-        print("standardized cdf first/middle/last:", cdf_triplet(cdf))
-        print_cdf_summary("standardized distribution summary:", grid, cdf)
-        print_numeric_cdf_sanity_checks(spec, eval_grid, cdf)
-        comment = (
-            f"Distribution spec: {json.dumps(spec)}\n"
-            f"Unit conversion: {unit_conversion_note}\n"
-            f"CDF ({cdf_size} points, first 5: {cdf[:5]})\n\n"
-            f"{reasoning_text}"
-        )
-        return cdf, comment, transcript
+        return raw_cdf, parsed, reasoning, unit_note
 
-    cdf_and_comment_pairs = await asyncio.gather(*[ask_llm_to_get_cdf() for _ in range(num_runs)])
-    comments = [pair[1] for pair in cdf_and_comment_pairs]
-    raw_responses = [pair[2] for pair in cdf_and_comment_pairs]
-    final_comment_sections = [f"## Rationale {i+1}\n{comment}" for i, comment in enumerate(comments)]
-    cdfs: list[list[float]] = [pair[0] for pair in cdf_and_comment_pairs]
-    all_cdfs = np.array(cdfs)
-    all_pmfs = np.diff(all_cdfs, prepend=0, axis=1)
-    mean_pmf = np.mean(all_pmfs, axis=0)
-    final_cdf: list[float] = np.cumsum(mean_pmf).tolist()
-    print("question title:", title)
-    print("bounds/raw x first/last:", float(grid[0]), float(grid[-1]))
-    print("distribution params:", f"aggregated from {len(cdfs)} run(s)")
-    print("cdf first/middle/last:", cdf_triplet(final_cdf))
-    print_cdf_summary("aggregated distribution summary:", grid, final_cdf)
-    final_comment = f"Aggregated CDF: `{str(final_cdf)[:100]}...`\n\n" + "\n\n".join(final_comment_sections)
-    return final_cdf, final_comment, reasoning_prompt, raw_responses
+    if parsed["kind"] == "pmf":
+        spec = {"type": "pmf", "params": parsed["pmf"]}
+        raw_cdf = np.asarray(pmf_spec_to_cdf(spec, grid))
+        return raw_cdf, parsed, reasoning, "PMF over outcome values; no unit conversion applied."
+
+    # Legacy parametric spec fallback.
+    spec = parsed["spec"]
+    if question_type == "discrete" and spec.get("type") != "pmf":
+        logger.warning(
+            "sanity check warning: discrete question used a continuous distribution family."
+        )
+    eval_grid, unit_note = grid_for_distribution_units(
+        spec,
+        grid,
+        open_upper_bound=open_upper_bound,
+        open_lower_bound=open_lower_bound,
+    )
+    raw_cdf = np.asarray(spec_to_cdf(spec, eval_grid))
+    return raw_cdf, parsed, reasoning, unit_note
+
+
+async def get_numeric_gpt_prediction(
+    question_details: dict,
+    num_runs: int,
+    summary_report: str,
+) -> ForecastResult:
+    title = question_details["title"]
+    prompt, geometry = build_numeric_prompt(question_details, summary_report)
+    grid = nominal_grid(
+        geometry["lower_bound"],
+        geometry["upper_bound"],
+        geometry["cdf_size"],
+        geometry["zero_point"],
+    )
+
+    runs = await gather_forecast_runs(prompt, num_runs, "numeric-forecast")
+
+    raw_cdfs: list[np.ndarray] = []
+    comments: list[str] = []
+    transcripts: list[str] = []
+    run_values: list[dict] = []
+    for response, transcript in runs:
+        raw_cdf, parsed, reasoning, unit_note = numeric_response_to_raw_cdf(
+            response, geometry, grid
+        )
+        logger.info("question title: %s", title)
+        logger.info("grid x first/last: %s %s", float(grid[0]), float(grid[-1]))
+        logger.info("unit conversion: %s", unit_note)
+        logger.info("run forecast: %s", json.dumps(parsed, default=str)[:600])
+        log_cdf_summary("raw run distribution summary:", raw_cdf.tolist())
+        location_values = _run_location_values(parsed)
+        log_numeric_cdf_sanity_checks(location_values, grid, raw_cdf.tolist())
+
+        raw_cdfs.append(raw_cdf)
+        transcripts.append(transcript)
+        run_values.append(parsed)
+        comments.append(
+            f"Forecast: {json.dumps(parsed, default=str)[:800]}\n"
+            f"Unit conversion: {unit_note}\n\n"
+            f"{reasoning}"
+        )
+
+    aggregated = aggregate_run_cdfs(raw_cdfs, geometry["question_type"])
+
+    standardizer = NumericDistribution(
+        declared_percentiles=[
+            Percentile(
+                percentile=0.01,
+                value=geometry["lower_bound"]
+                + 0.001 * (geometry["upper_bound"] - geometry["lower_bound"]),
+            ),
+            Percentile(
+                percentile=0.99,
+                value=geometry["lower_bound"]
+                + 0.999 * (geometry["upper_bound"] - geometry["lower_bound"]),
+            ),
+        ],
+        open_upper_bound=geometry["open_upper_bound"],
+        open_lower_bound=geometry["open_lower_bound"],
+        upper_bound=geometry["upper_bound"],
+        lower_bound=geometry["lower_bound"],
+        zero_point=None,
+        cdf_size=None,
+        standardize_cdf=False,
+        strict_validation=False,
+    )
+    final_cdf: list[float] = standardizer._standardize_cdf(aggregated.tolist())
+    logger.info("aggregated from %d run(s)", len(raw_cdfs))
+    log_cdf_summary("final standardized distribution summary:", final_cdf)
+
+    final_comment_sections = [
+        f"## Rationale {i+1}\n{comment}" for i, comment in enumerate(comments)
+    ]
+    final_comment = (
+        f"Aggregated CDF (quantile-averaged across {len(raw_cdfs)} runs): "
+        f"`{str(final_cdf)[:100]}...`\n\n" + "\n\n".join(final_comment_sections)
+    )
+
+    return ForecastResult(
+        forecast=final_cdf,
+        comment=final_comment,
+        prompt=prompt,
+        run_transcripts=transcripts,
+        run_values=run_values,
+        extra={"geometry": geometry},
+    )
+
+
+def _run_location_values(parsed: dict) -> list[float]:
+    if parsed["kind"] == "scenarios":
+        return [
+            float(value)
+            for scenario in parsed["scenarios"]
+            for value in scenario["percentiles"].values()
+            if isinstance(value, (int, float)) and np.isfinite(float(value))
+        ]
+    if parsed["kind"] == "pmf":
+        values, _ = _parse_pmf_params(parsed["pmf"])
+        return values
+    return _distribution_location_values(parsed["spec"])

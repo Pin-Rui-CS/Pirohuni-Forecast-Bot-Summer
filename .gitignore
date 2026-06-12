@@ -28,8 +28,16 @@ test_results/
 docs/
 sounds/
 
+# Bot run logs and scratch question dumps at repo root
+bot_run.log
+*_What_will_*.txt
+
+# Test files (local verification only, not committed)
+tests/
 test_serp_research.py
 test_adapter.py
+test_manifold_market_api.py
+prompt_preview.py
 
 # Claude Code local config
 .claude/

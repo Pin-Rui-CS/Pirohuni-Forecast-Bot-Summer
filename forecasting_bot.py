@@ -17,8 +17,10 @@ from config import (
     SKIP_PREVIOUSLY_FORECASTED_QUESTIONS,
     TOURNAMENT_MAPPING,
 )
+from artifacts import run_log_file_path
 from metaculus_client import get_open_question_ids_from_tournament
 from orchestrator import forecast_questions
+from run_logging import setup_run_logging
 
 
 def positive_int(value: str) -> int:
@@ -148,6 +150,7 @@ def get_tournament_ids(tournament_args: list[str] | None) -> list[int | str]:
 if __name__ == "__main__":
     args = parse_arguments()
     validate_runtime_configuration()
+    setup_run_logging(run_log_file_path())
 
     all_questions: list[tuple[int, int]] = []
 

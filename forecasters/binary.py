@@ -1,26 +1,26 @@
 from __future__ import annotations
 
-import asyncio
 import datetime
+import logging
 import re
 
 import numpy as np
 
-from llm_client import call_llm, run_research, log_prediction_prompt
+from forecasters.base import ForecastResult, gather_forecast_runs
+from llm_client import call_llm
+
+logger = logging.getLogger(__name__)
 
 
 BINARY_PROMPT_TEMPLATE = """
 You are a Superforecaster — a disciplined, calibrated prediction engine trained in the methods described in Philip Tetlock's research on superior forecasting. You will be given a forecasting question and supporting research material. Your job is to produce a well-reasoned probability estimate by working through a structured analytical process.
 
-You must complete every phase below in order. At the end of each phase, state your current probability estimate to the nearest whole percentage point. Show how your estimate shifts (or doesn't) as you move through each phase. Be explicit about the direction and magnitude of every adjustment.
+You must complete every phase below in order. At the end of each phase, state your current probability estimate. Show how your estimate shifts (or doesn't) as you move through each phase. Be explicit about the direction and magnitude of every adjustment.
 
----
-
-## TOOLS
-
-You have access to a `run_python_code` tool that executes Python 3.12 locally. numpy, scipy, pandas, scikit-learn, and statsmodels are available.
-
-**ALWAYS use this tool for any math, statistics, or probability calculation — never do mental arithmetic.** Choose the appropriate statistical model yourself. Write the code, run it, and report the verified numerical result. You MUST use this tool in Phase 1 to compute your base rate.
+Discipline rules that apply to every phase:
+- The research material labels evidence items with IDs like [E1], [E2]. Every probability adjustment you make must cite the specific evidence item(s) that justify it. An adjustment with no citable evidence must be small and explicitly labelled as judgment.
+- Keep arithmetic simple and show it in-line (e.g. "3 of 14 similar cases -> ~21%"). Do not perform calculations you cannot show.
+- If the Required Artifact Status says the key evidence is missing or partial, say so and keep your estimate closer to the base rate with reduced confidence. Do not fill gaps with invented certainty.
 
 ---
 
@@ -54,15 +54,15 @@ Before forecasting, audit the research material. Answer briefly:
 2. Is the research current enough for the question?
 3. Are any important sections incomplete, truncated, contradictory, or duplicated?
 4. Are any sources weak, stale, or likely misinterpreted?
-5. Which facts are strongest and most decision-relevant?
+5. Which evidence items are strongest and most decision-relevant (cite their IDs)?
 6. Which important facts are missing?
 
-If the research material is insufficient, say so explicitly and lower confidence. Do not fill gaps with invented certainty.
+If the research material is insufficient, say so explicitly and lower confidence.
 
 Output:
 - Research quality: High / Medium / Low
 - Main research limitations
-- Most important reliable facts
+- Most important reliable evidence items (by ID)
 - Missing information that could change the forecast
 
 ---
@@ -72,16 +72,13 @@ Output:
 Establish a starting probability using base rates and reference classes.
 
 - Identify the most relevant reference class for this question. What is the general category of event being predicted?
-- Find or reason about the historical base rate. How often do events of this type occur under broadly similar conditions?
-- If multiple reference classes apply, consider each and weigh them to arrive at a blended base rate.
-- **Use the `run_python_code` tool to compute your base rate numerically.** Choose an appropriate statistical model (e.g. beta-binomial, binomial proportion with confidence interval, weighted average of reference classes). Hard-code the reference class counts or rates you have identified, run the calculation, and use the printed result as your starting estimate.
-- State your initial probability estimate based purely on the outside view.
+- State the historical counts or rates you are using as explicit numbers, with their source or evidence ID. Show the simple arithmetic that turns them into a base rate.
+- If multiple reference classes apply, consider each and weigh them to arrive at a blended base rate. Show the weights.
 - Treat prediction market data carefully: Polymarket and Kalshi are real-money market priors weighted by their volume, liquidity, bid/ask spread, and relevance to the question; Manifold is a play-money crowd signal and should be discounted relative to comparable real-money markets.
 
 Output format:
 - Reference class(es) identified
-- Base rate reasoning
-- Python tool call with calculation
+- Base rate data and arithmetic, with citations
 - **Starting estimate: X%**
 
 ---
@@ -91,9 +88,9 @@ Output format:
 Now examine the provided research material. Identify the specific facts, signals, and context that distinguish this particular case from the base rate.
 
 For each significant piece of evidence:
-1. State the evidence clearly
+1. State the evidence clearly, citing its ID
 2. Assess its diagnostic value - whether it points to YES/NO, size of impact on result, dependent variables, reliability of source
-3. Compare the importance of each evidence item and size of update to the probability 
+3. Compare the importance of each evidence item and size of update to the probability
 4. Consider that events take time and favour a conservative update unless evidence is conclusive
 
 Guard against these biases:
@@ -102,7 +99,7 @@ Guard against these biases:
 - Anchoring too tightly to the base rate OR abandoning it too quickly
 
 Output format:
-- Evidence item → direction of adjustment → magnitude → reasoning
+- [E#] evidence item → direction of adjustment → magnitude → reasoning
 - **Updated estimate after inside view: X%**
 
 ---
@@ -148,7 +145,7 @@ Summarise your forecast in this structure:
 
 **Question:** {title}
 **Final Probability:** X%
-**Key drivers:** [2-3 most influential factors, ranked]
+**Key drivers:** [2-3 most influential evidence items by ID, ranked]
 **Biggest uncertainty:** [the single factor that could most change this forecast]
 **Estimate trajectory:** Starting X% → After inside view X% → After adversarial review X% → Final X%
 
@@ -168,62 +165,53 @@ def extract_probability_from_response_as_percentage_not_decimal(
         raise ValueError(f"Could not extract prediction from response: {forecast_text}")
 
 
-async def get_binary_gpt_prediction(
-    question_details: dict, num_runs: int,
-) -> tuple[float, str, str, list[str]]:
-
+def build_binary_prompt(question_details: dict, summary_report: str) -> str:
     today = datetime.datetime.now().strftime("%Y-%m-%d")
-    title = question_details["title"]
-    resolution_criteria = question_details["resolution_criteria"]
-    background = question_details["description"]
-    fine_print = question_details["fine_print"]
-
-    summary_report = await run_research(title, resolution_criteria, background, fine_print)
-
-    content = BINARY_PROMPT_TEMPLATE.format(
-        title=title,
+    return BINARY_PROMPT_TEMPLATE.format(
+        title=question_details["title"],
         today=today,
-        background=background,
-        resolution_criteria=resolution_criteria,
-        fine_print=fine_print,
+        background=question_details["description"],
+        resolution_criteria=question_details["resolution_criteria"],
+        fine_print=question_details["fine_print"],
         summary_report=summary_report,
     )
-    log_prediction_prompt("binary", title, content)
 
-    async def get_rationale_and_probability(content: str) -> tuple[float, str, str]:
-        rationale, transcript = await call_llm(
-            content,
-            use_tools=True,
-            _label="binary-forecast",
-            return_transcript=True,
-        )
+
+async def get_binary_gpt_prediction(
+    question_details: dict,
+    num_runs: int,
+    summary_report: str,
+) -> ForecastResult:
+    prompt = build_binary_prompt(question_details, summary_report)
+
+    runs = await gather_forecast_runs(prompt, num_runs, "binary-forecast")
+    probabilities: list[float] = []
+    comments: list[str] = []
+    transcripts: list[str] = []
+    for rationale, transcript in runs:
         probability = extract_probability_from_response_as_percentage_not_decimal(rationale)
-        comment = (
-            f"Extracted Probability: {probability}%\n\nGPT's Answer: "
-            f"{rationale}\n\n\n"
+        probabilities.append(probability)
+        comments.append(
+            f"Extracted Probability: {probability}%\n\nGPT's Answer: {rationale}\n\n\n"
         )
-        return probability, comment, transcript
+        transcripts.append(transcript)
 
-    probability_and_comment_pairs = await asyncio.gather(
-        *[get_rationale_and_probability(content) for _ in range(num_runs)]
-    )
-    comments = [pair[1] for pair in probability_and_comment_pairs]
-    raw_responses = [pair[2] for pair in probability_and_comment_pairs]
     final_comment_sections = [
         f"## Rationale {i+1}\n{comment}" for i, comment in enumerate(comments)
     ]
-    probabilities = [pair[0] for pair in probability_and_comment_pairs]
 
     SPREAD_THRESHOLD = 30
     prob_spread = max(probabilities) - min(probabilities)
+    tiebreaker_used = False
 
     if prob_spread >= SPREAD_THRESHOLD:
+        tiebreaker_used = True
         rationale_blocks = "\n\n".join(
             f"Run {i+1} (predicted {probabilities[i]}%):\n{comments[i]}"
             for i in range(len(probabilities))
         )
         tiebreaker_prompt = (
-            f"{content}\n\n"
+            f"{prompt}\n\n"
             "---\n\n"
             "IMPORTANT: Multiple independent forecasting runs produced highly divergent results. "
             f"Their probability estimates ranged from {min(probabilities):.0f}% to {max(probabilities):.0f}% "
@@ -235,11 +223,16 @@ async def get_binary_gpt_prediction(
             "Based on all of the above reasoning, give your final synthesized answer as: "
             '"Probability: ZZ%", 0-100'
         )
-        print(
-            f"[TIEBREAKER] High variance detected for binary question (spread: {prob_spread:.0f}pp, "
-            f"values: {probabilities}). Sending tiebreaker prompt to LLM."
+        logger.info(
+            "[TIEBREAKER] High variance for binary question (spread: %.0fpp, values: %s).",
+            prob_spread,
+            probabilities,
         )
-        final_rationale = await call_llm(tiebreaker_prompt, _label="binary-tiebreaker")
+        final_rationale = await call_llm(
+            tiebreaker_prompt,
+            _label="binary-tiebreaker",
+            cache_static_prefix=True,
+        )
         final_probability = extract_probability_from_response_as_percentage_not_decimal(
             final_rationale
         )
@@ -256,4 +249,11 @@ async def get_binary_gpt_prediction(
             final_comment_sections
         )
 
-    return median_probability, final_comment, content, raw_responses
+    return ForecastResult(
+        forecast=median_probability,
+        comment=final_comment,
+        prompt=prompt,
+        run_transcripts=transcripts,
+        run_values=[p / 100 for p in probabilities],
+        extra={"tiebreaker_used": tiebreaker_used, "spread_pp": prob_spread},
+    )

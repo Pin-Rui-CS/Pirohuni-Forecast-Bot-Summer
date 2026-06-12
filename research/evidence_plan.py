@@ -4,6 +4,7 @@ import json
 
 from llm_client import call_llm
 from monetary_cost_manager import HardLimitExceededError
+from utils import _truncate_text
 
 
 DEFAULT_EVIDENCE_PLAN_MODEL = "anthropic/claude-sonnet-4.6"
@@ -196,8 +197,3 @@ def _format_bullets(value) -> list[str]:
     return bullets or ["- None stated."]
 
 
-def _truncate_text(text: str, max_chars: int) -> str:
-    text = str(text or "").strip()
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars].rstrip() + "\n\n[Truncated for evidence planning.]"

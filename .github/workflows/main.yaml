@@ -91,7 +91,7 @@ jobs:
             --tournament summer-2026-ai \
             2>&1 | tee bot_run.log
           echo "Clean LLM result files created:"
-          find "docs/LLM results" -type f -name "*.txt" -print 2>/dev/null || true
+          find docs/runs -type f -print 2>/dev/null || true
         env:
           PYTHONUNBUFFERED: "1" # stream Python output in real time
           PYTHONFAULTHANDLER: "1" # print traceback on crashes / segfaults
@@ -127,6 +127,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: main-llm-results-${{ github.run_id }}
-          path: "docs/LLM results/**/*.txt"
+          path: docs/runs/**
           if-no-files-found: warn
           retention-days: 14

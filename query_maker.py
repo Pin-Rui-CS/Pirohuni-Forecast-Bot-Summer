@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from llm_client import call_llm
+from utils import _truncate_text
 
 
 DEFAULT_QUERY_COUNT = 8
@@ -229,12 +230,6 @@ def _format_options(options: list[str] | None) -> str:
     return "\n".join(f"- {option}" for option in options)
 
 
-def _truncate_text(text: str, max_chars: int) -> str:
-    if max_chars < 1:
-        return ""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars].rstrip() + "\n\n[Truncated for query generation.]"
 
 
 def _extract_json_value(text: str) -> Any:

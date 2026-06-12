@@ -10,6 +10,7 @@ from bs4.element import NavigableString, Tag
 
 from Adapters.base import AdapterResult, UrlAdapter
 from llm_client import call_llm
+from utils import _truncate_text
 
 
 USER_AGENT = (
@@ -347,13 +348,6 @@ def _clean_markdown(text: str) -> str:
     return text.strip()
 
 
-def _truncate_text(text: str, max_chars: int) -> str:
-    text = text.strip()
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 100:
-        return text[:max_chars].rstrip()
-    return text[: max_chars - 80].rstrip() + "\n\n[Truncated by Wikipedia adapter.]"
 
 
 # Backwards-compatible helper used by older smoke checks.

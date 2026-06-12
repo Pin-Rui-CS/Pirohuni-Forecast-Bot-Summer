@@ -9,6 +9,7 @@ from openai import AsyncOpenAI
 
 from config import OPENROUTER_API_KEY, llm_rate_limiter
 from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
+from utils import _truncate_text
 
 logger = logging.getLogger(__name__)
 
@@ -118,15 +119,15 @@ async def compile_research_report(
     provider_results: Iterable[ProviderResult] | None = None,
     raw_research: str | None = None,
     model: str = _DEFAULT_MODEL,
+    artifact_check: dict | None = None,
 ) -> str:
     """Compile raw research provider output into a forecast-ready brief.
 
-    The compiler is deliberately conservative: it removes provider boilerplate,
-    groups repeated article bodies while preserving every article citation,
-    highlights copied evidence excerpts at the top, and asks an LLM to organize
-    the cleaned evidence when an OpenRouter key is available. If compilation
-    fails, it returns a deterministic cleaned brief rather than blocking the
-    forecast.
+    The compiler is selective: it distills the raw provider output into a
+    ranked evidence table of decision-relevant items (each with exact values,
+    dates, source, and URL), collapses syndicated duplicates into one item,
+    and drops background color. If the LLM pass fails, it falls back to a
+    deterministic cleaned brief rather than blocking the forecast.
     """
     cleaned_sections = _prepare_sections(provider_results, raw_research)
     if not cleaned_sections:
@@ -136,6 +137,7 @@ async def compile_research_report(
         title=title,
         resolution_criteria=resolution_criteria,
         sections=cleaned_sections,
+        artifact_check=artifact_check,
     )
 
     llm_report = await _try_llm_compile(
@@ -145,6 +147,7 @@ async def compile_research_report(
         fine_print=fine_print,
         cleaned_sections=cleaned_sections,
         model=model,
+        artifact_check=artifact_check,
     )
     return llm_report or heuristic_report
 
@@ -348,6 +351,7 @@ async def _try_llm_compile(
     fine_print: str,
     cleaned_sections: list[ProviderResult],
     model: str,
+    artifact_check: dict | None = None,
 ) -> str | None:
     if not OPENROUTER_API_KEY:
         logger.info("Research compiler skipped LLM pass because OPENROUTER_API_KEY is not set.")
@@ -359,6 +363,7 @@ async def _try_llm_compile(
         background=background,
         fine_print=fine_print,
         cleaned_sections=cleaned_sections,
+        artifact_check=artifact_check,
     )
 
     client = AsyncOpenAI(
@@ -369,11 +374,11 @@ async def _try_llm_compile(
         {
             "role": "system",
             "content": (
-                "You are a research compiler for forecasting prompts. "
-                "You organize evidence without summarizing, paraphrasing, or forecasting. "
-                "Preserve article wording, citations, market odds, and source URLs. "
-                "When articles repeat the same content, show the shared content once "
-                "and list every article/source that shares it."
+                "You are a research compiler for a forecasting bot. You distill raw "
+                "research into a short, ranked evidence table. You select only "
+                "decision-relevant items, keep exact values, dates, source names, "
+                "and URLs, collapse syndicated duplicates into one item, and never "
+                "estimate probabilities or invent facts."
             ),
         },
         {"role": "user", "content": prompt},
@@ -405,12 +410,23 @@ async def _try_llm_compile(
         return None
 
 
+def _format_artifact_check(artifact_check: dict | None) -> str:
+    if not artifact_check:
+        return "No automated artifact check was run."
+    return (
+        f"Status: {artifact_check.get('status', 'unknown')}\n"
+        f"What was found: {artifact_check.get('what_was_found') or 'Not stated.'}\n"
+        f"What is missing: {artifact_check.get('what_is_missing') or 'Nothing noted.'}"
+    )
+
+
 def _build_compiler_prompt(
     title: str,
     resolution_criteria: str,
     background: str,
     fine_print: str,
     cleaned_sections: list[ProviderResult],
+    artifact_check: dict | None = None,
 ) -> str:
     research_text = _format_sections(cleaned_sections)
     research_text = _truncate_text(research_text, _MAX_COMPILER_INPUT_CHARS)
@@ -428,72 +444,47 @@ Background:
 Fine print:
 {fine_print or "Not provided."}
 
+Automated check of whether the required evidence artifact was found:
+{_format_artifact_check(artifact_check)}
+
 Raw research provider outputs, already partially cleaned:
 {research_text}
 
 Task:
-Reorganize the raw research into a compact, readable evidence packet for a forecaster.
-
-Important constraints:
-- Do not summarize, paraphrase, or rewrite article content unless absolutely necessary for removing boilerplate.
-- Keep article wording as close to the provided text as possible.
-- You may remove repeated article bodies, but you must not remove the article citations.
-- When multiple articles share the same or substantially similar content, show the shared content once and explicitly list every article/source/URL that shares it.
-- The "Key Facts And Evidence" section should use copied evidence excerpts or minimally edited source wording, not new analytical summaries.
+Distill the raw research into a compact evidence brief for a forecaster. Select
+only what could plausibly change the forecast. Drop filler, vivid color, and
+broad commentary that does not bear on the resolution criteria.
 
 Output exactly these Markdown sections:
 
 # Compiled Research Brief
 
-## Key Facts And Evidence
-- 6 to 10 bullets with the most decision-relevant copied excerpts at the top.
-- Each bullet must include dates, counts, odds, source names, or URLs when present.
-- Prefer facts that directly bear on the resolution criteria.
+## Required Artifact Status
+- Name the artifact the Evidence Plan says is most important.
+- State plainly: found completely / found partially / not found, and exactly which values or rows are present or missing.
+- If it is a table or time series and any rows were extracted, reproduce those rows here verbatim. This is the single most important section.
 
-## Required Evidence Artifact
-- State the artifact the Evidence Plan says is most important.
-- State whether the raw research appears to have found it completely, partially, or not at all.
-- If it is a table/list/time series, preserve rows or fields that were extracted.
-
-## Direct Evidence
-- Evidence that directly measures, resolves, or is identical to the forecast target.
-- Put exact prediction markets, official records, resolution sources, and primary datasets here.
-
-## Near Proxy Evidence
-- Evidence that is close to the target but not identical.
-- Explain briefly why each item is a proxy rather than direct evidence.
-
-## Weak Proxy Evidence
-- Evidence that is indirectly related and should receive little weight.
-- Adjacent markets, AI capability markets for human-contestant questions, and broad commentary belong here unless the raw source directly matches the resolution criteria.
-
-## Background Color
-- Context useful for understanding the setting but not enough to materially move the forecast by itself.
+## Key Evidence
+A ranked list of at most 15 items, most decision-relevant first. Format each item as:
+[E1] (tier) Claim with exact numbers and dates. — Source name, publish date, URL
+- tier is one of: direct (measures the resolution target itself), near-proxy (close but not identical; say in a few words why not identical), market (prediction-market signal).
+- Keep exact values, dates, counts, and odds. Never round away precision present in the source.
+- When several articles report the same fact (syndicated or near-identical coverage), output ONE item and list every source/URL on that item. Do not repeat the fact.
+- Exclude weak proxies and background color entirely unless fewer than 5 stronger items exist.
+- Do not place the same fact in more than one item.
 
 ## Market Signals
-- Reformat Polymarket, Kalshi, and Manifold signals, including relevance scores, odds, volume, liquidity, open interest, bid/ask spreads when present, and URLs. Treat Polymarket and Kalshi as real-money market signals; treat Manifold as a play-money crowd signal.
-- Put exact/direct markets before proxy markets. If an exact market appears to exist but odds were not extracted, say that plainly.
-- If no useful market signal exists, say so in one bullet.
+- One bullet per relevant market: question, current odds, volume/liquidity/open interest when present, URL. Real-money markets (Polymarket, Kalshi) before play-money (Manifold).
+- If no market bears directly on the question, say so in one bullet and do not pad with adjacent markets.
 
-## Resolution Source Findings
-- Reformat official or resolution-source scrape findings with minimal wording changes.
-- State whether the source currently appears to satisfy, partially satisfy, or not satisfy the criteria.
-- If no resolution source was found, say so in one bullet.
-
-## News And External Evidence
-- Organize article content groups. For each group, show the content once, then list all articles visited for that content.
-- If articles share the same or similar content, explicitly say that they share it.
-- Preserve source name, publish date, language when present, and URL for every article.
-
-## Uncertainties And Gaps
-- List missing facts, stale data, conflicting reports, or watchpoints using minimal wording changes.
-- Highlight contradictions between sources and missing required-artifact rows/fields.
+## Gaps And Cautions
+- At most 6 bullets: missing facts, stale data, conflicting reports, resolution-source access failures, and revision risks.
+- If the required artifact is missing or partial, say what that implies for forecast uncertainty in one bullet.
 
 Rules:
 - Do not make a probability estimate.
-- Do not include raw provider boilerplate.
 - Do not invent facts absent from the raw research.
-- Prefer organization and duplicate-body removal over compression. Do not shorten unique article content just to make the brief elegant.
+- Total output should be materially shorter than the input. Selectivity is the job.
 """.strip()
 
 
@@ -501,6 +492,7 @@ def _build_heuristic_report(
     title: str,
     resolution_criteria: str,
     sections: list[ProviderResult],
+    artifact_check: dict | None = None,
 ) -> str:
     key_evidence = _select_key_evidence(title, resolution_criteria, sections)
     market_sections = [
@@ -526,7 +518,14 @@ def _build_heuristic_report(
         and "resolution" not in provider.lower()
     ]
 
-    lines = ["# Compiled Research Brief", "", "## Key Facts And Evidence"]
+    lines = ["# Compiled Research Brief", ""]
+    if artifact_check:
+        lines += [
+            "## Required Artifact Status",
+            _format_artifact_check(artifact_check),
+            "",
+        ]
+    lines += ["## Key Facts And Evidence"]
     if key_evidence:
         lines.extend(f"- {item}" for item in key_evidence)
     else:
@@ -692,13 +691,6 @@ def _join_compact(parts: list[str], max_chars: int) -> str:
     return _truncate_text("\n\n".join(part.strip() for part in parts if part.strip()), max_chars)
 
 
-def _truncate_text(text: str, max_chars: int) -> str:
-    text = text.strip()
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 100:
-        return text[:max_chars].rstrip()
-    return text[: max_chars - 80].rstrip() + "\n\n[Truncated by research compiler.]"
 
 
 def _normalise_compiled_report(text: str) -> str:

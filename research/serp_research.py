@@ -9,6 +9,7 @@ import httpx
 
 from config import SERPAPI_API_KEY
 from llm_client import call_llm
+from utils import _truncate_text
 from query_maker import (
     DEFAULT_QUERY_COUNT,
     DEFAULT_QUERY_GENERATION_MODEL,
@@ -984,13 +985,6 @@ def _normalise_query(query: str) -> str:
     return " ".join(str(query).strip().split())
 
 
-def _truncate_text(text: str, max_chars: int) -> str:
-    text = str(text or "").strip()
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 100:
-        return text[:max_chars].rstrip()
-    return text[: max_chars - 80].rstrip() + "\n\n[Truncated for SerpAPI research.]"
 
 
 def _validate_serpapi_key() -> None:

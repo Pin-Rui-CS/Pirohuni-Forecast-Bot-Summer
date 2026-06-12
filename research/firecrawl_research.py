@@ -76,6 +76,7 @@ async def run_firecrawl_research(
     ranking_model: str = DEFAULT_SERP_RANKING_MODEL,
     extract_model: str = DEFAULT_EXTRACT_MODEL,
     temperature: float = 0.2,
+    preset_queries: list[str] | None = None,
 ) -> str:
     """Return formatted Firecrawl search research for the forecasting pipeline."""
     result = await build_firecrawl_research_result(
@@ -94,6 +95,7 @@ async def run_firecrawl_research(
         ranking_model=ranking_model,
         extract_model=extract_model,
         temperature=temperature,
+        preset_queries=preset_queries,
     )
     return format_firecrawl_research(result)
 
@@ -114,23 +116,34 @@ async def build_firecrawl_research_result(
     ranking_model: str = DEFAULT_SERP_RANKING_MODEL,
     extract_model: str = DEFAULT_EXTRACT_MODEL,
     temperature: float = 0.2,
+    preset_queries: list[str] | None = None,
 ) -> FirecrawlResearchResult:
-    """Generate Google-style queries, fetch Firecrawl results, rank URLs, and scrape."""
+    """Generate Google-style queries, fetch Firecrawl results, rank URLs, and scrape.
+
+    When ``preset_queries`` is given, query generation is skipped and the
+    provided queries are searched directly (used by the focused artifact
+    retry pass).
+    """
     _validate_firecrawl_key()
     firecrawl_sources = DEFAULT_FIRECRAWL_SEARCH_SOURCES
     firecrawl_tbs = FIRECRAWL_SEARCH_TBS if tbs is None else str(tbs).strip()
-    query_plan = await generate_google_search_query_plan(
-        title=title,
-        resolution_criteria=resolution_criteria,
-        background=background,
-        fine_print=fine_print,
-        asknews_research=asknews_research,
-        options=options,
-        max_queries=max_queries,
-        model=query_model,
-        temperature=temperature,
-    )
-    queries = _queries_with_title(title, query_plan)
+    if preset_queries:
+        queries = [
+            _normalise_query(query) for query in preset_queries if _normalise_query(query)
+        ]
+    else:
+        query_plan = await generate_google_search_query_plan(
+            title=title,
+            resolution_criteria=resolution_criteria,
+            background=background,
+            fine_print=fine_print,
+            asknews_research=asknews_research,
+            options=options,
+            max_queries=max_queries,
+            model=query_model,
+            temperature=temperature,
+        )
+        queries = _queries_with_title(title, query_plan)
     search_results = await fetch_firecrawl_search_results(
         queries=queries,
         total_results_per_query=total_results_per_query,

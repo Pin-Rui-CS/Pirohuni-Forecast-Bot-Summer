@@ -1,29 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-import datetime
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
+import logging
 from collections.abc import Callable
 from typing import Any
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
 
-from config import (
-    ENABLE_ASKNEWS_RESEARCH,
-    ENABLE_FIRECRAWL_RESEARCH,
-    ENABLE_PREDICTION_MARKET_RESEARCH,
-    ENABLE_RESOLUTION_SOURCE_RESEARCH,
-    ENABLE_SERPAPI_RESEARCH,
-    OPENROUTER_API_KEY,
-    llm_rate_limiter,
-)
-from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
+from config import OPENROUTER_API_KEY, llm_rate_limiter
+from monetary_cost_manager import MonetaryCostManager
+from utils import _get_field, _json_default, _truncate_text
 
+logger = logging.getLogger(__name__)
 
 OPENROUTER_MAX_ATTEMPTS = max(1, int(os.getenv("OPENROUTER_MAX_ATTEMPTS", "3")))
 OPENROUTER_RETRY_BASE_SECONDS = float(os.getenv("OPENROUTER_RETRY_BASE_SECONDS", "2.0"))
@@ -31,75 +24,6 @@ OPENROUTER_RETRY_BASE_SECONDS = float(os.getenv("OPENROUTER_RETRY_BASE_SECONDS",
 
 class RetryableLLMResponseError(RuntimeError):
     """Raised when OpenRouter returns an empty or malformed completion."""
-
-
-def log_prediction_prompt(question_type: str, title: str, prompt: str) -> None:
-    print(
-        "########################\n"
-        f"Formatted {question_type} prediction prompt for: {title}\n"
-        f"{prompt}\n"
-        "########################"
-    )
-
-
-_RUN_TIMESTAMP = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-LLM_RESULTS_DIR = os.path.join(os.path.dirname(__file__), "docs", "LLM results", _RUN_TIMESTAMP)
-
-
-def save_llm_result(
-    question_id: int,
-    post_id: int,
-    title: str,
-    question_type: str,
-    prompt: str,
-    per_run_responses: list[str],
-    final_forecast,
-    forecast_payload: dict,
-    usage_yaml_table: str | None = None,
-) -> None:
-    os.makedirs(LLM_RESULTS_DIR, exist_ok=True)
-    safe_title = re.sub(r'[^\w\s-]', '', title)[:60].strip().replace(' ', '_')
-    filename = f"{question_id}_{safe_title}.txt"
-    filepath = os.path.join(LLM_RESULTS_DIR, filename)
-    sep = "=" * 70
-    lines = [
-        sep,
-        f"Question: {title}",
-        f"Post ID: {post_id}  |  Question ID: {question_id}  |  Type: {question_type}",
-        sep,
-        "",
-        "PROMPT (sent to LLM for each run)",
-        sep,
-        prompt,
-        "",
-        sep,
-        f"LLM RESPONSES ({len(per_run_responses)} runs)",
-        sep,
-    ]
-    for i, response in enumerate(per_run_responses, 1):
-        lines += [f"\n--- Run {i} ---", response]
-    lines += [
-        "",
-        sep,
-        "FINAL PREDICTION (sent to Metaculus)",
-        sep,
-        f"Forecast value: {final_forecast}",
-        "",
-        "Forecast payload (continuous_cdf / probability_yes / per_category):",
-        json.dumps(forecast_payload, indent=2),
-        "",
-    ]
-    if usage_yaml_table:
-        lines += [
-            sep,
-            "MONETARY COST MANAGER / OPENROUTER USAGE (character/token estimate)",
-            sep,
-            usage_yaml_table,
-            "",
-        ]
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    print(f"  [LLM result saved] {filepath}")
 
 
 RUN_PYTHON_CODE_TOOL = {
@@ -184,9 +108,12 @@ async def _create_chat_completion_with_retries(
                 problem = _format_openrouter_exception(exc)
                 usage_handle.record_output(problem)
                 last_problem = problem
-                print(
-                    f"[OpenRouter] {label} attempt {attempt}/{OPENROUTER_MAX_ATTEMPTS} "
-                    f"failed: {problem}"
+                logger.warning(
+                    "[OpenRouter] %s attempt %d/%d failed: %s",
+                    label,
+                    attempt,
+                    OPENROUTER_MAX_ATTEMPTS,
+                    problem,
                 )
                 if attempt >= OPENROUTER_MAX_ATTEMPTS or not _is_retryable_openrouter_exception(exc):
                     raise RuntimeError(
@@ -202,14 +129,17 @@ async def _create_chat_completion_with_retries(
         problem = validate_response(response)
         if problem is None:
             if attempt > 1:
-                print(f"[OpenRouter] {label} recovered on attempt {attempt}.")
+                logger.info("[OpenRouter] %s recovered on attempt %d.", label, attempt)
             return response
 
         last_problem = problem
-        print(
-            f"[OpenRouter] {label} attempt {attempt}/{OPENROUTER_MAX_ATTEMPTS} "
-            f"returned unusable response: {problem}\n"
-            f"{_describe_openrouter_response(response)}"
+        logger.warning(
+            "[OpenRouter] %s attempt %d/%d returned unusable response: %s\n%s",
+            label,
+            attempt,
+            OPENROUTER_MAX_ATTEMPTS,
+            problem,
+            _describe_openrouter_response(response),
         )
         if attempt < OPENROUTER_MAX_ATTEMPTS:
             await asyncio.sleep(_retry_delay_seconds(attempt))
@@ -240,7 +170,7 @@ def _format_openrouter_exception(exc: Exception) -> str:
         pieces.append(f"status={status_code}")
     pieces.append(str(exc))
     if response_text:
-        pieces.append(f"body={_truncate_text(response_text, 1000)}")
+        pieces.append(f"body={_truncate_text(response_text, 1000, '... [truncated]')}")
     return " | ".join(pieces)
 
 
@@ -346,23 +276,6 @@ def _describe_openrouter_response(response: Any) -> str:
     return "\n".join(lines)
 
 
-def _get_field(obj: Any, field_name: str) -> Any:
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        return obj.get(field_name)
-    if hasattr(obj, field_name):
-        return getattr(obj, field_name)
-    model_extra = getattr(obj, "model_extra", None)
-    if isinstance(model_extra, dict) and field_name in model_extra:
-        return model_extra[field_name]
-    if hasattr(obj, "model_dump"):
-        dumped = obj.model_dump()
-        if isinstance(dumped, dict):
-            return dumped.get(field_name)
-    return None
-
-
 def _format_value(value: Any) -> str:
     if value is None:
         return "None"
@@ -370,21 +283,25 @@ def _format_value(value: Any) -> str:
         text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=_json_default)
     except (TypeError, ValueError):
         text = str(value)
-    return _truncate_text(text, 1000)
+    return _truncate_text(text, 1000, "... [truncated]")
 
 
-def _json_default(value: Any) -> Any:
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    if hasattr(value, "__dict__"):
-        return value.__dict__
-    return str(value)
-
-
-def _truncate_text(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - 30].rstrip() + "... [truncated]"
+def _user_message(prompt: str, cache_static_prefix: bool) -> dict:
+    """Build the user message, optionally marking the prompt as a cacheable
+    prefix (OpenRouter forwards cache_control to providers that support
+    prompt caching, e.g. Anthropic; others ignore it)."""
+    if not cache_static_prefix:
+        return {"role": "user", "content": prompt}
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+    }
 
 
 async def call_llm(
@@ -394,8 +311,13 @@ async def call_llm(
     use_tools: bool = False,
     _label: str = "forecast",
     return_transcript: bool = False,
+    cache_static_prefix: bool = False,
 ) -> str | tuple[str, str]:
-    """Call the LLM via OpenRouter."""
+    """Call the LLM via OpenRouter.
+
+    The returned transcript intentionally omits the user prompt; callers that
+    save transcripts store the prompt once themselves.
+    """
     client = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
@@ -404,9 +326,6 @@ async def call_llm(
         "# LLM Transcript",
         f"Label: {_label}",
         f"Model: {model}",
-        "",
-        "## User Prompt",
-        prompt,
     ]
 
     def finish(answer: str) -> str | tuple[str, str]:
@@ -414,10 +333,11 @@ async def call_llm(
             return answer
         return answer, "\n\n".join(transcript_parts)
 
+    logger.info("[LLM] %s | model=%s | prompt_chars=%d", _label, model, len(prompt))
+    logger.debug("[LLM] %s prompt:\n%s", _label, prompt)
+
     if not use_tools:
-        print(f"::group::[LLM CALL] {_label} | model={model}")
-        print(f"[PROMPT]\n{prompt}\n[/PROMPT]")
-        messages = [{"role": "user", "content": prompt}]
+        messages = [_user_message(prompt, cache_static_prefix)]
         response = await _create_chat_completion_with_retries(
             client,
             label=_label,
@@ -430,8 +350,7 @@ async def call_llm(
             validate_response=_validate_text_completion_response,
         )
         answer = response.choices[0].message.content
-        print(f"[RESPONSE]\n{answer}\n[/RESPONSE]")
-        print("::endgroup::")
+        logger.debug("[LLM] %s response:\n%s", _label, answer)
         if answer is None:
             raise ValueError("No answer returned from LLM")
         transcript_parts += [
@@ -441,9 +360,7 @@ async def call_llm(
         return finish(answer)
 
     # Agentic tool-use loop (max 10 iterations)
-    print(f"::group::[LLM CALL] {_label} (tool-use) | model={model}")
-    print(f"[PROMPT]\n{prompt}\n[/PROMPT]")
-    messages: list[dict] = [{"role": "user", "content": prompt}]
+    messages: list[dict] = [_user_message(prompt, cache_static_prefix)]
     for iteration in range(10):
         response = await _create_chat_completion_with_retries(
             client,
@@ -464,8 +381,7 @@ async def call_llm(
             answer = choice.message.content
             if answer is None:
                 raise ValueError("No answer returned from LLM")
-            print(f"[RESPONSE]\n{answer}\n[/RESPONSE]")
-            print("::endgroup::")
+            logger.debug("[LLM] %s response:\n%s", _label, answer)
             transcript_parts += [
                 f"## Assistant Turn {iteration + 1}: Final Response",
                 answer,
@@ -505,10 +421,10 @@ async def call_llm(
                 code = args.get("code", "")
                 reasoning = args.get("reasoning", "")
                 if reasoning:
-                    print(f"[tool] run_python_code — {reasoning}")
-                print(f"[tool] executing:\n{code}")
+                    logger.info("[tool] run_python_code — %s", reasoning)
+                logger.debug("[tool] executing:\n%s", code)
                 result = await asyncio.to_thread(execute_python_code, code)
-                print(f"[tool] result:\n{result}")
+                logger.debug("[tool] result:\n%s", result)
                 if reasoning:
                     transcript_parts += [
                         "Reasoning:",
@@ -533,218 +449,4 @@ async def call_llm(
                 "content": result,
             })
 
-    print("::endgroup::")
     raise ValueError("call_llm: reached maximum tool-use iterations (10) without a final response")
-
-
-async def run_research(
-    title: str,
-    resolution_criteria: str = "",
-    background: str = "",
-    fine_print: str = "",
-) -> str:
-    if ENABLE_ASKNEWS_RESEARCH:
-        from research.asknews_research import run_asknews_research
-    if ENABLE_PREDICTION_MARKET_RESEARCH:
-        from research.kalshi_research import scrape_kalshi
-        from research.manifold_research import scrape_manifold
-        from research.polymarket_research import scrape_polymarket
-
-    async def run_provider(name: str, research_call) -> tuple[str, str | None]:
-        try:
-            result = await research_call()
-            if result is None or not str(result).strip():
-                print(f"[research] {name}: no usable result")
-                return name, None
-            print(f"[research] {name}: completed")
-            return name, str(result).strip()
-        except HardLimitExceededError:
-            raise
-        except Exception as exc:
-            print(f"[research] {name}: unavailable ({type(exc).__name__}: {exc})")
-            return name, f"{name} research unavailable: {type(exc).__name__}: {exc}"
-
-    def should_include_provider_result(name: str, content: str | None) -> bool:
-        if not content:
-            return False
-        lowered = content.lower()
-        if "research unavailable" in lowered:
-            return False
-        if name in {"Kalshi", "Manifold", "Polymarket"}:
-            no_result_markers = (
-                "no sufficiently relevant",
-                "no active",
-                "no kalshi markets results",
-                "no manifold markets results",
-                "no polymarket results",
-            )
-            return not any(marker in lowered for marker in no_result_markers)
-        return True
-
-    async def asknews_call() -> str:
-        return await run_asknews_research(
-            title=title,
-            resolution_criteria=resolution_criteria,
-            background=background,
-            fine_print=fine_print,
-        )
-
-    async def resolution_sources_call() -> str:
-        from resolution_criteria_scraper import scrape_resolution_sources
-
-        question_context = title
-        if background.strip():
-            question_context += f"\n\nBackground:\n{background.strip()}"
-        if fine_print.strip():
-            question_context += f"\n\nFine print:\n{fine_print.strip()}"
-        if evidence_plan.strip():
-            question_context += f"\n\nEvidence plan:\n{evidence_plan.strip()}"
-
-        return await scrape_resolution_sources(
-            resolution_criteria=resolution_criteria,
-            question_text=question_context,
-            use_llm_cleaning=True,
-        )
-
-    async def serpapi_call(asknews_research: str = "") -> str:
-        from research.serp_research import run_serp_research
-
-        return await run_serp_research(
-            title=title,
-            resolution_criteria=resolution_criteria,
-            background=background,
-            fine_print=fine_print,
-            asknews_research=asknews_research,
-        )
-
-    async def firecrawl_call(asknews_research: str = "") -> str:
-        from research.firecrawl_research import run_firecrawl_research
-
-        return await run_firecrawl_research(
-            title=title,
-            resolution_criteria=resolution_criteria,
-            background=background,
-            fine_print=fine_print,
-            asknews_research=asknews_research,
-        )
-
-    async def kalshi_call() -> str:
-        return await asyncio.to_thread(scrape_kalshi, market_question)
-
-    async def manifold_call() -> str:
-        return await asyncio.to_thread(scrape_manifold, market_question)
-
-    async def polymarket_call() -> str:
-        return await asyncio.to_thread(scrape_polymarket, market_question)
-
-    asknews_task = (
-        asyncio.create_task(run_provider("AskNews", asknews_call))
-        if ENABLE_ASKNEWS_RESEARCH
-        else None
-    )
-
-    if asknews_task is not None:
-        asknews_result = await asknews_task
-    else:
-        asknews_result = ("AskNews", None)
-
-    asknews_name, asknews_content = asknews_result
-    usable_asknews_research = (
-        asknews_content
-        if should_include_provider_result(asknews_name, asknews_content)
-        else ""
-    )
-
-    from research.evidence_plan import build_evidence_plan
-
-    evidence_plan = await build_evidence_plan(
-        title=title,
-        resolution_criteria=resolution_criteria,
-        background=background,
-        fine_print=fine_print,
-        asknews_research=usable_asknews_research,
-    )
-    print("[research] Evidence Plan: completed")
-    evidence_plan_result = ("Evidence Plan", evidence_plan)
-    search_asknews_research = _join_research_context(
-        ("AskNews research", usable_asknews_research),
-        ("Evidence plan", evidence_plan),
-    )
-    market_question = _join_research_context(
-        ("Forecasting question", title),
-        ("Evidence plan for direct market search", evidence_plan),
-        max_chars=4_000,
-    )
-
-    other_provider_tasks = []
-    if ENABLE_RESOLUTION_SOURCE_RESEARCH:
-        other_provider_tasks.append(
-            asyncio.create_task(run_provider("Resolution Criteria Sources", resolution_sources_call))
-        )
-    if ENABLE_PREDICTION_MARKET_RESEARCH:
-        other_provider_tasks.append(asyncio.create_task(run_provider("Kalshi", kalshi_call)))
-        other_provider_tasks.append(asyncio.create_task(run_provider("Manifold", manifold_call)))
-        other_provider_tasks.append(asyncio.create_task(run_provider("Polymarket", polymarket_call)))
-
-    search_provider_tasks = []
-    if ENABLE_SERPAPI_RESEARCH:
-        search_provider_tasks.append(
-            asyncio.create_task(
-                run_provider(
-                    "SerpAPI Google",
-                    lambda: serpapi_call(search_asknews_research),
-                )
-            )
-        )
-    if ENABLE_FIRECRAWL_RESEARCH:
-        search_provider_tasks.append(
-            asyncio.create_task(
-                run_provider(
-                    "Firecrawl Search",
-                    lambda: firecrawl_call(search_asknews_research),
-                )
-            )
-        )
-
-    remaining_results = await asyncio.gather(
-        *search_provider_tasks,
-        *other_provider_tasks,
-    )
-    results = [
-        evidence_plan_result,
-        *remaining_results,
-        asknews_result,
-    ]
-
-    sections = []
-    included_results: list[tuple[str, str]] = []
-    for name, content in results:
-        if should_include_provider_result(name, content):
-            cleaned_content = content or ""
-            sections.append(cleaned_content)
-            included_results.append((name, cleaned_content))
-
-    if not sections:
-        return "No external research material found."
-
-    from compiler import compile_research_report
-
-    return await compile_research_report(
-        title=title,
-        resolution_criteria=resolution_criteria,
-        background=background,
-        fine_print=fine_print,
-        provider_results=included_results,
-    )
-
-
-def _join_research_context(*parts: tuple[str, str | None], max_chars: int = 18_000) -> str:
-    chunks = []
-    for label, content in parts:
-        text = str(content or "").strip()
-        if text:
-            chunks.append(f"## {label}\n{text}")
-    joined = "\n\n".join(chunks).strip()
-    if len(joined) <= max_chars:
-        return joined
-    return joined[:max_chars].rstrip() + "\n\n[Truncated for research context.]"

@@ -1,24 +1,23 @@
 from __future__ import annotations
 
-import asyncio
 import datetime
+import logging
 import re
 
-from llm_client import call_llm, run_research, log_prediction_prompt
+from forecasters.base import ForecastResult, gather_forecast_runs
+
+logger = logging.getLogger(__name__)
 
 
 MULTIPLE_CHOICE_PROMPT_TEMPLATE = """
 You are a Superforecaster — a disciplined, calibrated prediction engine trained in the methods described in Philip Tetlock's research on superior forecasting. You will be given a forecasting question with a fixed set of mutually exclusive options and supporting research material. Your job is to assign a well-reasoned probability to each option by working through a structured analytical process.
 
-You must complete every phase below in order. At the end of each phase, state your current probability distribution across all options to the nearest whole percentage point. Show how probabilities shift (or don't) as you move through each phase. Be explicit about the direction and magnitude of every adjustment. Probabilities must always sum to 100%.
+You must complete every phase below in order. At the end of each phase, state your current probability distribution across all options. Show how probabilities shift (or don't) as you move through each phase. Be explicit about the direction and magnitude of every adjustment. Probabilities must always sum to 100%.
 
----
-
-## TOOLS
-
-You have access to a `run_python_code` tool that executes Python 3.12 locally. numpy, scipy, pandas, scikit-learn, and statsmodels are available.
-
-**ALWAYS use this tool for any math, statistics, or probability calculation — never do mental arithmetic.** Choose the appropriate statistical model yourself. Write the code, run it, and report the verified numerical result. You MUST use this tool in Phase 1 to compute your base rate distribution across options.
+Discipline rules that apply to every phase:
+- The research material labels evidence items with IDs like [E1], [E2]. Every probability adjustment must cite the specific evidence item(s) that justify it. An adjustment with no citable evidence must be small and explicitly labelled as judgment.
+- Keep arithmetic simple and show it in-line. State the counts/rates you use explicitly.
+- If the Required Artifact Status says the key evidence is missing or partial, keep your distribution closer to the base rate with reduced confidence. Do not fill gaps with invented certainty.
 
 ---
 
@@ -54,15 +53,15 @@ Before forecasting, audit the research material. Answer briefly:
 2. Is the research current enough for the question?
 3. Are any important sections incomplete, truncated, contradictory, or duplicated?
 4. Are any sources weak, stale, or likely misinterpreted?
-5. Which facts are strongest and most decision-relevant?
+5. Which evidence items are strongest and most decision-relevant (cite their IDs)?
 6. Which important facts are missing?
 
-If the research material is insufficient, say so explicitly and lower confidence. Do not fill gaps with invented certainty.
+If the research material is insufficient, say so explicitly and lower confidence.
 
 Output:
 - Research quality: High / Medium / Low
 - Main research limitations
-- Most important reliable facts
+- Most important reliable evidence items (by ID)
 - Missing information that could change the forecast
 
 ---
@@ -72,15 +71,12 @@ Output:
 Establish a starting distribution using base rates and reference classes.
 
 - Identify the most relevant reference class for this type of question. How are outcomes of this kind typically distributed across similar option sets?
-- Reason about the prior probability each option deserves based purely on historical patterns and structural priors (e.g. incumbency advantage, status quo bias).
+- State the historical frequencies or structural priors you are using as explicit numbers (e.g. incumbency advantage, status quo bias), with their source or evidence ID, and show the simple arithmetic that turns them into a starting distribution.
 - If the options are asymmetric in their prior likelihood, reflect that in your distribution.
-- **Use the `run_python_code` tool to compute your base rate distribution numerically.** Hard-code the reference class frequencies or priors you have identified (e.g. historical win rates, Dirichlet concentration parameters), run the calculation with numpy/scipy, and use the printed result as your starting distribution. Ensure probabilities are normalised to sum to 100%.
-- State your initial distribution based purely on the outside view.
 - Treat prediction market data carefully: Polymarket and Kalshi are real-money market priors weighted by their volume, liquidity, bid/ask spread, and relevance to the question; Manifold is a play-money crowd signal and should be discounted relative to comparable real-money markets.
 
 Output format:
-- Reference class(es) and base rate reasoning
-- Python tool call with calculation
+- Reference class(es), the prior data used, and citations
 - **Starting distribution: Option_A: X%, Option_B: Y%, ... (must sum to 100%)**
 
 ---
@@ -90,9 +86,9 @@ Output format:
 Now examine the provided research material. Identify the specific facts, signals, and context that distinguish this particular case from the base rate distribution.
 
 For each significant piece of evidence:
-1. State the evidence clearly
+1. State the evidence clearly, citing its ID
 2. Assess its diagnostic value - which option(s) it points toward, size of impact on result, dependent variables, and reliability of source
-3. Estimate the relative likelihood of the evidence under each option, shrink/discount the likelihood weights, multiply each prior by its likelihood weight, then renormalize to get posterior option probabilities
+3. Shift probability between options proportionally to the strength of the evidence, and renormalize
 4. Compare the importance of each evidence item and size of update to the probability distribution
 5. Consider that events take time and favour a conservative update unless evidence is conclusive
 
@@ -102,7 +98,7 @@ Guard against these biases:
 - Anchoring too tightly to the base rate OR abandoning it too quickly
 
 Output format:
-- Evidence item → which option(s) it favours → magnitude → reasoning
+- [E#] evidence item → which option(s) it favours → magnitude → reasoning
 - **Updated distribution after inside view: Option_A: X%, Option_B: Y%, ...**
 
 ---
@@ -148,7 +144,7 @@ Summarise your forecast in this structure:
 
 **Question:** {title}
 **Confidence tier:** Very Low | Low | Moderate (based on spread of probabilities and evidence quality)
-**Key drivers:** [2-3 most influential factors, ranked]
+**Key drivers:** [2-3 most influential evidence items by ID, ranked]
 **Biggest uncertainty:** [the single factor that could most change this forecast]
 **Estimate trajectory:** (leading option) Starting X% → After inside view X% → After adversarial review X% → Final X%
 
@@ -214,71 +210,50 @@ def generate_multiple_choice_forecast(options, option_probabilities) -> dict:
     return probability_yes_per_category
 
 
+def build_multiple_choice_prompt(question_details: dict, summary_report: str) -> str:
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    return MULTIPLE_CHOICE_PROMPT_TEMPLATE.format(
+        title=question_details["title"],
+        today=today,
+        background=question_details["description"],
+        resolution_criteria=question_details["resolution_criteria"],
+        fine_print=question_details["fine_print"],
+        summary_report=summary_report,
+        options=question_details["options"],
+    )
+
+
 async def get_multiple_choice_gpt_prediction(
     question_details: dict,
     num_runs: int,
-) -> tuple[dict[str, float], str, str, list[str]]:
-
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    title = question_details["title"]
-    resolution_criteria = question_details["resolution_criteria"]
-    background = question_details["description"]
-    fine_print = question_details["fine_print"]
+    summary_report: str,
+) -> ForecastResult:
     options = question_details["options"]
+    prompt = build_multiple_choice_prompt(question_details, summary_report)
 
-    summary_report = await run_research(title, resolution_criteria, background, fine_print)
+    runs = await gather_forecast_runs(prompt, num_runs, "mc-forecast")
 
-    content = MULTIPLE_CHOICE_PROMPT_TEMPLATE.format(
-        title=title,
-        today=today,
-        background=background,
-        resolution_criteria=resolution_criteria,
-        fine_print=fine_print,
-        summary_report=summary_report,
-        options=options,
-    )
-    log_prediction_prompt("multiple_choice", title, content)
-
-    async def ask_llm_for_multiple_choice_probabilities(
-        content: str,
-    ) -> tuple[dict[str, float], str, str]:
-        rationale, transcript = await call_llm(
-            content,
-            use_tools=True,
-            _label="mc-forecast",
-            return_transcript=True,
-        )
-
-        option_probabilities = extract_option_probabilities_from_response(
-            rationale, options
-        )
-
-        comment = (
-            f"EXTRACTED_PROBABILITIES: {option_probabilities}\n\nGPT's Answer: "
-            f"{rationale}\n\n\n"
-        )
-
+    per_run_dicts: list[dict[str, float]] = []
+    comments: list[str] = []
+    transcripts: list[str] = []
+    for rationale, transcript in runs:
+        option_probabilities = extract_option_probabilities_from_response(rationale, options)
         probability_yes_per_category = generate_multiple_choice_forecast(
             options, option_probabilities
         )
-        return probability_yes_per_category, comment, transcript
+        per_run_dicts.append(probability_yes_per_category)
+        comments.append(
+            f"EXTRACTED_PROBABILITIES: {option_probabilities}\n\nGPT's Answer: "
+            f"{rationale}\n\n\n"
+        )
+        transcripts.append(transcript)
 
-    probability_yes_per_category_and_comment_pairs = await asyncio.gather(
-        *[ask_llm_for_multiple_choice_probabilities(content) for _ in range(num_runs)]
-    )
-    comments = [pair[1] for pair in probability_yes_per_category_and_comment_pairs]
-    raw_responses = [pair[2] for pair in probability_yes_per_category_and_comment_pairs]
     final_comment_sections = [
         f"## Rationale {i+1}\n{comment}" for i, comment in enumerate(comments)
     ]
-    probability_yes_per_category_dicts: list[dict[str, float]] = [
-        pair[0] for pair in probability_yes_per_category_and_comment_pairs
-    ]
     average_probability_yes_per_category: dict[str, float] = {}
     for option in options:
-        probabilities_for_current_option: list[float] = [
-            d[option] for d in probability_yes_per_category_dicts
-        ]
+        probabilities_for_current_option = [d[option] for d in per_run_dicts]
         average_probability_yes_per_category[option] = sum(
             probabilities_for_current_option
         ) / len(probabilities_for_current_option)
@@ -287,4 +262,10 @@ async def get_multiple_choice_gpt_prediction(
         f"Average Probability Yes Per Category: `{average_probability_yes_per_category}`\n\n"
         + "\n\n".join(final_comment_sections)
     )
-    return average_probability_yes_per_category, final_comment, content, raw_responses
+    return ForecastResult(
+        forecast=average_probability_yes_per_category,
+        comment=final_comment,
+        prompt=prompt,
+        run_transcripts=transcripts,
+        run_values=per_run_dicts,
+    )
