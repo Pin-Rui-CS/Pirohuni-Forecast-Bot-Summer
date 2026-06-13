@@ -220,6 +220,7 @@ async def forecast_individual_question(
         {
             "question_details": _question_snapshot(question_details),
             "artifact_check": research_bundle.artifact_check,
+            "degraded_search_providers": research_bundle.degraded_search_providers,
             "run_values": result.run_values,
             "final_forecast": result.forecast,
             "forecast_payload": forecast_payload,

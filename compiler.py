@@ -413,11 +413,17 @@ async def _try_llm_compile(
 def _format_artifact_check(artifact_check: dict | None) -> str:
     if not artifact_check:
         return "No automated artifact check was run."
-    return (
-        f"Status: {artifact_check.get('status', 'unknown')}\n"
-        f"What was found: {artifact_check.get('what_was_found') or 'Not stated.'}\n"
-        f"What is missing: {artifact_check.get('what_is_missing') or 'Nothing noted.'}"
-    )
+    lines = [
+        f"Status: {artifact_check.get('status', 'unknown')}",
+        f"What was found: {artifact_check.get('what_was_found') or 'Not stated.'}",
+        f"What is missing: {artifact_check.get('what_is_missing') or 'Nothing noted.'}",
+    ]
+    forecast_swing = artifact_check.get("forecast_swing")
+    if forecast_swing:
+        lines.append(
+            f"Estimated forecast swing if the missing information were resolved: {forecast_swing}"
+        )
+    return "\n".join(lines)
 
 
 def _build_compiler_prompt(

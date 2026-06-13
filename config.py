@@ -28,15 +28,23 @@ ASKNEWS_API_KEY = os.getenv("ASKNEWS_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 OPENROUTER_COST_HARD_LIMIT_USD = float(os.getenv("OPENROUTER_COST_HARD_LIMIT_USD", "0"))
 
 # Central research provider toggles.
 ENABLE_ASKNEWS_RESEARCH = _env_bool("ENABLE_ASKNEWS_RESEARCH", True)
 ENABLE_RESOLUTION_SOURCE_RESEARCH = _env_bool("ENABLE_RESOLUTION_SOURCE_RESEARCH", True)
-ENABLE_SERPAPI_RESEARCH = _env_bool("ENABLE_SERPAPI_RESEARCH", False)
+# Search providers run as a priority fallback chain (SerpAPI -> Firecrawl ->
+# Tavily): the bot uses the first enabled provider that returns results and
+# skips the rest, so enabling all three conserves credits rather than spending
+# them in parallel.
+ENABLE_SERPAPI_RESEARCH = _env_bool("ENABLE_SERPAPI_RESEARCH", True)
 ENABLE_FIRECRAWL_RESEARCH = _env_bool("ENABLE_FIRECRAWL_RESEARCH", True)
+ENABLE_TAVILY_RESEARCH = _env_bool("ENABLE_TAVILY_RESEARCH", True)
 ENABLE_PREDICTION_MARKET_RESEARCH = _env_bool("ENABLE_PREDICTION_MARKET_RESEARCH", True)
 FIRECRAWL_SEARCH_TBS = os.getenv("FIRECRAWL_SEARCH_TBS", "").strip()
+# Tavily search depth: basic|advanced|fast|ultra-fast (basic = 1 credit/query).
+TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "basic").strip()
 
 # Tournament IDs
 Q4_2024_AI_BENCHMARKING_ID = 32506
