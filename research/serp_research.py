@@ -10,6 +10,7 @@ import httpx
 from config import SERPAPI_API_KEY
 from llm_client import call_llm
 from utils import _truncate_text
+import source_ledger
 from query_maker import (
     DEFAULT_QUERY_COUNT,
     DEFAULT_QUERY_GENERATION_MODEL,
@@ -164,6 +165,13 @@ async def build_serp_research_result(
         queries=queries,
         num_results_per_query=num_results_per_query,
     )
+    for result in organic_results:
+        source_ledger.record_url_event(
+            result.link,
+            source_ledger.ROLE_CANDIDATE,
+            round_label="search",
+            detail=f"query: {result.query}",
+        )
     ranked_url_groups = await rank_serp_urls(
         title=title,
         resolution_criteria=resolution_criteria,
@@ -173,6 +181,7 @@ async def build_serp_research_result(
         max_ranked_urls=max_ranked_urls,
         model=ranking_model,
     )
+    _record_ranked_url_groups(ranked_url_groups)
     cycles = await run_scrape_cycles(
         title=title,
         resolution_criteria=resolution_criteria,
@@ -252,6 +261,18 @@ async def rank_serp_urls(
     parsed = _extract_json_value(response)
     ranked_groups = _parse_ranked_url_groups(parsed)
     return _dedupe_ranked_url_groups(ranked_groups, max_ranked_urls)
+
+
+def _record_ranked_url_groups(groups: list[RankedSerpUrlGroup]) -> None:
+    """Record every URL an LLM selected for scraping, grouped by purpose."""
+    for group in groups:
+        for item in group.urls:
+            source_ledger.record_url_event(
+                item.url,
+                source_ledger.ROLE_RANKED,
+                round_label=group.group,
+                detail=item.purpose,
+            )
 
 
 async def run_scrape_cycles(
@@ -616,6 +637,20 @@ async def _scrape_targets(
             group=group,
             item=item,
         )
+
+        def _finish(scrape: Scrape, engine: str) -> Scrape:
+            source_ledger.record_url_event(
+                scrape.url,
+                source_ledger.ROLE_SCRAPED,
+                engine=engine,
+                ok=scrape.ok,
+                error=scrape.error,
+                chars=len(scrape.content),
+                round_label=f"cycle {cycle_no}",
+                detail=group.group,
+            )
+            return scrape
+
         adapter = None
         try:
             from Adapters import find_adapter
@@ -629,37 +664,46 @@ async def _scrape_targets(
 
             duplicate_payload = claim_scrape_url(item.url)
             if duplicate_payload is not None:
-                return Scrape(
-                    cycle=0,
-                    group=group.group,
-                    group_purpose=group.group_purpose,
-                    url=item.url,
-                    purpose=item.purpose,
-                    ok=False,
-                    error="skipped duplicate: URL has already been scraped in this process",
+                return _finish(
+                    Scrape(
+                        cycle=0,
+                        group=group.group,
+                        group_purpose=group.group_purpose,
+                        url=item.url,
+                        purpose=item.purpose,
+                        ok=False,
+                        error="skipped duplicate: URL has already been scraped in this process",
+                    ),
+                    engine=source_ledger.ENGINE_SKIPPED_DUPLICATE,
                 )
             try:
                 print(f"[adapter] {adapter.name} handling {item.url}")
                 result = await adapter.extract(item.url, query=query)
-                return Scrape(
-                    cycle=0,
-                    group=group.group,
-                    group_purpose=group.group_purpose,
-                    url=item.url,
-                    purpose=item.purpose,
-                    ok=bool(result.content.strip()),
-                    content=_truncate_text(result.content, _MAX_SCRAPE_CHARS),
-                    error="" if result.content.strip() else f"{adapter.name} returned no content.",
+                return _finish(
+                    Scrape(
+                        cycle=0,
+                        group=group.group,
+                        group_purpose=group.group_purpose,
+                        url=item.url,
+                        purpose=item.purpose,
+                        ok=bool(result.content.strip()),
+                        content=_truncate_text(result.content, _MAX_SCRAPE_CHARS),
+                        error="" if result.content.strip() else f"{adapter.name} returned no content.",
+                    ),
+                    engine=f"adapter:{adapter.name}",
                 )
             except Exception as exc:
-                return Scrape(
-                    cycle=0,
-                    group=group.group,
-                    group_purpose=group.group_purpose,
-                    url=item.url,
-                    purpose=item.purpose,
-                    ok=False,
-                    error=f"adapter failed: {type(exc).__name__}: {exc}",
+                return _finish(
+                    Scrape(
+                        cycle=0,
+                        group=group.group,
+                        group_purpose=group.group_purpose,
+                        url=item.url,
+                        purpose=item.purpose,
+                        ok=False,
+                        error=f"adapter failed: {type(exc).__name__}: {exc}",
+                    ),
+                    engine=f"adapter:{adapter.name}",
                 )
 
         try:
@@ -679,34 +723,43 @@ async def _scrape_targets(
             config.content_budget = _MAX_SCRAPE_CHARS
             content = await adaptive_research_crawl(item.url, query, config=config)
             if is_duplicate_scrape_payload(content):
-                return Scrape(
+                return _finish(
+                    Scrape(
+                        cycle=0,
+                        group=group.group,
+                        group_purpose=group.group_purpose,
+                        url=item.url,
+                        purpose=item.purpose,
+                        ok=False,
+                        error="skipped duplicate: URL has already been scraped in this process",
+                    ),
+                    engine=source_ledger.ENGINE_SKIPPED_DUPLICATE,
+                )
+            return _finish(
+                Scrape(
+                    cycle=0,
+                    group=group.group,
+                    group_purpose=group.group_purpose,
+                    url=item.url,
+                    purpose=item.purpose,
+                    ok=bool(content.strip()),
+                    content=_truncate_text(content, _MAX_SCRAPE_CHARS),
+                    error="" if content.strip() else "Crawl4AI returned no content.",
+                ),
+                engine=source_ledger.ENGINE_CRAWL4AI_ADAPTIVE,
+            )
+        except Exception as exc:
+            return _finish(
+                Scrape(
                     cycle=0,
                     group=group.group,
                     group_purpose=group.group_purpose,
                     url=item.url,
                     purpose=item.purpose,
                     ok=False,
-                    error="skipped duplicate: URL has already been scraped in this process",
-                )
-            return Scrape(
-                cycle=0,
-                group=group.group,
-                group_purpose=group.group_purpose,
-                url=item.url,
-                purpose=item.purpose,
-                ok=bool(content.strip()),
-                content=_truncate_text(content, _MAX_SCRAPE_CHARS),
-                error="" if content.strip() else "Crawl4AI returned no content.",
-            )
-        except Exception as exc:
-            return Scrape(
-                cycle=0,
-                group=group.group,
-                group_purpose=group.group_purpose,
-                url=item.url,
-                purpose=item.purpose,
-                ok=False,
-                error=f"{type(exc).__name__}: {exc}",
+                    error=f"{type(exc).__name__}: {exc}",
+                ),
+                engine=source_ledger.ENGINE_CRAWL4AI_ADAPTIVE,
             )
 
     scrapes = await _limited_gather(

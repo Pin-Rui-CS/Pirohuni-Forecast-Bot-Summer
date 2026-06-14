@@ -105,9 +105,12 @@ async def forecast_individual_question(
     skip_previously_forecasted_questions: bool,
     per_question_token_hard_limit: float = 0,
 ) -> str:
+    import source_ledger
     from Crawl4AI.crawl import set_scrape_dedupe_scope
 
-    set_scrape_dedupe_scope(f"question:{question_id}:{post_id}")
+    scope = f"question:{question_id}:{post_id}"
+    set_scrape_dedupe_scope(scope)
+    source_ledger.set_source_scope(scope)
     post_details = await get_post_details(post_id)
     question_details = post_details.get("question")
     if not isinstance(question_details, dict):
@@ -215,6 +218,10 @@ async def forecast_individual_question(
         prompt=result.prompt,
         run_sections=result.run_transcripts,
         final_summary=result.comment,
+    )
+    artifacts.save_audit(
+        usage_yaml_table=usage_yaml_table,
+        url_events=source_ledger.drain_events(scope),
     )
     artifacts.save_forecast_json(
         {

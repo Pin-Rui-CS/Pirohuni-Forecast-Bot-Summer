@@ -18,6 +18,7 @@ from config import (
 from llm_client import call_llm
 from monetary_cost_manager import HardLimitExceededError
 from utils import _truncate_text
+import source_ledger
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ async def run_research(
     async def resolution_sources_call(evidence_plan: str) -> str:
         from resolution_criteria_scraper import scrape_resolution_sources
 
+        source_ledger.set_source_context("Resolution Scraper", "main pass")
         question_context = title
         if background.strip():
             question_context += f"\n\nBackground:\n{background.strip()}"
@@ -260,6 +262,15 @@ async def run_research(
     results.extend(other_results)
     results.append(asknews_result)
 
+    # AskNews and prediction-market providers embed source URLs in their text
+    # output rather than scraping pages individually. Record those URLs as
+    # surfaced-not-scraped so the audit artifact has full provenance. The
+    # scrape providers' URLs are already recorded with engine/status detail by
+    # the scrape code itself, so they are deliberately not re-parsed here.
+    for name, content in results:
+        if name in {"AskNews", "Kalshi", "Manifold", "Polymarket"} and content:
+            source_ledger.record_text_urls(content, tool=name, phase="main pass")
+
     # The run is search-degraded only if the whole chain produced no usable
     # search results. A successful fallback to a lower-priority provider is NOT
     # degraded; the providers that were tried and failed are surfaced only when
@@ -326,6 +337,7 @@ async def run_research(
             retry_extra_kwargs = (
                 {"reason": "artifact retry"} if retry_label == "Firecrawl Search" else {}
             )
+            source_ledger.set_source_context(retry_label, "artifact retry")
             retry_result = await run_provider(
                 f"Focused Artifact Retry ({retry_label})",
                 lambda: asyncio.wait_for(
@@ -442,6 +454,7 @@ async def _run_search_chain(
         if name in exhausted:
             errored.append(f"{name} (skipped: out of credits earlier this run)")
             continue
+        source_ledger.set_source_context(name, "main pass")
         result = await run_provider(name, lambda call=call: call(asknews_research))
         _, content = result
         if should_include(name, content):

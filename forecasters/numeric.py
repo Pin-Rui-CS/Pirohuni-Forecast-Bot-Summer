@@ -9,7 +9,6 @@ from collections import Counter
 import numpy as np
 from pydantic import BaseModel, Field, model_validator
 from scipy import stats
-from scipy.interpolate import PchipInterpolator
 
 from forecasters.base import ForecastResult, gather_forecast_runs
 
@@ -160,26 +159,61 @@ It should narrow when the outcome is already strongly constrained by reliable ev
 
 ## FINAL OUTPUT
 
-Return your forecast as JSON. It must be the very last thing you write:
+Express your final forecast as a **weighted mixture of smooth components** — one
+component per genuinely distinct scenario for how the quantity resolves. The harness
+evaluates each component's analytic curve, blends them by weight, and reads the answer
+off the combined distribution. Output this JSON as the very last thing you write:
 
 {{
-  "reasoning": "<one-paragraph summary of phases 1-4, including the estimate trajectory, the key evidence IDs, and the biggest uncertainty>",
-  "forecast": {{
-    "scenarios": [
-      {{
-        "name": "<short scenario label>",
-        "weight": 0.7,
-        "percentiles": {{"p5": <number>, "p25": <number>, "p50": <number>, "p75": <number>, "p95": <number>}}
-      }}
-    ]
-  }}
+  "reasoning_summary": "<one or two sentences on the regime structure and the dominant driver, citing key evidence IDs>",
+  "components": [
+    {{
+      "name": "<scenario label>",
+      "weight": <number between 0 and 1>,
+      "family": "<family name>",
+      "params": {{ ... }},
+      "implied_p50": <number>,
+      "implied_90ci": [<low>, <high>],
+      "evidence": ["E1", "E4"]
+    }}
+  ]
 }}
 
-Rules for the forecast:
-- Express your final distribution as 1 to 3 weighted scenarios. Use one scenario when your reasoning points to a single regime. Use two or three when Phase 3/4 identified genuinely distinct futures; give each its own percentiles and a weight reflecting how likely that future is. Weights must sum to 1.
-- Each scenario's percentiles are your believed values of the FINAL RESOLVED quantity under that scenario, in the answer units stated above. "p5": v means a 5% chance the resolved value is below v in that scenario.
-- Percentile values must be non-decreasing from p5 to p95 within each scenario.
-- The percentiles must reproduce the 90% CI you stated in Phase 4 (blended across scenarios).
+How to build it:
+1. **Scenarios.** Name the genuinely distinct futures. Use ONE component unless Phase 3/4
+   identified truly different regimes (e.g. "deal reached → calm" vs "talks collapse → shock");
+   then use two or at most three. Do not invent components for variety — one well-sized
+   component beats three arbitrary ones. Components weighted under 5%, or nearly identical
+   to another, are merged away, so make each one count and cite distinct evidence for each.
+2. **Family (match the support).** Pick the family whose shape and support fit the quantity;
+   never place mass where it is physically impossible or outside a stated bound:
+   - Can be negative OR positive (returns, spreads, differences): "normal", "skew_normal", "student_t"
+   - Strictly positive (price, index level, rate, count, days-until-event): "lognormal", "gamma"
+   - Hard-bounded on both sides [lo, hi]: "truncated_normal" (or "beta")
+   Reach for "skew_normal" when a regime is asymmetric, "student_t" (df 3–6) when tails are
+   heavy, "lognormal" for positive quantities that can spike up but not below zero (volatility, prices).
+3. **Parameters (honest spread).** Center each component where you believe the quantity lands
+   in that scenario; set its scale to your real uncertainty WITHIN that scenario, not the
+   average across scenarios. State implied_p50 and implied_90ci so any mismatch with your
+   reasoning is visible. When unsure, widen — a confident narrow component that is slightly
+   wrong is punished far harder by the scoring rule than an appropriately wide one.
+4. **Weights.** Your probabilities over the scenarios; positive and summing to 1.
+
+Parameter reference (params must match the chosen family exactly):
+- "normal": {{"mean": float, "std": float}}
+- "skew_normal": {{"location": float, "scale": float, "alpha": float}}  (alpha>0 right-skewed, <0 left-skewed)
+- "student_t": {{"location": float, "scale": float, "df": float}}  (lower df = fatter tails)
+- "lognormal": {{"median": float, "sigma": float}}  (median in nominal units; sigma is the log-scale spread)
+- "gamma": {{"mean": float, "shape": float}}  (positive support, right-skewed; higher shape = more symmetric)
+- "truncated_normal": {{"mean": float, "sd": float, "lo": float, "hi": float}}
+- "beta": {{"a": float, "b": float, "lower": float, "upper": float}}
+
+Rules:
+- 1–3 components; weights positive and summing to 1; each component is smooth and single-peaked.
+  Any multimodality comes from the MIXTURE, never from a single component.
+- The chosen family's support must contain every plausible outcome and violate no stated bound.
+- Do NOT output percentile lists (p5/p25/p50/...). Smoothness must come from the family you
+  choose, never from listing quantile points.
 {discrete_pmf_note}
 """
 
@@ -189,6 +223,26 @@ class MixtureNormal:
     def __init__(self, weights, means, stds):
         self.weights = np.array(weights)
         self.components = [stats.norm(loc=m, scale=s) for m, s in zip(means, stds)]
+
+    def cdf(self, x):
+        return sum(w * c.cdf(x) for w, c in zip(self.weights, self.components))
+
+
+class Mixture:
+    """Weighted mixture of arbitrary single-family components.
+
+    Each component is itself a distribution built by ``build_distribution``,
+    so a mixture can combine heterogeneous families (e.g. a skewed base case
+    plus a fat-tailed shock). The mixture CDF is the weight-blended sum of the
+    component CDFs; because every component is a closed-form smooth density,
+    the blend is smooth and any multimodality comes from the mixture, never
+    from a single component.
+    """
+    def __init__(self, weights, components):
+        w = np.asarray(weights, dtype=float)
+        total = w.sum()
+        self.weights = w / total if total > 0 else np.full(len(w), 1.0 / len(w))
+        self.components = components
 
     def cdf(self, x):
         return sum(w * c.cdf(x) for w, c in zip(self.weights, self.components))
@@ -215,9 +269,10 @@ def build_distribution(spec: dict):
     t = spec["type"]
     p = spec.get("params") or {k: v for k, v in spec.items() if k != "type"}
     if t == "normal":
-        if p["std"] <= 0:
-            raise ValueError(f"normal: std must be > 0, got {p['std']}")
-        return stats.norm(loc=p["mean"], scale=p["std"])
+        std = p["std"] if "std" in p else p["sd"]
+        if std <= 0:
+            raise ValueError(f"normal: std must be > 0, got {std}")
+        return stats.norm(loc=p["mean"], scale=std)
     elif t == "mixture_normal":
         if any(s <= 0 for s in p["stds"]):
             raise ValueError(f"mixture_normal: all stds must be > 0, got {p['stds']}")
@@ -240,15 +295,50 @@ def build_distribution(spec: dict):
         if p["upper"] <= p["lower"]:
             raise ValueError(f"beta: upper must be > lower, got lower={p['lower']}, upper={p['upper']}")
         return ScaledBeta(p["a"], p["b"], p["lower"], p["upper"])
-    elif t == "log_normal":
-        if p["sigma"] <= 0:
-            raise ValueError(f"log_normal: sigma must be > 0, got {p['sigma']}")
-        return stats.lognorm(s=p["sigma"], scale=np.exp(p["mu"]))
+    elif t in ("log_normal", "lognormal"):
+        sigma = p["sigma"]
+        if sigma <= 0:
+            raise ValueError(f"lognormal: sigma must be > 0, got {sigma}")
+        # Accept either `mu` (log-mean) or the friendlier `median` (= exp(mu)).
+        if "median" in p:
+            if p["median"] <= 0:
+                raise ValueError(f"lognormal: median must be > 0, got {p['median']}")
+            scale = float(p["median"])
+        else:
+            scale = float(np.exp(p["mu"]))
+        return stats.lognorm(s=sigma, scale=scale)
+    elif t == "gamma":
+        mean, shape = p["mean"], p["shape"]
+        if mean <= 0:
+            raise ValueError(f"gamma: mean must be > 0, got {mean}")
+        if shape <= 0:
+            raise ValueError(f"gamma: shape must be > 0, got {shape}")
+        return stats.gamma(a=shape, scale=mean / shape)
+    elif t == "truncated_normal":
+        mean, sd = p["mean"], p["sd"]
+        lo, hi = p["lo"], p["hi"]
+        if sd <= 0:
+            raise ValueError(f"truncated_normal: sd must be > 0, got {sd}")
+        if hi <= lo:
+            raise ValueError(f"truncated_normal: hi must be > lo, got lo={lo}, hi={hi}")
+        a, b = (lo - mean) / sd, (hi - mean) / sd
+        return stats.truncnorm(a, b, loc=mean, scale=sd)
     elif t == "uniform":
         lo, hi = p["lower"], p["upper"]
         if hi <= lo:
             raise ValueError(f"uniform: upper must be > lower, got lower={lo}, upper={hi}")
         return stats.uniform(loc=lo, scale=hi - lo)
+    elif t == "mixture":
+        components = p["components"]
+        if not components:
+            raise ValueError("mixture: components must be nonempty")
+        weights = [float(c["weight"]) for c in components]
+        if any(w < 0 for w in weights):
+            raise ValueError(f"mixture: weights must be nonnegative, got {weights}")
+        if sum(weights) <= 0:
+            raise ValueError("mixture: weights must sum to a positive number")
+        built = [build_distribution(c) for c in components]
+        return Mixture(weights, built)
     else:
         raise ValueError(f"Unknown distribution type: {t}")
 
@@ -272,9 +362,23 @@ def _distribution_location_values(spec: dict) -> list[float]:
         values = [p.get("lower"), p.get("upper")]
     elif t == "uniform":
         values = [p.get("lower"), p.get("upper")]
-    elif t == "log_normal":
-        mu = p.get("mu")
-        values = [np.exp(mu)] if isinstance(mu, (int, float)) else []
+    elif t in ("log_normal", "lognormal"):
+        if isinstance(p.get("median"), (int, float)):
+            values = [p["median"]]
+        elif isinstance(p.get("mu"), (int, float)):
+            values = [np.exp(p["mu"])]
+        else:
+            values = []
+    elif t == "gamma":
+        values = [p.get("mean")]
+    elif t == "truncated_normal":
+        values = [p.get("mean"), p.get("lo"), p.get("hi")]
+    elif t == "mixture":
+        values = [
+            value
+            for component in (p.get("components") or [])
+            for value in _distribution_location_values(component)
+        ]
     else:
         values = []
 
@@ -494,12 +598,13 @@ def distribution_guidance_for_question(
 
     header = (
         "\nDiscrete/count guidance: this is a discrete question over outcome values "
-        f"like: {value_text}. Prefer a native probability mass function over "
-        "continuous percentiles."
+        f"like: {value_text}. Prefer a native probability mass function over a "
+        "continuous mixture."
     )
     pmf_note = (
-        '- Because this is a discrete/count question, you may INSTEAD return '
-        '{"forecast": {"pmf": {"values": [<outcome values>], "probabilities": [<floats>]}}} '
+        '- Because this is a discrete/count question, INSTEAD of "components" return '
+        '{"distribution": {"type": "pmf", "params": {"values": [<outcome values>], '
+        '"probabilities": [<floats>]}}} '
         f"using outcome values like: {value_text}. Probabilities must be nonnegative and "
         "will be normalized. Use the open-ended upper-tail value when the question has one. "
         "Prefer this pmf form for count questions."
@@ -953,214 +1058,266 @@ class NumericDistribution(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Scenario / percentile elicitation
+# Mixture validation / guardrails
+#
+# Every continuous forecast is treated as a weighted mixture of smooth
+# single-family components (a single family is just a 1-component mixture).
+# These guardrails guarantee the submitted curve is always valid, smooth, and
+# in-bounds no matter what the model returns. The layers, in order:
+#   1. per-component validation (known family, present & finite params, builds)
+#   2. self-consistency check (stated 90% CI vs the params' actual CI) — warn
+#   3. weight normalisation, dropping negligible components, cap at MAX
+#   4. minimum-width floor — makes interpolation-style spikes impossible
+#   5. merge of near-duplicate same-family humps (spurious multimodality)
+#   6. a broad-normal fallback if nothing survives
 # ---------------------------------------------------------------------------
 
-_PERCENTILE_KEY_PATTERN = re.compile(r"^p?\s*(\d+(?:\.\d+)?)\s*%?$", re.IGNORECASE)
+# Anti-spike: no component may be narrower than this fraction of the question
+# range. Keeps peak per-cell mass well under the Metaculus cap even before the
+# final standardisation backstop.
+MIN_SCALE_FRACTION = 0.02
+# Absolute floor on a lognormal's log-scale spread (sigma is unitless).
+MIN_LOG_SIGMA = 0.03
+# Components rated less likely than this are negligible: dropped and absorbed.
+COMPONENT_WEIGHT_FLOOR = 0.05
+# Maximum components kept (parsimony; matches the prompt instruction).
+MAX_COMPONENTS = 3
+# Same-family components whose centres sit within this fraction of the range
+# of each other are merged (the model inventing spurious multimodality).
+COMPONENT_MERGE_FRACTION = 0.05
+
+_COMPONENT_FAMILIES = {
+    "normal", "skew_normal", "student_t", "lognormal", "log_normal",
+    "gamma", "truncated_normal", "beta",
+}
 
 
-def _parse_percentile_key(key) -> float:
-    """Map 'p5', 'p50', '95', '2.5', 0.05 etc. to a fraction in (0, 1)."""
-    if isinstance(key, (int, float)):
-        number = float(key)
-    else:
-        match = _PERCENTILE_KEY_PATTERN.match(str(key).strip())
-        if not match:
-            raise ValueError(f"Unrecognized percentile key: {key!r}")
-        number = float(match.group(1))
-    if 0 < number < 1:
-        return number
-    if 1 <= number < 100:
-        return number / 100
-    raise ValueError(f"Percentile key out of range (0, 100): {key!r}")
+def _validate_component(family: str, params: dict) -> tuple[bool, str]:
+    """A component is valid if its family is known, its params are finite, and
+    ``build_distribution`` can actually construct it (which enforces positivity
+    of scales, ordering of bounds, presence of required keys, etc.)."""
+    if family not in _COMPONENT_FAMILIES:
+        return False, f"unknown family {family!r}"
+    for key, value in params.items():
+        if isinstance(value, (int, float)) and not np.isfinite(float(value)):
+            return False, f"non-finite param {key}"
+    try:
+        build_distribution({"type": family, "params": params})
+    except KeyError as exc:
+        return False, f"missing param {exc}"
+    except (ValueError, TypeError, ZeroDivisionError) as exc:
+        return False, str(exc)
+    return True, ""
 
 
-def _sanitize_declared_percentiles(
-    percentiles: dict,
-    zero_point: float | None,
-    value_scale: float = 1.0,
-) -> list[Percentile]:
-    parsed: list[tuple[float, float]] = []
-    for key, value in percentiles.items():
-        fraction = _parse_percentile_key(key)
-        parsed.append((fraction, float(value) * value_scale))
-    if len(parsed) < 2:
-        raise ValueError(f"Need at least 2 percentiles, got: {percentiles}")
-    parsed.sort(key=lambda pair: pair[0])
-
-    fractions = [pair[0] for pair in parsed]
-    values = [pair[1] for pair in parsed]
-    if any(values[i] > values[i + 1] for i in range(len(values) - 1)):
-        raise ValueError(f"Percentile values must be non-decreasing, got: {percentiles}")
-
-    # Nudge ties so interpolation never divides by zero.
-    value_span = max(abs(values[-1] - values[0]), abs(values[-1]), 1.0)
-    epsilon = value_span * 1e-9
-    for i in range(1, len(values)):
-        if values[i] <= values[i - 1]:
-            values[i] = values[i - 1] + epsilon
-
-    if zero_point is not None:
-        floor = zero_point + max(abs(zero_point), 1.0) * 1e-9
-        values = [max(value, floor) for value in values]
-        for i in range(1, len(values)):
-            if values[i] <= values[i - 1]:
-                values[i] = values[i - 1] + epsilon
-
-    return [
-        Percentile(percentile=fraction, value=value)
-        for fraction, value in zip(fractions, values)
-    ]
+def _component_center(family: str, params: dict) -> float | None:
+    values = _distribution_location_values({"type": family, "params": params})
+    return float(np.mean(values)) if values else None
 
 
-def _pchip_cdf_on_grid(distribution: NumericDistribution, cdf_size: int) -> np.ndarray:
-    """Evaluate declared percentiles as a smooth CDF on the location grid.
-
-    The legacy path linearly interpolated between percentile knots, which made
-    the PMF a step function (flat shelves with sharp corners on the Metaculus
-    plot). Monotone cubic (PCHIP) interpolation passes through exactly the
-    same knots — declared percentiles plus the bound anchors — but curves
-    smoothly between them and cannot overshoot monotonicity.
-    """
-    bounded = distribution._add_explicit_upper_lower_bound_percentiles(
-        distribution.declared_percentiles
-    )
-    knot_locations: list[float] = []
-    knot_probabilities: list[float] = []
-    for point in bounded:
-        location = distribution._nominal_location_to_cdf_location(point.value)
-        probability = float(point.percentile)
-        if knot_locations and location <= knot_locations[-1] + 1e-12:
-            # Collapse duplicate locations (e.g. several values clamped to a
-            # closed bound) keeping the upper CDF envelope.
-            knot_probabilities[-1] = max(knot_probabilities[-1], probability)
-            continue
-        knot_locations.append(location)
-        knot_probabilities.append(probability)
-
-    if len(knot_locations) < 2:
-        raise ValueError(f"Not enough distinct percentile knots: {bounded}")
-
-    interpolator = PchipInterpolator(knot_locations, knot_probabilities)
-    locations = np.linspace(0.0, 1.0, cdf_size)
-    clipped = np.clip(locations, knot_locations[0], knot_locations[-1])
-    values = np.asarray(interpolator(clipped), dtype=float)
-    return np.clip(np.maximum.accumulate(values), 0.0, 1.0)
-
-
-def percentiles_to_cdf(
-    percentiles: dict,
-    *,
-    lower_bound: float,
-    upper_bound: float,
-    zero_point: float | None,
-    open_lower_bound: bool,
-    open_upper_bound: bool,
-    cdf_size: int,
-    value_scale: float = 1.0,
-) -> np.ndarray:
-    """Evaluate declared percentiles as a raw (unstandardized) smooth CDF."""
-    declared = _sanitize_declared_percentiles(percentiles, zero_point, value_scale)
-    distribution = NumericDistribution(
-        declared_percentiles=declared,
-        open_upper_bound=open_upper_bound,
-        open_lower_bound=open_lower_bound,
-        upper_bound=upper_bound,
-        lower_bound=lower_bound,
-        zero_point=zero_point,
-        cdf_size=cdf_size,
-        standardize_cdf=False,
-        strict_validation=False,
-    )
-    return _pchip_cdf_on_grid(distribution, cdf_size)
-
-
-def parse_scenarios(forecast: dict) -> list[dict]:
-    scenarios = forecast.get("scenarios")
-    if isinstance(forecast.get("percentiles"), dict) and not scenarios:
-        scenarios = [{"name": "single", "weight": 1.0, "percentiles": forecast["percentiles"]}]
-    if not isinstance(scenarios, list) or not scenarios:
-        raise ValueError(f"forecast must contain a nonempty 'scenarios' list, got keys: {list(forecast.keys())}")
-    if len(scenarios) > 5:
-        raise ValueError(f"too many scenarios: {len(scenarios)}")
-
-    cleaned = []
-    for scenario in scenarios:
-        if not isinstance(scenario, dict) or not isinstance(scenario.get("percentiles"), dict):
-            raise ValueError(f"each scenario needs a 'percentiles' dict, got: {scenario}")
-        weight = float(scenario.get("weight", 1.0))
-        if not np.isfinite(weight) or weight < 0:
-            raise ValueError(f"scenario weight must be a nonnegative number, got: {scenario.get('weight')}")
-        cleaned.append(
-            {
-                "name": str(scenario.get("name", "")).strip() or "scenario",
-                "weight": weight,
-                "percentiles": scenario["percentiles"],
-            }
+def _check_component_ci(
+    family: str, params: dict, implied_90ci, notes: list[str]
+) -> None:
+    """Warn (don't reject) when the model's stated 90% CI for a component
+    disagrees badly with the CI its own parameters actually imply — a sign it
+    picked numbers that don't match its reasoning."""
+    if not (isinstance(implied_90ci, (list, tuple)) and len(implied_90ci) == 2):
+        return
+    try:
+        stated_lo, stated_hi = float(implied_90ci[0]), float(implied_90ci[1])
+        dist = build_distribution({"type": family, "params": params})
+        real_lo, real_hi = float(dist.ppf(0.05)), float(dist.ppf(0.95))
+    except Exception:
+        return
+    stated_w, real_w = abs(stated_hi - stated_lo), abs(real_hi - real_lo)
+    if stated_w <= 0 or real_w <= 0:
+        return
+    ratio = max(stated_w, real_w) / max(min(stated_w, real_w), 1e-9)
+    if ratio > 2.0:
+        notes.append(
+            f"component '{family}' stated 90% CI {list(implied_90ci)} disagrees with "
+            f"its parameters' CI [{real_lo:.3g}, {real_hi:.3g}]"
         )
-    total_weight = sum(scenario["weight"] for scenario in cleaned)
-    if total_weight <= 0:
-        raise ValueError("scenario weights must sum to a positive number")
-    for scenario in cleaned:
-        scenario["weight"] /= total_weight
-    return cleaned
 
 
-def scenarios_to_cdf(
-    scenarios: list[dict],
-    *,
-    lower_bound: float,
-    upper_bound: float,
-    zero_point: float | None,
-    open_lower_bound: bool,
-    open_upper_bound: bool,
-    cdf_size: int,
-    grid: np.ndarray,
-) -> tuple[np.ndarray, str]:
-    """Mix per-scenario percentile CDFs into one raw CDF on the grid."""
-    all_values = [
-        float(value)
-        for scenario in scenarios
-        for value in scenario["percentiles"].values()
-        if isinstance(value, (int, float)) and np.isfinite(float(value))
-    ]
-    value_scale = 1.0
-    unit_note = "Scenario percentile values appear to use the same units as the Metaculus grid."
-    if zero_point is None and _values_use_millions_against_raw_grid(
-        all_values,
-        grid,
-        open_upper_bound=open_upper_bound,
-        open_lower_bound=open_lower_bound,
+def _apply_width_floor(family: str, params: dict, min_scale: float) -> dict:
+    """Clamp a component's spread up to ``min_scale`` so it can never collapse
+    into a spike. Family-specific because each family parameterises width
+    differently."""
+    q = dict(params)
+    if family == "normal":
+        key = "std" if "std" in q else "sd"
+        q[key] = max(float(q[key]), min_scale)
+    elif family in ("skew_normal", "student_t"):
+        q["scale"] = max(float(q["scale"]), min_scale)
+    elif family == "truncated_normal":
+        key = "sd" if "sd" in q else "std"
+        q[key] = max(float(q[key]), min_scale)
+    elif family in ("lognormal", "log_normal"):
+        median = float(q["median"]) if "median" in q else float(np.exp(q["mu"]))
+        floor = MIN_LOG_SIGMA
+        if median > 0:
+            floor = max(MIN_LOG_SIGMA, min(min_scale / median, 0.5))
+        q["sigma"] = max(float(q["sigma"]), floor)
+    elif family == "gamma":
+        mean = float(q["mean"])
+        if min_scale > 0:
+            # std = mean / sqrt(shape) >= min_scale  ->  shape <= (mean/min_scale)^2
+            q["shape"] = min(float(q["shape"]), (mean / min_scale) ** 2)
+    # beta and any other family fall back to the final standardisation cap.
+    return q
+
+
+def _merge_components(components: list[dict], merge_tol: float) -> list[dict]:
+    """Combine same-family components whose centres are within ``merge_tol`` by
+    weight-averaging their parameters and summing their weights."""
+    merged: list[dict] = []
+    for comp in sorted(
+        components,
+        key=lambda c: (c["family"], c["center"] if c["center"] is not None else 0.0),
     ):
-        value_scale = 1_000_000.0
-        unit_note = (
-            "Metaculus grid appears to be raw units; scenario percentile values appear "
-            "to be in millions. Scaling values by 1,000,000."
-        )
+        target = None
+        for existing in merged:
+            if (
+                existing["family"] == comp["family"]
+                and existing["center"] is not None
+                and comp["center"] is not None
+                and abs(existing["center"] - comp["center"]) <= merge_tol
+            ):
+                target = existing
+                break
+        if target is None:
+            merged.append(dict(comp))
+            continue
+        wa, wb = target["weight"], comp["weight"]
+        wt = wa + wb or 1.0
+        for key, value in target["params"].items():
+            other = comp["params"].get(key)
+            if isinstance(value, (int, float)) and isinstance(other, (int, float)):
+                target["params"][key] = (value * wa + other * wb) / wt
+        target["weight"] = wa + wb
+        target["center"] = (target["center"] * wa + comp["center"] * wb) / wt
+    return merged
 
-    mixed = np.zeros(cdf_size)
-    for scenario in scenarios:
-        mixed += scenario["weight"] * percentiles_to_cdf(
-            scenario["percentiles"],
-            lower_bound=lower_bound,
-            upper_bound=upper_bound,
-            zero_point=zero_point,
-            open_lower_bound=open_lower_bound,
-            open_upper_bound=open_upper_bound,
-            cdf_size=cdf_size,
-            value_scale=value_scale,
+
+def _renormalize(components: list[dict]) -> None:
+    total = sum(c["weight"] for c in components) or 1.0
+    for c in components:
+        c["weight"] /= total
+
+
+def build_mixture_spec_from_components(
+    components: list, geometry: dict
+) -> tuple[dict | None, list[str]]:
+    """Turn the model's raw component list into a validated mixture spec.
+
+    Returns ``(spec, notes)``. ``spec`` is ``None`` when nothing survives
+    validation, signalling the caller to use the fallback. ``notes`` records
+    every guardrail that fired, for the transcript/logs.
+    """
+    notes: list[str] = []
+    lower, upper = geometry["lower_bound"], geometry["upper_bound"]
+    rng = abs(upper - lower) or 1.0
+    min_scale = MIN_SCALE_FRACTION * rng
+    merge_tol = COMPONENT_MERGE_FRACTION * rng
+
+    clean: list[dict] = []
+    for raw in components:
+        if not isinstance(raw, dict):
+            notes.append("dropped a component that was not an object")
+            continue
+        family = str(raw.get("family") or raw.get("type") or "").strip()
+        params = raw.get("params")
+        if not isinstance(params, dict):
+            params = {
+                k: v for k, v in raw.items()
+                if k not in ("family", "type", "weight", "name", "evidence",
+                             "implied_p50", "implied_90ci")
+            }
+        try:
+            weight = float(raw.get("weight", 1.0))
+        except (TypeError, ValueError):
+            weight = -1.0
+        if not np.isfinite(weight) or weight < 0:
+            notes.append(f"dropped component '{family}' with invalid weight")
+            continue
+        ok, reason = _validate_component(family, params)
+        if not ok:
+            notes.append(f"dropped component '{family}': {reason}")
+            continue
+        _check_component_ci(family, params, raw.get("implied_90ci"), notes)
+        clean.append({
+            "family": family,
+            "params": dict(params),
+            "weight": weight,
+            "center": _component_center(family, params),
+        })
+
+    if not clean:
+        return None, notes
+
+    _renormalize(clean)
+
+    # Drop negligible components, then keep at most MAX_COMPONENTS.
+    kept = [c for c in clean if c["weight"] >= COMPONENT_WEIGHT_FLOOR]
+    if not kept:
+        kept = [max(clean, key=lambda c: c["weight"])]
+    if len(kept) < len(clean):
+        notes.append(
+            f"dropped {len(clean) - len(kept)} negligible component(s) "
+            f"(<{COMPONENT_WEIGHT_FLOOR:.0%} weight)"
         )
-    return np.clip(np.maximum.accumulate(mixed), 0.0, 1.0), unit_note
+    _renormalize(kept)
+    if len(kept) > MAX_COMPONENTS:
+        kept = sorted(kept, key=lambda c: c["weight"], reverse=True)[:MAX_COMPONENTS]
+        notes.append(f"capped to the top {MAX_COMPONENTS} components")
+        _renormalize(kept)
+
+    # Anti-spike width floor.
+    for comp in kept:
+        widened = _apply_width_floor(comp["family"], comp["params"], min_scale)
+        if widened != comp["params"]:
+            notes.append(f"widened component '{comp['family']}' up to the minimum scale")
+            comp["params"] = widened
+            comp["center"] = _component_center(comp["family"], widened)
+
+    # Merge near-duplicate humps.
+    before = len(kept)
+    kept = _merge_components(kept, merge_tol)
+    if len(kept) < before:
+        notes.append(f"merged {before - len(kept)} near-duplicate component(s)")
+    _renormalize(kept)
+
+    spec = {
+        "type": "mixture",
+        "components": [
+            {"type": c["family"], "params": c["params"], "weight": c["weight"]}
+            for c in kept
+        ],
+    }
+    try:
+        build_distribution(spec)
+    except Exception as exc:  # pragma: no cover - defensive
+        notes.append(f"assembled mixture failed to build ({exc}); using fallback")
+        return None, notes
+    return spec, notes
+
+
+def _fallback_mixture_spec(geometry: dict) -> dict:
+    """A broad, safe normal spanning the question range — used when a run's
+    components are all unsalvageable."""
+    lower, upper = geometry["lower_bound"], geometry["upper_bound"]
+    rng = abs(upper - lower) or 1.0
+    return {"type": "normal", "params": {"mean": lower + 0.5 * rng, "std": 0.25 * rng}}
 
 
 def parse_numeric_response(response: str) -> tuple[dict, str]:
     """Parse the model's final JSON into ({'kind': ..., ...}, reasoning).
 
     Supported forms:
-    - {"forecast": {"scenarios": [...]}} (preferred)
-    - {"forecast": {"percentiles": {...}}} (single implicit scenario)
-    - {"forecast": {"pmf": {"values": [...], "probabilities": [...]}}} (discrete)
-    - {"distribution": {"type": ..., "params": ...}} (legacy parametric fallback)
+    - {"components": [{family, params, weight, ...}, ...]} (mixture — preferred)
+    - {"distribution": {"type": ..., "params": ...}} (single family = 1-component mixture)
+    - {"distribution": {"type": "pmf", ...}} (discrete count questions)
     """
     try:
         parsed = json.loads(response)
@@ -1170,22 +1327,25 @@ def parse_numeric_response(response: str) -> tuple[dict, str]:
             raise ValueError(f"Could not extract JSON from LLM response: {response[:300]}")
         parsed = json.loads(candidates[-1])
 
-    reasoning = str(parsed.get("reasoning", ""))
-    forecast = parsed.get("forecast")
-    if isinstance(forecast, dict):
-        pmf = forecast.get("pmf")
-        if isinstance(pmf, dict):
-            return {"kind": "pmf", "pmf": pmf}, reasoning
-        if forecast.get("values") is not None and forecast.get("probabilities") is not None:
-            return {"kind": "pmf", "pmf": forecast}, reasoning
-        return {"kind": "scenarios", "scenarios": parse_scenarios(forecast)}, reasoning
+    reasoning = str(parsed.get("reasoning") or parsed.get("reasoning_summary") or "")
+
+    components = parsed.get("components")
+    if isinstance(components, list) and components:
+        return {"kind": "mixture", "components": components}, reasoning
 
     spec = parsed.get("distribution")
     if isinstance(spec, dict):
-        return {"kind": "spec", "spec": spec}, reasoning
+        if spec.get("type") == "pmf":
+            return {"kind": "pmf", "pmf": spec.get("params") or spec}, reasoning
+        family = spec.get("type")
+        params = spec.get("params") or {k: v for k, v in spec.items() if k != "type"}
+        return (
+            {"kind": "mixture", "components": [{"family": family, "params": params, "weight": 1.0}]},
+            reasoning,
+        )
 
     raise ValueError(
-        f"LLM response missing 'forecast' or 'distribution'. Keys present: {list(parsed.keys())}"
+        f"LLM response missing 'components'/'distribution'. Keys present: {list(parsed.keys())}"
     )
 
 
@@ -1346,29 +1506,21 @@ def numeric_response_to_raw_cdf(
     open_upper_bound = geometry["open_upper_bound"]
     open_lower_bound = geometry["open_lower_bound"]
 
-    if parsed["kind"] == "scenarios":
-        raw_cdf, unit_note = scenarios_to_cdf(
-            parsed["scenarios"],
-            lower_bound=geometry["lower_bound"],
-            upper_bound=geometry["upper_bound"],
-            zero_point=geometry["zero_point"],
-            open_lower_bound=open_lower_bound,
-            open_upper_bound=open_upper_bound,
-            cdf_size=geometry["cdf_size"],
-            grid=grid,
-        )
-        return raw_cdf, parsed, reasoning, unit_note
-
     if parsed["kind"] == "pmf":
         spec = {"type": "pmf", "params": parsed["pmf"]}
         raw_cdf = np.asarray(pmf_spec_to_cdf(spec, grid))
+        parsed["spec"] = spec
         return raw_cdf, parsed, reasoning, "PMF over outcome values; no unit conversion applied."
 
-    # Legacy parametric spec fallback.
-    spec = parsed["spec"]
-    if question_type == "discrete" and spec.get("type") != "pmf":
+    # Mixture of smooth families (a single family is a 1-component mixture).
+    spec, notes = build_mixture_spec_from_components(parsed["components"], geometry)
+    if spec is None:
+        spec = _fallback_mixture_spec(geometry)
+        notes = notes + ["all components invalid; fell back to a broad normal"]
+    parsed["spec"] = spec
+    if question_type == "discrete":
         logger.warning(
-            "sanity check warning: discrete question used a continuous distribution family."
+            "sanity check warning: discrete question used a continuous mixture; prefer pmf."
         )
     eval_grid, unit_note = grid_for_distribution_units(
         spec,
@@ -1377,6 +1529,8 @@ def numeric_response_to_raw_cdf(
         open_lower_bound=open_lower_bound,
     )
     raw_cdf = np.asarray(spec_to_cdf(spec, eval_grid))
+    if notes:
+        unit_note = unit_note + " | guardrails: " + "; ".join(notes)
     return raw_cdf, parsed, reasoning, unit_note
 
 
@@ -1401,9 +1555,15 @@ async def get_numeric_gpt_prediction(
     transcripts: list[str] = []
     run_values: list[dict] = []
     for response, transcript in runs:
-        raw_cdf, parsed, reasoning, unit_note = numeric_response_to_raw_cdf(
-            response, geometry, grid
-        )
+        try:
+            raw_cdf, parsed, reasoning, unit_note = numeric_response_to_raw_cdf(
+                response, geometry, grid
+            )
+        except Exception as exc:
+            # One malformed run must not sink the question; drop it and lean on
+            # the others. If every run fails, a fallback is built below.
+            logger.warning("dropping unparseable numeric run: %s", exc)
+            continue
         logger.info("question title: %s", title)
         logger.info("grid x first/last: %s %s", float(grid[0]), float(grid[-1]))
         logger.info("unit conversion: %s", unit_note)
@@ -1420,6 +1580,21 @@ async def get_numeric_gpt_prediction(
             f"Unit conversion: {unit_note}\n\n"
             f"{reasoning}"
         )
+
+    if not raw_cdfs:
+        logger.warning(
+            "all %d numeric run(s) failed for %r; submitting a broad-normal fallback.",
+            len(runs), title,
+        )
+        fallback_spec = _fallback_mixture_spec(geometry)
+        eval_grid, _ = grid_for_distribution_units(
+            fallback_spec, grid,
+            open_upper_bound=geometry["open_upper_bound"],
+            open_lower_bound=geometry["open_lower_bound"],
+        )
+        raw_cdfs.append(np.asarray(spec_to_cdf(fallback_spec, eval_grid)))
+        run_values.append({"kind": "mixture", "spec": fallback_spec})
+        comments.append("All runs failed to parse; using a broad-normal fallback.")
 
     aggregated = aggregate_run_cdfs(raw_cdfs, geometry["question_type"])
 
@@ -1468,13 +1643,6 @@ async def get_numeric_gpt_prediction(
 
 
 def _run_location_values(parsed: dict) -> list[float]:
-    if parsed["kind"] == "scenarios":
-        return [
-            float(value)
-            for scenario in parsed["scenarios"]
-            for value in scenario["percentiles"].values()
-            if isinstance(value, (int, float)) and np.isfinite(float(value))
-        ]
     if parsed["kind"] == "pmf":
         values, _ = _parse_pmf_params(parsed["pmf"])
         return values

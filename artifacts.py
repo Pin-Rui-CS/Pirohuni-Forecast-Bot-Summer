@@ -95,6 +95,24 @@ class QuestionArtifacts:
         lines += ["## Final", final_summary, ""]
         return self._write("runs.md", "\n".join(lines))
 
+    def save_audit(self, usage_yaml_table: str, url_events: list[Any]) -> str:
+        """Write audit.md: per-question token usage and full URL/scrape ledger."""
+        lines = [
+            f"# Audit — {self.title}",
+            f"Question ID: {self.question_id} | Post ID: {self.post_id} | Type: {self.question_type}",
+            "",
+            "## Token Usage (this question)",
+            "",
+            "```yaml",
+            usage_yaml_table or "(none)",
+            "```",
+            "",
+            "## Research Sources",
+            "",
+        ]
+        lines += _format_url_events(url_events)
+        return self._write("audit.md", "\n".join(lines))
+
     def save_forecast_json(self, data: dict[str, Any]) -> str:
         record = {
             "question_id": self.question_id,
@@ -109,3 +127,95 @@ class QuestionArtifacts:
             json.dump(record, f, indent=2, default=_json_default)
         logger.info("[artifact saved] %s", path)
         return path
+
+
+_ROLE_ORDER = {"candidate": 0, "ranked-for-scrape": 1, "scraped": 2}
+
+
+def _audit_cell(value: Any) -> str:
+    return str(value).replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
+
+
+def _format_url_events(url_events: list[Any]) -> list[str]:
+    if not url_events:
+        return ["No research URLs were recorded for this question."]
+
+    unique_urls = {event.url for event in url_events}
+    roles = [event.role for event in url_events]
+    scraped = [event for event in url_events if event.role == "scraped"]
+    scraped_ok = sum(1 for event in scraped if event.ok is True)
+    scraped_failed = sum(
+        1 for event in scraped if event.ok is False and event.engine != "skipped-duplicate"
+    )
+    skipped_dup = sum(1 for event in scraped if event.engine == "skipped-duplicate")
+
+    lines = [
+        f"Totals: {len(url_events)} events across {len(unique_urls)} unique URLs — "
+        f"candidates: {roles.count('candidate')}, "
+        f"ranked-for-scrape: {roles.count('ranked-for-scrape')}, "
+        f"scraped: {len(scraped)} (ok: {scraped_ok}, failed: {scraped_failed}, "
+        f"skipped-duplicate: {skipped_dup}).",
+        "",
+    ]
+
+    # Per-tool rollup.
+    tools: dict[str, dict[str, int]] = {}
+    for event in url_events:
+        bucket = tools.setdefault(
+            event.tool,
+            {"candidate": 0, "ranked-for-scrape": 0, "ok": 0, "failed": 0, "dup": 0},
+        )
+        if event.role == "scraped":
+            if event.engine == "skipped-duplicate":
+                bucket["dup"] += 1
+            elif event.ok is True:
+                bucket["ok"] += 1
+            else:
+                bucket["failed"] += 1
+        else:
+            bucket[event.role] += 1
+
+    lines += [
+        "### Per-tool summary",
+        "",
+        "| tool | candidates | ranked | scraped ok | scraped failed | skipped dup |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for tool, bucket in sorted(tools.items()):
+        lines.append(
+            f"| {_audit_cell(tool)} | {bucket['candidate']} | {bucket['ranked-for-scrape']} "
+            f"| {bucket['ok']} | {bucket['failed']} | {bucket['dup']} |"
+        )
+    lines += ["", "### All URL events", ""]
+
+    ordered = sorted(
+        url_events,
+        key=lambda event: (
+            event.tool,
+            event.phase,
+            _ROLE_ORDER.get(event.role, 9),
+            event.round_label,
+            event.url,
+        ),
+    )
+    lines += [
+        "| # | tool | phase | round | role | scraped-by | status | chars | url |",
+        "| ---: | --- | --- | --- | --- | --- | --- | ---: | --- |",
+    ]
+    for index, event in enumerate(ordered, start=1):
+        if event.role == "scraped":
+            if event.engine == "skipped-duplicate":
+                status = "skipped-duplicate"
+            elif event.ok is True:
+                status = "ok"
+            else:
+                status = f"failed: {event.error}" if event.error else "failed"
+        else:
+            status = "—"
+        lines.append(
+            f"| {index} | {_audit_cell(event.tool)} | {_audit_cell(event.phase)} "
+            f"| {_audit_cell(event.round_label)} | {_audit_cell(event.role)} "
+            f"| {_audit_cell(event.engine or '—')} | {_audit_cell(status)} "
+            f"| {'' if event.chars is None else event.chars} | {_audit_cell(event.url)} |"
+        )
+    return lines

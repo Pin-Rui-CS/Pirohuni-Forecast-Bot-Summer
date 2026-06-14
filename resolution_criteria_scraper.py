@@ -463,10 +463,20 @@ async def _scrape_resolution_url(
     returning confidence 0.000 / no content even when the page rendered fine.
     See tests/test_crawl_basic_vs_adaptive.py for the comparison.
     """
+    import source_ledger
+
     try:
         from Crawl4AI.crawl import claim_scrape_url
 
         if claim_scrape_url(url) is not None:
+            source_ledger.record_url_event(
+                url,
+                source_ledger.ROLE_SCRAPED,
+                engine=source_ledger.ENGINE_SKIPPED_DUPLICATE,
+                ok=False,
+                error="skipped duplicate: URL has already been scraped in this process",
+                round_label="single pass",
+            )
             return _ResolutionScrapeResult(
                 url=url,
                 provider_used="dedupe registry",
@@ -475,16 +485,34 @@ async def _scrape_resolution_url(
             )
 
         content = _truncate_scrape_content(await _basic_crawl_markdown(url, timeout))
-        return _ResolutionScrapeResult(
+        result = _ResolutionScrapeResult(
             url=url,
             provider_used="crawl4ai-basic",
             success=bool(content.strip()),
             content=content,
             error="" if content.strip() else "Crawl4AI returned no content.",
         )
+        source_ledger.record_url_event(
+            url,
+            source_ledger.ROLE_SCRAPED,
+            engine=source_ledger.ENGINE_CRAWL4AI_BASIC,
+            ok=result.success,
+            error=result.error,
+            chars=len(content),
+            round_label="single pass",
+        )
+        return result
     except HardLimitExceededError:
         raise
     except Exception as exc:
+        source_ledger.record_url_event(
+            url,
+            source_ledger.ROLE_SCRAPED,
+            engine=source_ledger.ENGINE_CRAWL4AI_BASIC,
+            ok=False,
+            error=f"{type(exc).__name__}: {exc}",
+            round_label="single pass",
+        )
         return _ResolutionScrapeResult(
             url=url,
             provider_used="crawl4ai-basic",

@@ -28,8 +28,10 @@ from research.serp_research import (
     _limited_gather,
     _normalise_query,
     _parse_ranked_url_groups,
+    _record_ranked_url_groups,
     run_scrape_cycles,
 )
+import source_ledger
 
 
 logger = logging.getLogger(__name__)
@@ -160,6 +162,13 @@ async def build_firecrawl_research_result(
         tbs=firecrawl_tbs,
         reason=reason,
     )
+    for result in search_results:
+        source_ledger.record_url_event(
+            result.url,
+            source_ledger.ROLE_CANDIDATE,
+            round_label="search",
+            detail=f"query: {result.query} | source: {result.source}",
+        )
     ranked_url_groups = await rank_firecrawl_urls(
         title=title,
         resolution_criteria=resolution_criteria,
@@ -169,6 +178,7 @@ async def build_firecrawl_research_result(
         max_ranked_urls=max_ranked_urls,
         model=ranking_model,
     )
+    _record_ranked_url_groups(ranked_url_groups)
     cycles = await run_scrape_cycles(
         title=title,
         resolution_criteria=resolution_criteria,
