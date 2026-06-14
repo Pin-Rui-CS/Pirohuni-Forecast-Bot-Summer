@@ -20,7 +20,10 @@ You must complete every phase below in order. At the end of each phase, state yo
 Discipline rules that apply to every phase:
 - The research material labels evidence items with IDs like [E1], [E2]. Every probability adjustment you make must cite the specific evidence item(s) that justify it. An adjustment with no citable evidence must be small and explicitly labelled as judgment.
 - Keep arithmetic simple and show it in-line (e.g. "3 of 14 similar cases -> ~21%"). Do not perform calculations you cannot show.
-- If the Required Artifact Status says the key evidence is missing or partial, say so and keep your estimate closer to the base rate with reduced confidence. Do not fill gaps with invented certainty.
+- If the Required Artifact Status says the key evidence is missing or partial, WIDEN your uncertainty and say so. Then classify each missing fact before reacting to it:
+  - Contingent / current facts (vote counts, schedules, who has committed, current status): do NOT guess — treat as genuinely unknown.
+  - Stable institutional, legal, or procedural facts (how an established process works, fixed rules, well-documented precedent): you MAY resolve these from your own established knowledge. Label such reasoning "[from background knowledge]" so it is auditable, and reason from it rather than leaving it "unresolved".
+  A partial artifact means WIDEN — it does NOT mean default to the nearest prediction market or refuse to apply knowledge you reliably hold.
 
 ---
 
@@ -74,7 +77,7 @@ Establish a starting probability using base rates and reference classes.
 - Identify the most relevant reference class for this question. What is the general category of event being predicted?
 - State the historical counts or rates you are using as explicit numbers, with their source or evidence ID. Show the simple arithmetic that turns them into a base rate.
 - If multiple reference classes apply, consider each and weigh them to arrive at a blended base rate. Show the weights.
-- Treat prediction market data carefully: Polymarket and Kalshi are real-money market priors weighted by their volume, liquidity, bid/ask spread, and relevance to the question; Manifold is a play-money crowd signal and should be discounted relative to comparable real-money markets.
+- Treat prediction market data carefully. Before weighting ANY market, state its comparability to THIS question on three axes: (1) same resolution condition, (2) same deadline/date, (3) same entity/scope. A market that differs on any axis is a weak prior to ADJUST FROM, not an anchor to match — name the adjustment's direction and rough size (e.g. an earlier-deadline market understates a later-deadline question). Real-money markets (Polymarket, Kalshi) are weighted by volume, liquidity, bid/ask spread AND comparability; Manifold is a play-money crowd signal and discounted further. A thin or non-comparable market must not dominate a well-supported inside view.
 
 Output format:
 - Reference class(es) identified

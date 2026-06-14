@@ -96,6 +96,7 @@ async def run_serp_research(
     ranking_model: str = DEFAULT_SERP_RANKING_MODEL,
     extract_model: str = DEFAULT_EXTRACT_MODEL,
     temperature: float = 0.2,
+    preset_queries: list[str] | None = None,
 ) -> str:
     """Return formatted SerpAPI Google research for the forecasting pipeline."""
     result = await build_serp_research_result(
@@ -113,6 +114,7 @@ async def run_serp_research(
         ranking_model=ranking_model,
         extract_model=extract_model,
         temperature=temperature,
+        preset_queries=preset_queries,
     )
     return format_serp_research(result)
 
@@ -132,21 +134,32 @@ async def build_serp_research_result(
     ranking_model: str = DEFAULT_SERP_RANKING_MODEL,
     extract_model: str = DEFAULT_EXTRACT_MODEL,
     temperature: float = 0.2,
+    preset_queries: list[str] | None = None,
 ) -> SerpResearchResult:
-    """Generate Google queries, fetch SerpAPI organic results, and rank URLs."""
+    """Generate Google queries, fetch SerpAPI organic results, and rank URLs.
+
+    When ``preset_queries`` is given, query generation is skipped and the
+    provided queries are searched directly (used by the focused artifact
+    retry pass).
+    """
     _validate_serpapi_key()
-    query_plan = await generate_google_search_query_plan(
-        title=title,
-        resolution_criteria=resolution_criteria,
-        background=background,
-        fine_print=fine_print,
-        asknews_research=asknews_research,
-        options=options,
-        max_queries=max_queries,
-        model=query_model,
-        temperature=temperature,
-    )
-    queries = _queries_with_title(title, query_plan)
+    if preset_queries:
+        queries = [
+            _normalise_query(query) for query in preset_queries if _normalise_query(query)
+        ]
+    else:
+        query_plan = await generate_google_search_query_plan(
+            title=title,
+            resolution_criteria=resolution_criteria,
+            background=background,
+            fine_print=fine_print,
+            asknews_research=asknews_research,
+            options=options,
+            max_queries=max_queries,
+            model=query_model,
+            temperature=temperature,
+        )
+        queries = _queries_with_title(title, query_plan)
     organic_results = await fetch_serpapi_organic_results(
         queries=queries,
         num_results_per_query=num_results_per_query,

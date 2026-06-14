@@ -230,18 +230,18 @@ async def run_research(
             asyncio.create_task(run_provider("Polymarket", lambda: polymarket_call(market_question)))
         )
 
-    # Search providers run as a priority fallback CHAIN (SerpAPI -> Firecrawl ->
-    # Tavily), not in parallel, to conserve credits: the bot uses the first
+    # Search providers run as a priority fallback CHAIN (SerpAPI -> Tavily ->
+    # Firecrawl), not in parallel, to conserve credits: the bot uses the first
     # provider that returns usable results and skips the rest. A provider that
     # fails with an out-of-credits / auth / missing-key signal is remembered for
     # the rest of the process so later questions skip it without re-probing.
     ordered_search_providers = []
     if ENABLE_SERPAPI_RESEARCH:
         ordered_search_providers.append(("SerpAPI Google", serpapi_call))
-    if ENABLE_FIRECRAWL_RESEARCH:
-        ordered_search_providers.append(("Firecrawl Search", firecrawl_call))
     if ENABLE_TAVILY_RESEARCH:
         ordered_search_providers.append(("Tavily Search", tavily_call))
+    if ENABLE_FIRECRAWL_RESEARCH:
+        ordered_search_providers.append(("Firecrawl Search", firecrawl_call))
 
     chosen_search_result, search_provider_errors = await _run_search_chain(
         ordered_search_providers,
@@ -293,15 +293,19 @@ async def run_research(
         provider_results=included_results,
     )
 
-    # Stage 5: focused retry aimed only at the missing artifact.
-    retry_provider = _select_retry_search_provider()
+    # Stage 5: focused retry aimed only at the missing artifact. Reuse the search
+    # provider that already returned usable results this run, so the retry never
+    # spends a different provider's credits and always uses one proven to work. If
+    # the whole main chain produced nothing, fall back to the first not-yet-
+    # exhausted provider in the configured order.
+    retry_label = _select_retry_provider_label(chosen_search_result, ordered_search_providers)
+    run_retry_search = _retry_runner_for(retry_label) if retry_label else None
     if (
         artifact_check
         and artifact_check.get("status") in {"missing", "partial"}
         and artifact_check.get("retry_queries")
-        and retry_provider is not None
+        and run_retry_search is not None
     ):
-        retry_label, run_retry_search = retry_provider
         retry_queries = [
             str(query).strip()
             for query in artifact_check["retry_queries"][:_MAX_RETRY_QUERIES]
@@ -448,22 +452,41 @@ async def _run_search_chain(
     return None, errored
 
 
-def _select_retry_search_provider():
-    """Pick the search provider for the focused artifact retry.
+def _select_retry_provider_label(
+    chosen_search_result: tuple[str, str | None] | None,
+    ordered_search_providers: list[tuple[str, object]],
+) -> str | None:
+    """Pick which provider the focused artifact retry should use.
 
-    Only providers whose ``run_*_research`` entrypoint accepts ``preset_queries``
-    qualify (Firecrawl, Tavily); SerpAPI's does not. Honors the chain priority
-    (Firecrawl before Tavily) and skips providers already exhausted this run.
-    Returns ``(label, callable)`` or ``None``.
+    Prefer the provider that already returned usable results this run, so the
+    retry reuses an already-paid-for provider proven to work rather than
+    spending a different one's credits. If the main chain produced nothing,
+    fall back to the first provider in the configured order that has not been
+    exhausted. All three providers' ``run_*_research`` entrypoints accept
+    ``preset_queries``, so any of them can run the retry.
     """
-    if ENABLE_FIRECRAWL_RESEARCH and "Firecrawl Search" not in _exhausted_search_providers:
+    if chosen_search_result is not None:
+        return chosen_search_result[0]
+    for name, _ in ordered_search_providers:
+        if name not in _exhausted_search_providers:
+            return name
+    return None
+
+
+def _retry_runner_for(label: str):
+    """Map a provider label to its ``run_*_research`` entrypoint."""
+    if label == "SerpAPI Google":
+        from research.serp_research import run_serp_research
+
+        return run_serp_research
+    if label == "Firecrawl Search":
         from research.firecrawl_research import run_firecrawl_research
 
-        return "Firecrawl Search", run_firecrawl_research
-    if ENABLE_TAVILY_RESEARCH and "Tavily Search" not in _exhausted_search_providers:
+        return run_firecrawl_research
+    if label == "Tavily Search":
         from research.tavily_research import run_tavily_research
 
-        return "Tavily Search", run_tavily_research
+        return run_tavily_research
     return None
 
 

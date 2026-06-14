@@ -411,18 +411,6 @@ class _ResolutionScrapeResult:
     error: str = ""
 
 
-def _build_crawl_query(question_text: str, resolution_criteria: str) -> str:
-    return "\n".join(
-        part
-        for part in [
-            f"Forecasting question: {question_text}" if question_text else "",
-            f"Resolution criteria: {resolution_criteria}" if resolution_criteria else "",
-            "Find concrete facts, dates, numbers, rules, labels, status fields, and source text relevant to the resolution criteria. Do not forecast.",
-        ]
-        if part
-    )
-
-
 def _truncate_scrape_content(content: str, max_chars: int = _CRAWL4AI_CONTENT_BUDGET) -> str:
     content = str(content or "").strip()
     if len(content) <= max_chars:
@@ -438,45 +426,58 @@ def _format_combined_resolution_content(sources: list[tuple[str, str]]) -> str:
     )
 
 
+async def _basic_crawl_markdown(url: str, timeout: int) -> str:
+    """Fetch one page with a single-page browser crawl; return full raw markdown.
+
+    No embedding relevance filter and no link-following: the resolution source is
+    the page that holds the value being resolved, so its full markdown is what we
+    want, handed downstream to the LLM-cleaning step. Returns "" if the page did
+    not load successfully.
+    """
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+
+    run_config = CrawlerRunConfig(page_timeout=max(1, int(timeout)) * 1000)
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+        result = await crawler.arun(url=url, config=run_config)
+    if not getattr(result, "success", False):
+        return ""
+    markdown = getattr(result, "markdown", None)
+    if markdown is None:
+        return ""
+    return getattr(markdown, "raw_markdown", None) or str(markdown)
+
+
 async def _scrape_resolution_url(
     url: str,
     question_text: str,
     resolution_criteria: str,
     timeout: int,
 ) -> _ResolutionScrapeResult:
-    """Scrape one resolution URL through Crawl4AI only."""
-    query = _build_crawl_query(question_text, resolution_criteria)
+    """Scrape one resolution URL with a basic single-page crawl.
 
+    The resolution source is the page named by the resolution criteria, so the
+    value being resolved is on that page by definition; a basic crawl returns its
+    full markdown for the LLM-cleaning step to read against the criteria. The
+    embedding-filtered adaptive crawler used here previously discarded short,
+    semantically-thin facts (e.g. a bare stat like "Predictions 3,903,957"),
+    returning confidence 0.000 / no content even when the page rendered fine.
+    See tests/test_crawl_basic_vs_adaptive.py for the comparison.
+    """
     try:
-        from Crawl4AI.crawl import (
-            AdaptiveResearchConfig,
-            adaptive_research_crawl,
-            is_duplicate_scrape_payload,
-        )
+        from Crawl4AI.crawl import claim_scrape_url
 
-        config = AdaptiveResearchConfig.from_env()
-        config.max_pages = 4
-        config.max_depth = 1
-        config.top_k_links = 2
-        config.top_k_content = 4
-        config.max_chars_per_page = 16_000
-        config.max_total_chars = 40_000
-        config.content_budget = _CRAWL4AI_CONTENT_BUDGET
-        # Fewer embedding query variations: resolution scraping is a targeted
-        # lookup, not broad exploration, and each variation costs crawl time.
-        config.n_query_variations = 4
-        content = await adaptive_research_crawl(url, query, config=config)
-        if is_duplicate_scrape_payload(content):
+        if claim_scrape_url(url) is not None:
             return _ResolutionScrapeResult(
                 url=url,
                 provider_used="dedupe registry",
                 success=False,
                 error="skipped duplicate: URL has already been scraped in this process",
             )
-        content = _truncate_scrape_content(content)
+
+        content = _truncate_scrape_content(await _basic_crawl_markdown(url, timeout))
         return _ResolutionScrapeResult(
             url=url,
-            provider_used="crawl4ai",
+            provider_used="crawl4ai-basic",
             success=bool(content.strip()),
             content=content,
             error="" if content.strip() else "Crawl4AI returned no content.",
@@ -486,7 +487,7 @@ async def _scrape_resolution_url(
     except Exception as exc:
         return _ResolutionScrapeResult(
             url=url,
-            provider_used="crawl4ai",
+            provider_used="crawl4ai-basic",
             success=False,
             error=f"{type(exc).__name__}: {exc}",
         )
@@ -713,30 +714,35 @@ async def scrape_resolution_sources(
     question_text: str = "",
     use_llm_cleaning: bool = False,
     llm_model: str = "anthropic/claude-sonnet-4.6",
-    max_concurrent: int = 3,
+    max_concurrent: int = 5,
     timeout: int = 30,
-    max_urls: int = 3,
+    max_urls: int = 10,
 ) -> str:
-    """Scrape explicit resolution-source URLs and summarize them once.
+    """Scrape the URLs embedded in the question and summarize them once.
 
-    The resolution-source path is intentionally narrow: it uses URLs from the
-    resolution criteria first, falls back to URLs in the question context only
-    when the criteria has none, and never asks the LLM to discover follow-up
-    links. At most ``max_urls`` URLs are scraped; URLs from the resolution
-    criteria are authoritative, while question-text URLs are usually just
-    background links and not worth a long crawl each.
+    Candidate URLs are gathered from BOTH the resolution criteria and the
+    question context (background + fine print), deduped with criteria URLs
+    first. They are NOT exclusive: the primary source that holds the resolved
+    value is often linked only in the background (e.g. a congress.gov bill page)
+    while the criteria cite only a generic definitions/FAQ link. Scraping is a
+    free local crawl, and all sources feed a single combined summary call, so
+    every candidate (up to ``max_urls`` as a guard against pathological link
+    counts) is scraped concurrently rather than pre-filtered.
     """
 
-    urls = extract_urls(resolution_criteria)
-    if not urls:
-        urls = extract_urls(question_text)
+    seen: set[str] = set()
+    urls: list[str] = []
+    for url in [*extract_urls(resolution_criteria), *extract_urls(question_text)]:
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
     if not urls:
         logger.info("No external URLs found in question text or resolution criteria.")
         return ""
 
     if len(urls) > max_urls:
         logger.info(
-            "Found %d resolution URL(s); scraping only the first %d.", len(urls), max_urls
+            "Found %d resolution URL(s); scraping the first %d.", len(urls), max_urls
         )
         urls = urls[:max_urls]
     logger.info("Found %d resolution URL(s): %s", len(urls), urls)
