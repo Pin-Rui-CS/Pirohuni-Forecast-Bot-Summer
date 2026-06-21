@@ -4,7 +4,7 @@ import datetime
 import logging
 import re
 
-from forecasters.base import ForecastResult, gather_forecast_runs
+from forecasters.base import ForecastResult, gather_forecast_runs, short_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +223,18 @@ def build_multiple_choice_prompt(question_details: dict, summary_report: str) ->
     )
 
 
+def _make_mc_validator(options) -> "callable":
+    def _validate(response: str) -> str | None:
+        try:
+            probs = extract_option_probabilities_from_response(response, options)
+            generate_multiple_choice_forecast(options, probs)
+            return None
+        except (ValueError, ZeroDivisionError) as exc:
+            return str(exc)
+
+    return _validate
+
+
 async def get_multiple_choice_gpt_prediction(
     question_details: dict,
     num_runs: int,
@@ -231,25 +243,68 @@ async def get_multiple_choice_gpt_prediction(
     options = question_details["options"]
     prompt = build_multiple_choice_prompt(question_details, summary_report)
 
-    runs = await gather_forecast_runs(prompt, num_runs, "mc-forecast")
+    repair_instruction = (
+        f"End your reply with exactly {len(options)} lines, one per option in this "
+        f"order {options}, each formatted as 'Option_Name: probability'. The "
+        "probabilities must be numbers that sum to 100."
+    )
+    runs = await gather_forecast_runs(
+        prompt,
+        num_runs,
+        "mc-forecast",
+        validate=_make_mc_validator(options),
+        repair_instruction=repair_instruction,
+    )
 
     per_run_dicts: list[dict[str, float]] = []
+    models: list[str] = []
     comments: list[str] = []
     transcripts: list[str] = []
-    for rationale, transcript in runs:
-        option_probabilities = extract_option_probabilities_from_response(rationale, options)
+    ensemble: list[dict] = []
+    for i, run in enumerate(runs):
+        transcripts.append(run.transcript)
+        record = {"model": run.model, "valid": run.valid, "repaired": run.repaired}
+        if not run.valid:
+            logger.warning(
+                "[ensemble] mc run %d (%s) dropped — unparseable option probabilities: %s",
+                i + 1, run.model, run.error,
+            )
+            record["dropped"] = True
+            ensemble.append(record)
+            continue
+        option_probabilities = extract_option_probabilities_from_response(run.response, options)
         probability_yes_per_category = generate_multiple_choice_forecast(
             options, option_probabilities
         )
         per_run_dicts.append(probability_yes_per_category)
+        models.append(run.model)
+        ensemble.append(record)
+        repaired_note = " _(repaired)_" if run.repaired else ""
         comments.append(
-            f"EXTRACTED_PROBABILITIES: {option_probabilities}\n\nGPT's Answer: "
-            f"{rationale}\n\n\n"
+            f"**Model: {run.model}**{repaired_note}\n\n"
+            f"EXTRACTED_PROBABILITIES: {option_probabilities}\n\nAnswer: "
+            f"{run.response}\n\n\n"
         )
-        transcripts.append(transcript)
+
+    if not per_run_dicts:
+        logger.warning(
+            "[ensemble] all %d mc run(s) failed for %r; defaulting to a uniform distribution.",
+            len(runs), question_details.get("title"),
+        )
+        uniform = {option: 1.0 / len(options) for option in options}
+        return ForecastResult(
+            forecast=uniform,
+            comment="All ensemble runs failed to produce parseable option probabilities; "
+            "defaulting to a uniform distribution.",
+            prompt=prompt,
+            run_transcripts=transcripts,
+            run_values=[],
+            extra={"ensemble": ensemble},
+        )
 
     final_comment_sections = [
-        f"## Rationale {i+1}\n{comment}" for i, comment in enumerate(comments)
+        f"## Rationale {i+1} — {short_model_name(models[i])}\n{comment}"
+        for i, comment in enumerate(comments)
     ]
     average_probability_yes_per_category: dict[str, float] = {}
     for option in options:
@@ -268,4 +323,5 @@ async def get_multiple_choice_gpt_prediction(
         prompt=prompt,
         run_transcripts=transcripts,
         run_values=per_run_dicts,
+        extra={"ensemble": ensemble},
     )

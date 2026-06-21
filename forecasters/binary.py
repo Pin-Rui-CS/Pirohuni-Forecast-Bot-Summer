@@ -6,7 +6,8 @@ import re
 
 import numpy as np
 
-from forecasters.base import ForecastResult, gather_forecast_runs
+from config import FORECASTER_TIEBREAKER_MODEL
+from forecasters.base import ForecastResult, gather_forecast_runs, short_model_name
 from llm_client import call_llm
 
 logger = logging.getLogger(__name__)
@@ -180,6 +181,20 @@ def build_binary_prompt(question_details: dict, summary_report: str) -> str:
     )
 
 
+def _validate_binary_response(response: str) -> str | None:
+    try:
+        extract_probability_from_response_as_percentage_not_decimal(response)
+        return None
+    except ValueError as exc:
+        return str(exc)
+
+
+_BINARY_REPAIR_INSTRUCTION = (
+    'Finish with your final answer on its own line, exactly in the form '
+    '"Probability: ZZ%", where ZZ is an integer between 0 and 100.'
+)
+
+
 async def get_binary_gpt_prediction(
     question_details: dict,
     num_runs: int,
@@ -187,20 +202,61 @@ async def get_binary_gpt_prediction(
 ) -> ForecastResult:
     prompt = build_binary_prompt(question_details, summary_report)
 
-    runs = await gather_forecast_runs(prompt, num_runs, "binary-forecast")
+    runs = await gather_forecast_runs(
+        prompt,
+        num_runs,
+        "binary-forecast",
+        validate=_validate_binary_response,
+        repair_instruction=_BINARY_REPAIR_INSTRUCTION,
+    )
+
+    # Valid runs feed the aggregate; ``probabilities``/``models``/``comments``
+    # stay index-aligned so the tiebreaker can quote them. Dropped runs are
+    # logged and recorded but never sink the question.
     probabilities: list[float] = []
+    models: list[str] = []
     comments: list[str] = []
     transcripts: list[str] = []
-    for rationale, transcript in runs:
-        probability = extract_probability_from_response_as_percentage_not_decimal(rationale)
+    ensemble: list[dict] = []
+    for i, run in enumerate(runs):
+        transcripts.append(run.transcript)
+        record = {"model": run.model, "valid": run.valid, "repaired": run.repaired}
+        if not run.valid:
+            logger.warning(
+                "[ensemble] binary run %d (%s) dropped — no parseable probability: %s",
+                i + 1, run.model, run.error,
+            )
+            record["dropped"] = True
+            ensemble.append(record)
+            continue
+        probability = extract_probability_from_response_as_percentage_not_decimal(run.response)
+        record["probability"] = probability
+        ensemble.append(record)
         probabilities.append(probability)
+        models.append(run.model)
+        repaired_note = " _(repaired)_" if run.repaired else ""
         comments.append(
-            f"Extracted Probability: {probability}%\n\nGPT's Answer: {rationale}\n\n\n"
+            f"**Model: {run.model}**{repaired_note}\n\n"
+            f"Extracted Probability: {probability}%\n\nAnswer: {run.response}\n\n\n"
         )
-        transcripts.append(transcript)
+
+    if not probabilities:
+        logger.warning(
+            "[ensemble] all %d binary run(s) failed for %r; defaulting to 50%%.",
+            len(runs), question_details.get("title"),
+        )
+        return ForecastResult(
+            forecast=0.5,
+            comment="All ensemble runs failed to produce a parseable probability; defaulting to 50%.",
+            prompt=prompt,
+            run_transcripts=transcripts,
+            run_values=[],
+            extra={"tiebreaker_used": False, "spread_pp": 0.0, "ensemble": ensemble},
+        )
 
     final_comment_sections = [
-        f"## Rationale {i+1}\n{comment}" for i, comment in enumerate(comments)
+        f"## Rationale {i+1} — {short_model_name(models[i])}\n{comment}"
+        for i, comment in enumerate(comments)
     ]
 
     SPREAD_THRESHOLD = 30
@@ -210,7 +266,7 @@ async def get_binary_gpt_prediction(
     if prob_spread >= SPREAD_THRESHOLD:
         tiebreaker_used = True
         rationale_blocks = "\n\n".join(
-            f"Run {i+1} (predicted {probabilities[i]}%):\n{comments[i]}"
+            f"Run {i+1} — {models[i]} (predicted {probabilities[i]}%):\n{comments[i]}"
             for i in range(len(probabilities))
         )
         tiebreaker_prompt = (
@@ -233,6 +289,7 @@ async def get_binary_gpt_prediction(
         )
         final_rationale = await call_llm(
             tiebreaker_prompt,
+            model=FORECASTER_TIEBREAKER_MODEL,
             _label="binary-tiebreaker",
             cache_static_prefix=True,
         )
@@ -258,5 +315,9 @@ async def get_binary_gpt_prediction(
         prompt=prompt,
         run_transcripts=transcripts,
         run_values=[p / 100 for p in probabilities],
-        extra={"tiebreaker_used": tiebreaker_used, "spread_pp": prob_spread},
+        extra={
+            "tiebreaker_used": tiebreaker_used,
+            "spread_pp": prob_spread,
+            "ensemble": ensemble,
+        },
     )

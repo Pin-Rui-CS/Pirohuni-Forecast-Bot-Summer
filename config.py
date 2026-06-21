@@ -15,7 +15,44 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-NUM_RUNS_PER_QUESTION = 3
+def _env_list(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    return items or default
+
+
+NUM_RUNS_PER_QUESTION = 4
+
+# --- Forecaster ensemble -----------------------------------------------------
+# The per-question forecast runs are spread across an ensemble of models, mapped
+# onto this pool in order and cycling when NUM_RUNS_PER_QUESTION exceeds the pool
+# size. The motivation for a *multi-model* pool is that genuinely different model
+# lineages make different errors, so aggregating across them decorrelates those
+# errors -- a bigger accuracy gain than re-sampling one model at temperature. The
+# pool should hold models of *comparable* forecasting quality (con 2: a
+# materially weaker model drags the average instead of decorrelating it).
+#
+# For now the pool is intentionally a SINGLE model (Opus 4.8): we are not ready
+# to switch on cross-provider forecasting yet. The ensemble machinery stays in
+# place — with a one-model pool all runs simply use Opus, exactly the old
+# single-model behaviour. To turn multi-model back on, add ids here (or set the
+# comma-separated FORECASTER_MODELS env var), e.g. "openai/gpt-5.5". Note Gemini
+# 3.1 Pro is currently unreachable via the OpenRouter BYOK Google key (free tier,
+# daily limit 0) until that key has billing enabled or BYOK is disabled.
+DEFAULT_FORECASTER_MODEL = "anthropic/claude-opus-4.8"
+FORECASTER_MODELS = _env_list(
+    "FORECASTER_MODELS",
+    [
+        DEFAULT_FORECASTER_MODEL,
+    ],
+)
+# The tiebreaker / synthesis judge is a single fixed strong model so the final
+# call doesn't inherit whichever ensemble member happened to run last.
+FORECASTER_TIEBREAKER_MODEL = os.getenv(
+    "FORECASTER_TIEBREAKER_MODEL", DEFAULT_FORECASTER_MODEL
+)
 SKIP_PREVIOUSLY_FORECASTED_QUESTIONS = True
 METACULUS_MAX_CONCURRENT_REQUESTS = int(os.getenv("METACULUS_MAX_CONCURRENT_REQUESTS", "1"))
 METACULUS_API_RATE_LIMITER = asyncio.Semaphore(METACULUS_MAX_CONCURRENT_REQUESTS)

@@ -198,6 +198,15 @@ def _parse_sub_market(raw: dict) -> dict | None:
     ]
     return {
         "question": raw.get("question", ""),
+        # groupItemTitle is the clean per-market label inside an event (e.g.
+        # "India"); fall back to the full question when it's absent.
+        "label": (raw.get("groupItemTitle") or raw.get("question") or "").strip(),
+        # The Gamma `description` is the market's actual resolution rule. Carrying
+        # it through is what lets the forecaster judge whether this market is a
+        # stricter/looser bar than the question (e.g. "...becomes LAW in the US"
+        # is stricter than "announced/finalised"); guessing from the title alone
+        # is how the nesting direction gets read backwards.
+        "resolution_rule": (raw.get("description") or "").strip(),
         "outcomes": outcome_data,
         "volume": _safe_float(raw.get("volume", 0)),
         "liquidity": _safe_float(raw.get("liquidity", 0)),
@@ -313,21 +322,45 @@ def _format_output(input_question: str, events: list[dict], scores: list[float])
         "",
         f"Found {len(events)} relevant market group(s) on Polymarket:\n",
     ]
+    def _trunc_rule(rule: str, limit: int = 600) -> str:
+        return rule[:limit].rstrip() + "..." if len(rule) > limit else rule
+
     for i, (event, score) in enumerate(zip(events, scores), start=1):
+        sub_markets = event["sub_markets"]
+        n_sub = len(sub_markets)
+        # When an event holds several sub-markets, its volume is the SUM across
+        # all of them, NOT the signal for any single market. Label it so the
+        # event total can't be mistaken for the relevant market's own volume
+        # (the $52K-event-vs-$2.9K-India conflation).
+        event_volume_note = (
+            f" (total across {n_sub} sub-markets, NOT any single market's volume)"
+            if n_sub > 1
+            else ""
+        )
+        # Grouped sub-markets usually share one templated resolution rule; print
+        # it once at the event level instead of repeating it on every line (which
+        # would bloat the brief and bury the signal).
+        distinct_rules = {sm["resolution_rule"] for sm in sub_markets if sm["resolution_rule"]}
+        shared_rule = next(iter(distinct_rules)) if len(distinct_rules) == 1 else None
+
         lines += [
             f"[{i}] {event['title']}",
             f"    Relevance score : {score:.1f} / 10",
-            f"    Total volume    : {_fmt_volume(event['volume'])}",
-            f"    Total liquidity : {_fmt_volume(event['liquidity'])}",
+            f"    Event volume    : {_fmt_volume(event['volume'])}{event_volume_note}",
             f"    URL             : {event['url']}",
-            "",
-            "    Active sub-markets:",
         ]
-        for sm in event["sub_markets"]:
-            lines.append(f"      - {sm['question']}")
-            lines.append(f"        Odds: {_fmt_outcomes(sm['outcomes'])}")
-            if sm["volume"] > 0:
-                lines.append(f"        Volume: {_fmt_volume(sm['volume'])}")
+        if shared_rule:
+            lines.append(f"    Resolution rule (all sub-markets): {_trunc_rule(shared_rule)}")
+        lines += [
+            "",
+            "    Active sub-markets (weight each by ITS OWN volume, not the event total):",
+        ]
+        for sm in sub_markets:
+            lines.append(f"      - {sm['label']}")
+            lines.append(f"        Odds   : {_fmt_outcomes(sm['outcomes'])}")
+            lines.append(f"        Volume : {_fmt_volume(sm['volume'])}")
+            if not shared_rule and sm["resolution_rule"]:
+                lines.append(f"        Resolves: {_trunc_rule(sm['resolution_rule'])}")
         lines.append("")
     lines.append("=" * 70)
     return "\n".join(lines)

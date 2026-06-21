@@ -10,7 +10,7 @@ import numpy as np
 from pydantic import BaseModel, Field, model_validator
 from scipy import stats
 
-from forecasters.base import ForecastResult, gather_forecast_runs
+from forecasters.base import ForecastResult, gather_forecast_runs, short_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -1496,10 +1496,13 @@ def numeric_response_to_raw_cdf(
     response: str,
     geometry: dict,
     grid: np.ndarray,
-) -> tuple[np.ndarray, dict, str, str]:
+) -> tuple[np.ndarray, dict, str, str, bool]:
     """Convert one run's response into a raw CDF on the grid.
 
-    Returns (raw_cdf, parsed_forecast, reasoning, unit_note).
+    Returns (raw_cdf, parsed_forecast, reasoning, unit_note, used_fallback).
+    ``used_fallback`` is True when none of the run's components survived
+    validation and a broad-normal was substituted — the caller logs that loudly
+    against the run's model rather than letting it pass silently.
     """
     parsed, reasoning = parse_numeric_response(response)
     question_type = geometry["question_type"]
@@ -1510,10 +1513,11 @@ def numeric_response_to_raw_cdf(
         spec = {"type": "pmf", "params": parsed["pmf"]}
         raw_cdf = np.asarray(pmf_spec_to_cdf(spec, grid))
         parsed["spec"] = spec
-        return raw_cdf, parsed, reasoning, "PMF over outcome values; no unit conversion applied."
+        return raw_cdf, parsed, reasoning, "PMF over outcome values; no unit conversion applied.", False
 
     # Mixture of smooth families (a single family is a 1-component mixture).
     spec, notes = build_mixture_spec_from_components(parsed["components"], geometry)
+    used_fallback = spec is None
     if spec is None:
         spec = _fallback_mixture_spec(geometry)
         notes = notes + ["all components invalid; fell back to a broad normal"]
@@ -1531,7 +1535,35 @@ def numeric_response_to_raw_cdf(
     raw_cdf = np.asarray(spec_to_cdf(spec, eval_grid))
     if notes:
         unit_note = unit_note + " | guardrails: " + "; ".join(notes)
-    return raw_cdf, parsed, reasoning, unit_note
+    return raw_cdf, parsed, reasoning, unit_note, used_fallback
+
+
+_NUMERIC_REPAIR_INSTRUCTION = (
+    "End your reply with ONLY the final JSON object described above: a top-level "
+    '"components" list of 1–3 items, each with "family", "params" (matching that '
+    'family exactly), and "weight". For a discrete/count question, use the "pmf" '
+    "form instead. Do not output percentile lists."
+)
+
+
+def _make_numeric_validator(geometry: dict):
+    """Validator for the repair retry: the response must parse into a pmf or into
+    at least one buildable mixture component. Catches both 'no JSON' and 'JSON
+    but every component is junk' before they degrade silently to a broad normal."""
+
+    def _validate(response: str) -> str | None:
+        try:
+            parsed, _ = parse_numeric_response(response)
+        except Exception as exc:  # noqa: BLE001 - any parse failure is a repair signal
+            return f"could not parse forecast JSON: {exc}"
+        if parsed["kind"] == "pmf":
+            return None
+        spec, _notes = build_mixture_spec_from_components(parsed["components"], geometry)
+        if spec is None:
+            return "no valid distribution components"
+        return None
+
+    return _validate
 
 
 async def get_numeric_gpt_prediction(
@@ -1548,24 +1580,52 @@ async def get_numeric_gpt_prediction(
         geometry["zero_point"],
     )
 
-    runs = await gather_forecast_runs(prompt, num_runs, "numeric-forecast")
+    runs = await gather_forecast_runs(
+        prompt,
+        num_runs,
+        "numeric-forecast",
+        validate=_make_numeric_validator(geometry),
+        repair_instruction=_NUMERIC_REPAIR_INSTRUCTION,
+    )
 
     raw_cdfs: list[np.ndarray] = []
     comments: list[str] = []
     transcripts: list[str] = []
     run_values: list[dict] = []
-    for response, transcript in runs:
+    ensemble: list[dict] = []
+    for run in runs:
+        record = {"model": run.model, "valid": run.valid, "repaired": run.repaired}
+        if not run.valid:
+            logger.warning(
+                "[ensemble] numeric run (%s) dropped — unparseable forecast: %s",
+                run.model, run.error,
+            )
+            record["dropped"] = True
+            ensemble.append(record)
+            continue
         try:
-            raw_cdf, parsed, reasoning, unit_note = numeric_response_to_raw_cdf(
-                response, geometry, grid
+            raw_cdf, parsed, reasoning, unit_note, used_fallback = numeric_response_to_raw_cdf(
+                run.response, geometry, grid
             )
         except Exception as exc:
             # One malformed run must not sink the question; drop it and lean on
             # the others. If every run fails, a fallback is built below.
-            logger.warning("dropping unparseable numeric run: %s", exc)
+            logger.warning("dropping unparseable numeric run (%s): %s", run.model, exc)
+            record["dropped"] = True
+            record["error"] = str(exc)
+            ensemble.append(record)
             continue
+        if used_fallback:
+            # Parseable JSON but no usable components — make the broad-normal
+            # substitution visible and attributable instead of silent (con 1).
+            logger.warning(
+                "[ensemble] numeric run (%s) had no valid components; used a broad-normal fallback.",
+                run.model,
+            )
+        record["used_fallback"] = used_fallback
+        ensemble.append(record)
         logger.info("question title: %s", title)
-        logger.info("grid x first/last: %s %s", float(grid[0]), float(grid[-1]))
+        logger.info("model: %s | grid x first/last: %s %s", run.model, float(grid[0]), float(grid[-1]))
         logger.info("unit conversion: %s", unit_note)
         logger.info("run forecast: %s", json.dumps(parsed, default=str)[:600])
         log_cdf_summary("raw run distribution summary:", raw_cdf.tolist())
@@ -1573,9 +1633,11 @@ async def get_numeric_gpt_prediction(
         log_numeric_cdf_sanity_checks(location_values, grid, raw_cdf.tolist())
 
         raw_cdfs.append(raw_cdf)
-        transcripts.append(transcript)
+        transcripts.append(run.transcript)
         run_values.append(parsed)
+        repaired_note = " (repaired)" if run.repaired else ""
         comments.append(
+            f"**Model: {run.model}**{repaired_note}\n"
             f"Forecast: {json.dumps(parsed, default=str)[:800]}\n"
             f"Unit conversion: {unit_note}\n\n"
             f"{reasoning}"
@@ -1638,7 +1700,7 @@ async def get_numeric_gpt_prediction(
         prompt=prompt,
         run_transcripts=transcripts,
         run_values=run_values,
-        extra={"geometry": geometry},
+        extra={"geometry": geometry, "ensemble": ensemble},
     )
 
 
