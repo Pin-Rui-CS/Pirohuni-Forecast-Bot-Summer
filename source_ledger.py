@@ -30,6 +30,7 @@ ROLE_SCRAPED = "scraped"                # a scrape was actually attempted
 # Engines that perform a scrape.
 ENGINE_CRAWL4AI_ADAPTIVE = "crawl4ai-adaptive"
 ENGINE_CRAWL4AI_BASIC = "crawl4ai-basic"
+ENGINE_FIRECRAWL = "firecrawl-scrape"
 ENGINE_SKIPPED_DUPLICATE = "skipped-duplicate"
 
 

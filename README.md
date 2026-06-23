@@ -70,7 +70,7 @@ question. A value of `0` disables enforcement while still tracking usage.
 
 ## Research
 
-Research is handled by `llm_client.run_research()`. It gathers market/news context from the providers under `research/` and also scrapes source URLs embedded anywhere in the question text, background, fine print, or resolution criteria via `resolution_criteria_scraper.py`. Source scraping uses URL-specific adapters first, including Metaculus, Google Trends, and Wikipedia, then falls back to the local Crawl4AI research crawler.
+Research is handled by `llm_client.run_research()`. It gathers market/news context from the providers under `research/` and also scrapes source URLs embedded anywhere in the question text, background, fine print, or resolution criteria via `resolution_criteria_scraper.py`. Each source page is scraped with Firecrawl's single-page `/v2/scrape` endpoint first; if Firecrawl runs out of credits (or fails for any other reason) it falls back to the local Crawl4AI basic crawler. The combined scraped content is then summarized in one LLM pass whose output budget scales with the number of pages scraped.
 
 ## Setup
 

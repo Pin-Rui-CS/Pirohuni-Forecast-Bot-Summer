@@ -25,10 +25,52 @@ import os
 import re
 from dataclasses import dataclass
 
-from config import OPENROUTER_API_KEY, llm_rate_limiter  # noqa: E402
+import httpx
+
+from config import FIRECRAWL_API_KEY, OPENROUTER_API_KEY, llm_rate_limiter  # noqa: E402
 from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Firecrawl single-page scrape configuration
+# ---------------------------------------------------------------------------
+# Resolution sources are scraped with Firecrawl FIRST (its rendering handles
+# JS-heavy and PDF sources well); the local Crawl4AI basic crawl is the
+# fallback. See _scrape_resolution_url for the ordering and fallback rules.
+_FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v2/scrape"
+# onlyMainContent=True lets Firecrawl strip nav/header/footer chrome at the DOM
+# level. Flip to False if a resolution miss ever traces back to a dropped
+# sidebar/widget stat (e.g. a bare "Predictions 3,903,957" count).
+_FIRECRAWL_ONLY_MAIN_CONTENT = True
+# Reuse a page scraped within the last hour; resolution values are
+# time-sensitive so we do not want Firecrawl's 2-day default cache.
+_FIRECRAWL_MAX_AGE_MS = 3_600_000
+
+# Substrings in a Firecrawl error/status that mean the key cannot recover this
+# run (out of credits, auth failure). Mirrors research.pipeline's marker set.
+_FIRECRAWL_EXHAUSTION_MARKERS = (
+    "402",
+    "payment required",
+    "401",
+    "unauthorized",
+    "invalid api key",
+    "403",
+    "forbidden",
+    "insufficient",
+    "out of credit",
+    "no credit",
+    "quota",
+    "usage limit",
+)
+
+# Process-level memo: once Firecrawl signals credit/auth exhaustion, every later
+# URL this run skips straight to the Crawl4AI fallback without re-probing.
+_firecrawl_exhausted = False
+
+
+class _FirecrawlCreditError(RuntimeError):
+    """Raised when Firecrawl fails in a way that will not recover this run."""
 
 
 def _get_openrouter_api_key() -> str:
@@ -188,7 +230,12 @@ def _build_resolution_summary_prompt(
         "- Do not search for, identify, request, or recommend additional links.\n"
         "- Do not use external knowledge to fill gaps in the scraped data.\n"
         "- If information is missing, say 'not present in scraped content'.\n"
-        "- Quote exact strings where they are important to the resolution criteria."
+        "- Quote exact strings where they are important to the resolution criteria.\n"
+        "- Summarize by reading for relevance, not to hit a length. Include every "
+        "detail that bears on the resolution criteria, however small — do NOT drop "
+        "or compress resolution-relevant facts to make the summary shorter. The "
+        "only things to leave out are navigation, boilerplate, and content with no "
+        "bearing on the question."
     )
 
 
@@ -267,6 +314,16 @@ def _build_summary_prompt(
     )
 
 
+def _summary_token_cap(num_pages: int) -> int:
+    """Output token budget for the resolution summary, scaled by page count.
+
+    The cap is a guardrail against boilerplate/formatting cruft bloating the
+    summary — it is NOT a compression target. More scraped pages mean more
+    legitimate content to report, so the budget grows with the number of pages.
+    """
+    return min(2000 + 1500 * max(0, num_pages), 8000)
+
+
 async def _llm_summarize(
     url: str,
     content: str,
@@ -274,6 +331,7 @@ async def _llm_summarize(
     resolution_criteria: str,
     model: str,
     key_terms: list[str] | None = None,
+    max_tokens: int = 2000,
 ) -> str:
     """Summarize scraped page content into a structured forecast-ready report.
 
@@ -294,12 +352,12 @@ async def _llm_summarize(
         usage_handle = MonetaryCostManager.start_openrouter_call(
             "resolution-scraper/page-summary",
             model,
-            {"messages": messages, "max_tokens": 2000},
+            {"messages": messages, "max_tokens": max_tokens},
         )
         response = await client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=2000,
+            max_tokens=max_tokens,
             temperature=0.1,
         )
     usage_handle.record_response(response)
@@ -447,77 +505,168 @@ async def _basic_crawl_markdown(url: str, timeout: int) -> str:
     return getattr(markdown, "raw_markdown", None) or str(markdown)
 
 
+def _looks_like_firecrawl_exhaustion(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in _FIRECRAWL_EXHAUSTION_MARKERS)
+
+
+async def _firecrawl_scrape_markdown(url: str, timeout: int) -> str:
+    """Scrape one page with Firecrawl's /v2/scrape endpoint; return raw markdown.
+
+    Single-page only — no crawling or link-following. Raises
+    ``_FirecrawlCreditError`` when the failure is a credit/auth exhaustion (so
+    the caller can stop probing Firecrawl for the rest of the run), and a plain
+    exception on any other failure (so the caller falls back to Crawl4AI for
+    just that URL). Returns "" if the page yielded no markdown.
+    """
+    if not FIRECRAWL_API_KEY:
+        raise _FirecrawlCreditError("Missing FIRECRAWL_API_KEY for Firecrawl scraping.")
+
+    # PDF parsing is enabled by Firecrawl's defaults, so no "parsers" field is
+    # sent (its value is an array of objects, and a malformed field would 400
+    # every scrape and silently route everything to the Crawl4AI fallback).
+    payload = {
+        "url": url,
+        "formats": ["markdown"],
+        "onlyMainContent": _FIRECRAWL_ONLY_MAIN_CONTENT,
+        "maxAge": _FIRECRAWL_MAX_AGE_MS,
+        "timeout": max(1, int(timeout)) * 1000,
+    }
+    # Give the HTTP client a little headroom over Firecrawl's own page timeout.
+    async with httpx.AsyncClient(timeout=max(1, int(timeout)) + 15) as client:
+        response = await client.post(
+            _FIRECRAWL_SCRAPE_URL,
+            headers={
+                "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+
+    if response.status_code in (401, 402, 403, 429):
+        raise _FirecrawlCreditError(
+            f"Firecrawl scrape returned HTTP {response.status_code} for {url}: {response.text[:300]}"
+        )
+    response.raise_for_status()
+
+    body = response.json()
+    if not isinstance(body, dict):
+        raise ValueError(f"Firecrawl scrape response for {url!r} was not a JSON object.")
+    if body.get("success") is False:
+        error = body.get("error") or body.get("message") or body
+        if _looks_like_firecrawl_exhaustion(error):
+            raise _FirecrawlCreditError(f"Firecrawl scrape error for {url!r}: {error}")
+        raise ValueError(f"Firecrawl scrape error for {url!r}: {error}")
+
+    data = body.get("data", body)
+    markdown = ""
+    if isinstance(data, dict):
+        markdown = str(data.get("markdown") or "")
+    return markdown
+
+
 async def _scrape_resolution_url(
     url: str,
     question_text: str,
     resolution_criteria: str,
     timeout: int,
 ) -> _ResolutionScrapeResult:
-    """Scrape one resolution URL with a basic single-page crawl.
+    """Scrape one resolution URL, Firecrawl first with a Crawl4AI fallback.
 
     The resolution source is the page named by the resolution criteria, so the
-    value being resolved is on that page by definition; a basic crawl returns its
-    full markdown for the LLM-cleaning step to read against the criteria. The
-    embedding-filtered adaptive crawler used here previously discarded short,
-    semantically-thin facts (e.g. a bare stat like "Predictions 3,903,957"),
-    returning confidence 0.000 / no content even when the page rendered fine.
-    See tests/test_crawl_basic_vs_adaptive.py for the comparison.
+    value being resolved is on that page by definition; the full page markdown is
+    handed to the LLM-cleaning step to read against the criteria.
+
+    Firecrawl's /v2/scrape is tried first (it renders JS and PDFs well). On a
+    credit/auth exhaustion it is disabled for the rest of the run; on any other
+    Firecrawl failure (timeout, page error, empty result) we fall back to the
+    local Crawl4AI basic crawl for just this URL. The Crawl4AI basic crawl is the
+    historical engine here: the embedding-filtered adaptive crawler previously
+    discarded short, semantically-thin facts (e.g. a bare "Predictions
+    3,903,957"). See tests/test_crawl_basic_vs_adaptive.py for the comparison.
     """
+    global _firecrawl_exhausted
     import source_ledger
 
-    try:
-        from Crawl4AI.crawl import claim_scrape_url
+    from Crawl4AI.crawl import claim_scrape_url
 
-        if claim_scrape_url(url) is not None:
-            source_ledger.record_url_event(
-                url,
-                source_ledger.ROLE_SCRAPED,
-                engine=source_ledger.ENGINE_SKIPPED_DUPLICATE,
-                ok=False,
-                error="skipped duplicate: URL has already been scraped in this process",
-                round_label="single pass",
-            )
-            return _ResolutionScrapeResult(
-                url=url,
-                provider_used="dedupe registry",
-                success=False,
-                error="skipped duplicate: URL has already been scraped in this process",
-            )
-
-        content = _truncate_scrape_content(await _basic_crawl_markdown(url, timeout))
-        result = _ResolutionScrapeResult(
-            url=url,
-            provider_used="crawl4ai-basic",
-            success=bool(content.strip()),
-            content=content,
-            error="" if content.strip() else "Crawl4AI returned no content.",
-        )
+    if claim_scrape_url(url) is not None:
         source_ledger.record_url_event(
             url,
             source_ledger.ROLE_SCRAPED,
-            engine=source_ledger.ENGINE_CRAWL4AI_BASIC,
-            ok=result.success,
-            error=result.error,
-            chars=len(content),
-            round_label="single pass",
-        )
-        return result
-    except HardLimitExceededError:
-        raise
-    except Exception as exc:
-        source_ledger.record_url_event(
-            url,
-            source_ledger.ROLE_SCRAPED,
-            engine=source_ledger.ENGINE_CRAWL4AI_BASIC,
+            engine=source_ledger.ENGINE_SKIPPED_DUPLICATE,
             ok=False,
-            error=f"{type(exc).__name__}: {exc}",
+            error="skipped duplicate: URL has already been scraped in this process",
             round_label="single pass",
         )
         return _ResolutionScrapeResult(
             url=url,
-            provider_used="crawl4ai-basic",
+            provider_used="dedupe registry",
             success=False,
-            error=f"{type(exc).__name__}: {exc}",
+            error="skipped duplicate: URL has already been scraped in this process",
+        )
+
+    def _record_and_return(engine: str, provider: str, content: str, error: str) -> _ResolutionScrapeResult:
+        success = bool(content.strip())
+        source_ledger.record_url_event(
+            url,
+            source_ledger.ROLE_SCRAPED,
+            engine=engine,
+            ok=success,
+            error="" if success else error,
+            chars=len(content),
+            round_label="single pass",
+        )
+        return _ResolutionScrapeResult(
+            url=url,
+            provider_used=provider,
+            success=success,
+            content=content,
+            error="" if success else error,
+        )
+
+    # ------------------------------------------------------------------
+    # 1. Firecrawl single-page scrape (skipped once credits/auth exhausted).
+    # ------------------------------------------------------------------
+    if not _firecrawl_exhausted:
+        try:
+            content = _truncate_scrape_content(await _firecrawl_scrape_markdown(url, timeout))
+            if content.strip():
+                return _record_and_return(
+                    source_ledger.ENGINE_FIRECRAWL, "firecrawl-scrape", content, ""
+                )
+            logger.info("Firecrawl returned no content for %s; falling back to Crawl4AI.", url)
+        except _FirecrawlCreditError as exc:
+            _firecrawl_exhausted = True
+            logger.warning(
+                "Firecrawl exhausted (credits/auth) on %s: %s — falling back to "
+                "Crawl4AI for this and all remaining resolution URLs this run.",
+                url, exc,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Firecrawl scrape failed for %s: %s — falling back to Crawl4AI.", url, exc
+            )
+
+    # ------------------------------------------------------------------
+    # 2. Crawl4AI basic crawl fallback.
+    # ------------------------------------------------------------------
+    try:
+        content = _truncate_scrape_content(await _basic_crawl_markdown(url, timeout))
+        return _record_and_return(
+            source_ledger.ENGINE_CRAWL4AI_BASIC,
+            "crawl4ai-basic",
+            content,
+            "Crawl4AI returned no content.",
+        )
+    except HardLimitExceededError:
+        raise
+    except Exception as exc:
+        return _record_and_return(
+            source_ledger.ENGINE_CRAWL4AI_BASIC,
+            "crawl4ai-basic",
+            "",
+            f"{type(exc).__name__}: {exc}",
         )
 
 
@@ -815,6 +964,7 @@ async def scrape_resolution_sources(
                 question_text=question_text,
                 resolution_criteria=resolution_criteria,
                 model=llm_model,
+                max_tokens=_summary_token_cap(len(cleaned_sources)),
             )
             source_lines = "\n".join(f"- {url}" for url, _ in cleaned_sources)
             return (
