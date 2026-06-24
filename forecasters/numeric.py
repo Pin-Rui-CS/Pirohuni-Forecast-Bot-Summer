@@ -427,24 +427,111 @@ def _values_use_millions_against_raw_grid(
     )
 
 
-def grid_for_distribution_units(
-    spec: dict,
+# Component value-axis parameters scale linearly with the outcome unit (so they
+# must be rescaled when converting millions -> raw units). Every other parameter
+# (alpha, df, shape, sigma, a, b, weight) is unitless and left untouched.
+# ``lognormal`` is handled specially because its spread (sigma) is on the log
+# scale: scaling the median by ``s`` is the unit conversion; sigma never moves.
+_VALUE_AXIS_PARAM_KEYS = {
+    "normal": ("mean", "std", "sd"),
+    "skew_normal": ("location", "scale"),
+    "student_t": ("location", "scale"),
+    "truncated_normal": ("mean", "sd", "std", "lo", "hi"),
+    "gamma": ("mean",),
+    "beta": ("lower", "upper"),
+    "uniform": ("lower", "upper"),
+}
+
+# Keys carried alongside a component that are NOT distribution params.
+_COMPONENT_META_KEYS = (
+    "family", "type", "weight", "name", "evidence", "implied_p50", "implied_90ci",
+)
+
+
+def _component_family_and_params(raw: dict) -> tuple[str, dict]:
+    """Pull a component's family name and parameter dict out of a raw model
+    component, whether the params are nested under ``params`` or inlined
+    alongside the family/metadata keys."""
+    family = str(raw.get("family") or raw.get("type") or "").strip()
+    params = raw.get("params")
+    if not isinstance(params, dict):
+        params = {k: v for k, v in raw.items() if k not in _COMPONENT_META_KEYS}
+    return family, params
+
+
+def _rescale_component_params(family: str, params: dict, scale: float) -> dict:
+    """Multiply a component's value-axis parameters by ``scale`` (the unit
+    conversion factor). Unitless shape parameters are preserved exactly."""
+    q = dict(params)
+    if scale == 1.0:
+        return q
+    if family in ("lognormal", "log_normal"):
+        if isinstance(q.get("median"), (int, float)):
+            q["median"] = float(q["median"]) * scale
+        elif isinstance(q.get("mu"), (int, float)):
+            q["mu"] = float(q["mu"]) + float(np.log(scale))
+        return q
+    for key in _VALUE_AXIS_PARAM_KEYS.get(family, ()):
+        if isinstance(q.get(key), (int, float)):
+            q[key] = float(q[key]) * scale
+    return q
+
+
+def _rescale_raw_component(raw: dict, scale: float) -> dict:
+    """Return a copy of a raw model component with its params (and stated
+    diagnostics) converted into canonical raw units. Emits explicit ``family``
+    and ``params`` so downstream guardrails see only canonical units."""
+    if not isinstance(raw, dict) or scale == 1.0:
+        return raw
+    family, params = _component_family_and_params(raw)
+    out = dict(raw)
+    out["family"] = family
+    out["params"] = _rescale_component_params(family, params, scale)
+    # Keep the model's stated p50 / 90% CI in the same (raw) units so the
+    # self-consistency check compares like with like.
+    p50 = raw.get("implied_p50")
+    if isinstance(p50, (int, float)):
+        out["implied_p50"] = float(p50) * scale
+    ci = raw.get("implied_90ci")
+    if (
+        isinstance(ci, (list, tuple))
+        and len(ci) == 2
+        and all(isinstance(v, (int, float)) for v in ci)
+    ):
+        out["implied_90ci"] = [float(ci[0]) * scale, float(ci[1]) * scale]
+    return out
+
+
+def detect_component_unit_scale(
+    components: list,
     raw_grid: np.ndarray,
     *,
     open_upper_bound: bool,
     open_lower_bound: bool,
-) -> tuple[np.ndarray, str]:
+) -> float:
+    """Detect the unit-conversion factor between the model's components and the
+    Metaculus grid. Returns 1e6 when the model expressed the quantity in
+    millions against a raw-unit grid, else 1.0.
+
+    Detection runs on the raw components BEFORE any guardrail so that unit
+    normalisation and the width floor always operate in the same units (the
+    raw question units)."""
+    value_axis_params: list[float] = []
+    for raw in components:
+        if not isinstance(raw, dict):
+            continue
+        family, params = _component_family_and_params(raw)
+        value_axis_params.extend(
+            _distribution_location_values({"type": family, "params": params})
+        )
     if _values_use_millions_against_raw_grid(
-        _distribution_location_values(spec),
+        value_axis_params,
         raw_grid,
         open_upper_bound=open_upper_bound,
         open_lower_bound=open_lower_bound,
     ):
-        return (
-            raw_grid / 1_000_000,
-            "Metaculus grid appears to be raw units; distribution parameters appear to be in millions. Evaluating CDF on x/1,000,000.",
-        )
-    return raw_grid, "Metaculus grid and distribution parameters appear to use the same units."
+        return 1_000_000.0
+    return 1.0
 
 
 def spec_to_cdf(spec: dict, grid: np.ndarray) -> list[float]:
@@ -1226,14 +1313,7 @@ def build_mixture_spec_from_components(
         if not isinstance(raw, dict):
             notes.append("dropped a component that was not an object")
             continue
-        family = str(raw.get("family") or raw.get("type") or "").strip()
-        params = raw.get("params")
-        if not isinstance(params, dict):
-            params = {
-                k: v for k, v in raw.items()
-                if k not in ("family", "type", "weight", "name", "evidence",
-                             "implied_p50", "implied_90ci")
-            }
+        family, params = _component_family_and_params(raw)
         try:
             weight = float(raw.get("weight", 1.0))
         except (TypeError, ValueError):
@@ -1516,7 +1596,32 @@ def numeric_response_to_raw_cdf(
         return raw_cdf, parsed, reasoning, "PMF over outcome values; no unit conversion applied.", False
 
     # Mixture of smooth families (a single family is a 1-component mixture).
-    spec, notes = build_mixture_spec_from_components(parsed["components"], geometry)
+    #
+    # Normalise units BEFORE any guardrail runs. The model often expresses a
+    # money/population quantity in millions while the Metaculus grid is in raw
+    # units; detect that up front and rescale every component into canonical
+    # raw units. This keeps the width floor (derived from the raw question
+    # range) and the component parameters in the SAME units, so the floor can
+    # never be applied across a unit mismatch. The CDF is then evaluated on the
+    # raw grid directly — no later x/1e6 step.
+    unit_scale = detect_component_unit_scale(
+        parsed["components"],
+        grid,
+        open_upper_bound=open_upper_bound,
+        open_lower_bound=open_lower_bound,
+    )
+    if unit_scale != 1.0:
+        components = [_rescale_raw_component(c, unit_scale) for c in parsed["components"]]
+        unit_note = (
+            "Metaculus grid appears to be raw units; distribution parameters "
+            "appeared to be in millions. Rescaled component parameters "
+            "x1,000,000 into raw units before applying guardrails."
+        )
+    else:
+        components = parsed["components"]
+        unit_note = "Metaculus grid and distribution parameters appear to use the same units."
+
+    spec, notes = build_mixture_spec_from_components(components, geometry)
     used_fallback = spec is None
     if spec is None:
         spec = _fallback_mixture_spec(geometry)
@@ -1526,13 +1631,7 @@ def numeric_response_to_raw_cdf(
         logger.warning(
             "sanity check warning: discrete question used a continuous mixture; prefer pmf."
         )
-    eval_grid, unit_note = grid_for_distribution_units(
-        spec,
-        grid,
-        open_upper_bound=open_upper_bound,
-        open_lower_bound=open_lower_bound,
-    )
-    raw_cdf = np.asarray(spec_to_cdf(spec, eval_grid))
+    raw_cdf = np.asarray(spec_to_cdf(spec, grid))
     if notes:
         unit_note = unit_note + " | guardrails: " + "; ".join(notes)
     return raw_cdf, parsed, reasoning, unit_note, used_fallback
@@ -1648,13 +1747,10 @@ async def get_numeric_gpt_prediction(
             "all %d numeric run(s) failed for %r; submitting a broad-normal fallback.",
             len(runs), title,
         )
+        # The fallback spec is built from the raw question bounds, so it is
+        # already in canonical raw units — evaluate it directly on the grid.
         fallback_spec = _fallback_mixture_spec(geometry)
-        eval_grid, _ = grid_for_distribution_units(
-            fallback_spec, grid,
-            open_upper_bound=geometry["open_upper_bound"],
-            open_lower_bound=geometry["open_lower_bound"],
-        )
-        raw_cdfs.append(np.asarray(spec_to_cdf(fallback_spec, eval_grid)))
+        raw_cdfs.append(np.asarray(spec_to_cdf(fallback_spec, grid)))
         run_values.append({"kind": "mixture", "spec": fallback_spec})
         comments.append("All runs failed to parse; using a broad-normal fallback.")
 
