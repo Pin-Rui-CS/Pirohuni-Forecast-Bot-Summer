@@ -660,28 +660,63 @@ def log_numeric_cdf_sanity_checks(
             )
 
 
+def _format_outcome_value(value: float, step: float) -> str:
+    """Render an outcome value with only as many decimals as the bin step needs
+    (integers for count questions, e.g. 0.1-spaced values for fine grids)."""
+    if abs(step - round(step)) < 1e-9 and abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    decimals = max(0, min(6, -int(np.floor(np.log10(step))) + 1))
+    return f"{value:.{decimals}f}"
+
+
 def distribution_guidance_for_question(
     question_type: str,
     lower_bound: float,
     upper_bound: float,
-    cdf_size: int,
+    outcome_count: int,
+    step: float,
+    use_pmf: bool,
     open_upper_bound: bool,
 ) -> tuple[str, str]:
-    """Return (header_guidance, final_output_pmf_note) for the prompt."""
+    """Return (header_guidance, final_output_pmf_note) for the prompt.
+
+    Discrete questions come in two flavours that need different handling:
+    - count questions (small number of integer-spaced outcomes) are best
+      expressed as a native PMF over those outcomes;
+    - fine-resolution discrete questions (many sub-integer bins, e.g. a
+      percentage reported to 0.1) are a continuum in disguise — a PMF over
+      enumerated bins collapses into spikes, so we steer the model to the
+      smooth ``components`` form instead. ``use_pmf`` encodes that choice.
+    """
     if question_type != "discrete":
         return "", ""
 
-    grid = np.linspace(lower_bound, upper_bound, cdf_size)
-    outcome_values = [int(round(value + 0.5)) for value in grid[:-1]]
+    # Bin centres at the true spacing (NOT assuming unit-width integer bins).
+    outcome_values = [lower_bound + (i + 0.5) * step for i in range(outcome_count)]
     if open_upper_bound and outcome_values:
-        tail_label = f"{outcome_values[-1] + 1}+"
+        tail_label = f"{_format_outcome_value(outcome_values[-1] + step, step)}+"
     else:
         tail_label = ""
-    value_text = ", ".join(str(value) for value in outcome_values[:20])
+    value_text = ", ".join(
+        _format_outcome_value(value, step) for value in outcome_values[:20]
+    )
     if len(outcome_values) > 20:
         value_text += ", ..."
     if tail_label:
         value_text += f", {tail_label}"
+
+    if not use_pmf:
+        # Fine-resolution discrete: render as a continuous distribution. No PMF
+        # note, so the model returns smooth mixture components that evaluate to
+        # a continuous CDF on the discrete grid instead of point-mass spikes.
+        header = (
+            "\nDiscrete (fine-resolution) guidance: the outcome is reported in steps "
+            f"of {_format_outcome_value(step, step)} between {lower_bound:g} and "
+            f"{upper_bound:g} ({outcome_count} possible values). Treat this as a "
+            "continuous quantity and express it with the smooth `components` form; "
+            "do NOT enumerate per-value probabilities."
+        )
+        return header, ""
 
     header = (
         "\nDiscrete/count guidance: this is a discrete question over outcome values "
@@ -1498,11 +1533,13 @@ def quantile_average_cdfs(cdfs: list[np.ndarray]) -> np.ndarray:
     return average_lower + (1.0 - average_lower - average_upper) * average_conditional
 
 
-def aggregate_run_cdfs(cdfs: list[np.ndarray], question_type: str) -> np.ndarray:
-    """Discrete questions average PMFs (natural for point masses); continuous
-    questions average quantiles to preserve per-run spread."""
+def aggregate_run_cdfs(cdfs: list[np.ndarray], use_pmf: bool) -> np.ndarray:
+    """Count questions (true PMFs over a handful of point masses) average in
+    PMF space; everything else — including fine-resolution discrete questions
+    rendered as smooth distributions — averages quantiles to preserve per-run
+    spread instead of flattening the consensus."""
     arrays = [np.asarray(cdf, dtype=float) for cdf in cdfs]
-    if question_type == "discrete":
+    if use_pmf:
         all_pmfs = np.diff(np.stack(arrays), prepend=0.0, axis=1)
         mean_pmf = np.mean(all_pmfs, axis=0)
         return np.clip(np.cumsum(mean_pmf), 0.0, 1.0)
@@ -1512,6 +1549,32 @@ def aggregate_run_cdfs(cdfs: list[np.ndarray], question_type: str) -> np.ndarray
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
+# A discrete question with more inbound outcomes than this is treated as a
+# continuum (smooth mixture) rather than an enumerated PMF: beyond a few dozen
+# bins a per-value PMF both overwhelms the model and renders as point-mass
+# spikes on the submission grid instead of a continuous curve. Tunable.
+MAX_PMF_OUTCOMES = 30
+
+
+def _discrete_outcome_count(
+    scaling: dict, lower_bound: float, upper_bound: float
+) -> int:
+    """Number of inbound outcomes for a discrete question, from the most
+    reliable source available. Prefer Metaculus's explicit count; then the
+    length of the supplied grid; only then fall back to the integer span.
+
+    The integer-span fallback assumes unit-width bins, so it is a last resort:
+    using it for a sub-integer grid yields the wrong ``cdf_size`` and therefore
+    the wrong number of submitted points."""
+    count = scaling.get("inbound_outcome_count")
+    if isinstance(count, int) and count > 0:
+        return count
+    continuous_range = scaling.get("continuous_range")
+    if isinstance(continuous_range, (list, tuple)) and len(continuous_range) >= 2:
+        return len(continuous_range) - 1
+    return max(1, int(round(upper_bound - lower_bound)))
+
 
 def build_numeric_prompt(question_details: dict, summary_report: str) -> tuple[str, dict]:
     """Return (prompt, question_geometry) for a numeric/discrete question."""
@@ -1525,10 +1588,18 @@ def build_numeric_prompt(question_details: dict, summary_report: str) -> tuple[s
     lower_bound = scaling["range_min"]
     zero_point = scaling.get("zero_point")
     if question_type == "discrete":
-        outcome_count = scaling.get("inbound_outcome_count") or int(upper_bound - lower_bound)
+        outcome_count = _discrete_outcome_count(scaling, lower_bound, upper_bound)
         cdf_size = outcome_count + 1
+        step = (upper_bound - lower_bound) / outcome_count
+        # Small, integer-spaced grids are genuine count questions and read best
+        # as a native PMF; finer grids are a continuum in disguise and must be
+        # rendered as a smooth distribution to avoid point-mass spikes.
+        use_pmf = outcome_count <= MAX_PMF_OUTCOMES
     else:
         cdf_size = 201
+        outcome_count = cdf_size - 1
+        step = (upper_bound - lower_bound) / outcome_count
+        use_pmf = False
 
     if open_upper_bound:
         upper_bound_message = ""
@@ -1543,7 +1614,9 @@ def build_numeric_prompt(question_details: dict, summary_report: str) -> tuple[s
         question_type=question_type,
         lower_bound=lower_bound,
         upper_bound=upper_bound,
-        cdf_size=cdf_size,
+        outcome_count=outcome_count,
+        step=step,
+        use_pmf=use_pmf,
         open_upper_bound=open_upper_bound,
     )
 
@@ -1568,6 +1641,9 @@ def build_numeric_prompt(question_details: dict, summary_report: str) -> tuple[s
         "open_lower_bound": open_lower_bound,
         "open_upper_bound": open_upper_bound,
         "cdf_size": cdf_size,
+        "outcome_count": outcome_count,
+        "step": step,
+        "use_pmf": use_pmf,
     }
     return prompt, geometry
 
@@ -1593,6 +1669,20 @@ def numeric_response_to_raw_cdf(
         spec = {"type": "pmf", "params": parsed["pmf"]}
         raw_cdf = np.asarray(pmf_spec_to_cdf(spec, grid))
         parsed["spec"] = spec
+        # Guard against the staircase failure: a PMF whose distinct values are
+        # far coarser than the grid resolution produces point-mass spikes
+        # instead of a continuous curve. Expected for true count questions
+        # (use_pmf), a bug for fine-resolution discrete grids.
+        if not geometry.get("use_pmf", True):
+            values, _ = _parse_pmf_params(parsed["pmf"])
+            outcome_count = geometry.get("outcome_count") or len(grid)
+            if len(set(values)) * 3 < outcome_count:
+                logger.warning(
+                    "sanity check warning: fine-resolution discrete question got a "
+                    "coarse PMF (%d distinct values over %d grid bins); this renders "
+                    "as point-mass spikes, not a continuous curve.",
+                    len(set(values)), outcome_count,
+                )
         return raw_cdf, parsed, reasoning, "PMF over outcome values; no unit conversion applied.", False
 
     # Mixture of smooth families (a single family is a 1-component mixture).
@@ -1627,9 +1717,11 @@ def numeric_response_to_raw_cdf(
         spec = _fallback_mixture_spec(geometry)
         notes = notes + ["all components invalid; fell back to a broad normal"]
     parsed["spec"] = spec
-    if question_type == "discrete":
+    if question_type == "discrete" and geometry.get("use_pmf", True):
+        # Only a concern for genuine count questions; fine-resolution discrete
+        # questions are expected to use a continuous mixture by design.
         logger.warning(
-            "sanity check warning: discrete question used a continuous mixture; prefer pmf."
+            "sanity check warning: count question used a continuous mixture; prefer pmf."
         )
     raw_cdf = np.asarray(spec_to_cdf(spec, grid))
     if notes:
@@ -1754,7 +1846,7 @@ async def get_numeric_gpt_prediction(
         run_values.append({"kind": "mixture", "spec": fallback_spec})
         comments.append("All runs failed to parse; using a broad-normal fallback.")
 
-    aggregated = aggregate_run_cdfs(raw_cdfs, geometry["question_type"])
+    aggregated = aggregate_run_cdfs(raw_cdfs, geometry["use_pmf"])
 
     standardizer = NumericDistribution(
         declared_percentiles=[
@@ -1779,6 +1871,14 @@ async def get_numeric_gpt_prediction(
         strict_validation=False,
     )
     final_cdf: list[float] = standardizer._standardize_cdf(aggregated.tolist())
+    # The number of submitted points must equal the question's grid size
+    # (inbound_outcome_count + 1 for discrete, 201 for numeric). Fail loudly
+    # rather than post a wrong-length CDF that Metaculus would reject.
+    if len(final_cdf) != geometry["cdf_size"]:
+        raise ValueError(
+            f"final CDF has {len(final_cdf)} points but the question grid "
+            f"expects {geometry['cdf_size']}; refusing to submit."
+        )
     logger.info("aggregated from %d run(s)", len(raw_cdfs))
     log_cdf_summary("final standardized distribution summary:", final_cdf)
 
