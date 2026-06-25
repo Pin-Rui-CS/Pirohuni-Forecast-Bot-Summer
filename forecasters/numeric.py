@@ -24,6 +24,7 @@ Discipline rules that apply to every phase:
 - The research material labels evidence items with IDs like [E1], [E2]. Every shift of your central estimate or your interval must cite the specific evidence item(s) that justify it. A shift with no citable evidence must be small and explicitly labelled as judgment.
 - Keep arithmetic simple and show it in-line. State the data values you use explicitly. Do not perform calculations you cannot show.
 - If the Required Artifact Status says the key evidence is missing or partial, your final 90% interval must be meaningfully wider than it would be with the artifact in hand. Say so explicitly. Do not fill gaps with invented certainty.
+- Avoid double-counting correlated evidence. Items tracing to the same source, event, or announcement are largely one signal — corroboration of reliability, not additive weight — so update for them roughly once, and do not re-apply a fact in both the base rate and an inside-view update. Genuinely independent lines of evidence that happen to agree DO each add weight; the caution is against inflating one signal into many, not against real confirmation.
 
 ---
 

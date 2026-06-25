@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 ProviderResult = tuple[str, str]
 
-_DEFAULT_MODEL = "anthropic/claude-sonnet-4.6"
+_DEFAULT_MODEL = "anthropic/claude-opus-4.8"
 _MAX_PROVIDER_CHARS = 24_000
 _MAX_COMPILER_INPUT_CHARS = 60_000
 _MAX_ARTICLE_BODY_CHARS = 2_400
@@ -374,8 +374,8 @@ async def _try_llm_compile(
         {
             "role": "system",
             "content": (
-                "You are a research compiler for a forecasting bot. You distill raw "
-                "research into a short, ranked evidence table. You select only "
+                "You are a research compiler for a forecasting bot. You filter raw "
+                "research into a detailed evidence showcase. You select only "
                 "decision-relevant items, keep exact values, dates, source names, "
                 "and URLs, collapse syndicated duplicates into one item, and never "
                 "estimate probabilities or invent facts."
@@ -482,7 +482,7 @@ the forecast, never to stand in for the resolution value):
 {research_text}
 
 Task:
-Distill the raw research into a compact evidence brief for a forecaster. Select
+Distill the raw research into a detailed evidence brief for a forecaster. Select
 only what could plausibly change the forecast. Drop filler, vivid color, and
 broad commentary that does not bear on the resolution criteria.
 
@@ -506,9 +506,9 @@ Output exactly these Markdown sections:
 - If the automated check lists a "Closest available adjacent metric", reproduce it here and carry it into Key Evidence as an `adjacent-metric` item. Never omit a value that was actually retrieved just because it is not the exact metric.
 
 ## Key Evidence
-A ranked list of at most 15 items, most decision-relevant first. Format each item as:
+A list of at most 15 items. Do NOT sort by relevance — order does not matter, and the [E#] labels are just citation handles, not a priority ranking. Format each item as:
 [E1] (tier) Claim with exact numbers and dates. — Source name, publish date, URL
-- RANK BY DECISION-RELEVANCE. The most decision-relevant items, which must appear and rank near the top whenever the research supports them, are: (1) the RULE or MECHANISM that governs how the resolution value changes over time — eligibility criteria, recovery/transition conditions, the clock or event that triggers a change, a reaction function, a scheduled decision; and (2) the CURRENT VALUE of each input that rule depends on (including the date that starts the clock, not just the date a change was announced). A precise figure that does not feed this mechanism is background color, however exact. When a number's relevance hinges on a condition (a confounder that speeds or slows the mechanism), keep the condition with the number.
+- SELECT BY DECISION-RELEVANCE (this governs which items make the list, not their order). The items that must appear whenever the research supports them are: (1) the RULE or MECHANISM that governs how the resolution value changes over time — eligibility criteria, recovery/transition conditions, the clock or event that triggers a change, a reaction function, a scheduled decision; and (2) the CURRENT VALUE of each input that rule depends on (including the date that starts the clock, not just the date a change was announced). A precise figure that does not feed this mechanism is background color, however exact. When a number's relevance hinges on a condition (a confounder that speeds or slows the mechanism), keep the condition with the number.
 - tier is one of: direct (measures the resolution target itself, from the resolution source or confirmed equal to it), adjacent-metric (same family but a different basis/series; state the relationship and any conversion toward the target), near-proxy (close but not identical; say in a few words why not identical), market (prediction-market signal).
 - Every item must carry the observation date/period of its value. If a value's date cannot be tied to the period the question asks about, append "(date unverified)" and do NOT label it `direct` — a value reported by a single article without a confirmable current date is not direct evidence.
 - Keep exact values, dates, counts, and odds. Never round away precision present in the source.

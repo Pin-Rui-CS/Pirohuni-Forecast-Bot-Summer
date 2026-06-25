@@ -23,7 +23,7 @@ def _env_list(name: str, default: list[str]) -> list[str]:
     return items or default
 
 
-NUM_RUNS_PER_QUESTION = 4
+NUM_RUNS_PER_QUESTION = 3
 
 # --- Forecaster ensemble -----------------------------------------------------
 # The per-question forecast runs are spread across an ensemble of models, mapped
@@ -53,7 +53,7 @@ FORECASTER_MODELS = _env_list(
 FORECASTER_TIEBREAKER_MODEL = os.getenv(
     "FORECASTER_TIEBREAKER_MODEL", DEFAULT_FORECASTER_MODEL
 )
-SKIP_PREVIOUSLY_FORECASTED_QUESTIONS = True
+SKIP_PREVIOUSLY_FORECASTED_QUESTIONS = False
 METACULUS_MAX_CONCURRENT_REQUESTS = int(os.getenv("METACULUS_MAX_CONCURRENT_REQUESTS", "1"))
 METACULUS_API_RATE_LIMITER = asyncio.Semaphore(METACULUS_MAX_CONCURRENT_REQUESTS)
 METACULUS_REQUEST_INTERVAL = float(os.getenv("METACULUS_REQUEST_INTERVAL", "3.0"))

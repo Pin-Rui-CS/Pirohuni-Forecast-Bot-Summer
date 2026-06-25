@@ -25,6 +25,7 @@ Discipline rules that apply to every phase:
   - Contingent / current facts (vote counts, schedules, who has committed, current status): do NOT guess — treat as genuinely unknown.
   - Stable institutional, legal, or procedural facts (how an established process works, fixed rules, well-documented precedent): you MAY resolve these from your own established knowledge. Label such reasoning "[from background knowledge]" so it is auditable, and reason from it rather than leaving it "unresolved".
   A partial artifact means WIDEN — it does NOT mean default to the nearest prediction market or refuse to apply knowledge you reliably hold.
+- Avoid double-counting correlated evidence. Items tracing to the same source, event, or announcement are largely one signal — corroboration of reliability, not additive weight — so update for them roughly once, and do not re-apply a fact in both the base rate and an inside-view update. Genuinely independent lines of evidence that happen to agree DO each add weight; the caution is against inflating one signal into many, not against real confirmation.
 
 ---
 
