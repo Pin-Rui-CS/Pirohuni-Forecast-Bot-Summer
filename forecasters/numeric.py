@@ -1550,11 +1550,22 @@ def aggregate_run_cdfs(cdfs: list[np.ndarray], use_pmf: bool) -> np.ndarray:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-# A discrete question with more inbound outcomes than this is treated as a
-# continuum (smooth mixture) rather than an enumerated PMF: beyond a few dozen
-# bins a per-value PMF both overwhelms the model and renders as point-mass
-# spikes on the submission grid instead of a continuous curve. Tunable.
+# Fine-resolution (sub-integer step) discrete questions with more outcomes than
+# this are treated as a continuum (smooth mixture): the model cannot enumerate
+# hundreds of sub-integer values, so a sparse PMF would render as point-mass
+# spikes (the "staircase"). Tunable.
 MAX_PMF_OUTCOMES = 30
+
+# Genuine integer-count questions (step == 1) use the native PMF up to this many
+# outcomes regardless of MAX_PMF_OUTCOMES. A PMF over integers can never
+# staircase here (the submission grid step always equals the outcome step), and
+# it tapers cleanly at the bounds. The continuous path, by contrast, sets
+# cdf[0] = CDF(lower_bound), which collapses the ENTIRE lower tail of a smooth
+# family into the single `<lower` cell — a tall boundary spike whenever the
+# median sits within a few sigma of an open bound (e.g. a rig count near 559 on
+# an open floor of 550). The cap keeps the enumeration burden sane; wider counts
+# fall back to continuous, where the median is usually far from either bound.
+MAX_PMF_INTEGER_OUTCOMES = 100
 
 
 def _discrete_outcome_count(
@@ -1591,10 +1602,18 @@ def build_numeric_prompt(question_details: dict, summary_report: str) -> tuple[s
         outcome_count = _discrete_outcome_count(scaling, lower_bound, upper_bound)
         cdf_size = outcome_count + 1
         step = (upper_bound - lower_bound) / outcome_count
-        # Small, integer-spaced grids are genuine count questions and read best
-        # as a native PMF; finer grids are a continuum in disguise and must be
-        # rendered as a smooth distribution to avoid point-mass spikes.
-        use_pmf = outcome_count <= MAX_PMF_OUTCOMES
+        # Genuine integer-count questions (step == 1) read best as a native PMF:
+        # it tapers cleanly at the bounds and never staircases. Fine-resolution
+        # (sub-integer step) grids are a continuum in disguise — a sparse PMF
+        # over many values would spike, so steer those to the smooth mixture.
+        # The continuous path collapses a smooth family's whole lower tail into
+        # the first cell (cdf[0] = CDF(lower)), so an integer count whose median
+        # sits near an open bound must stay on the PMF path to avoid a spurious
+        # boundary spike.
+        step_is_integer = abs(step - round(step)) < 1e-9
+        use_pmf = outcome_count <= MAX_PMF_OUTCOMES or (
+            step_is_integer and outcome_count <= MAX_PMF_INTEGER_OUTCOMES
+        )
     else:
         cdf_size = 201
         outcome_count = cdf_size - 1

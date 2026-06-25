@@ -7,6 +7,60 @@ re-deriving the same diagnosis twice — read this before touching the forecasti
 
 ---
 
+## 2026-06-26 — Integer-count questions routed to the continuous path spike at an open bound
+
+| | |
+|---|---|
+| **Severity** | Medium — wrong-shaped distribution submitted; a tall spurious bar at the open bound |
+| **Introduced** | 2026-06-25, commit `781487b` ("converting fine grained qns into continuous preds") |
+| **Detected** | 2026-06-26 — "active US drilling rigs, week ending 2026-07-31" (discrete, 40 integer outcomes, 550–590, open lower bound) |
+| **Diagnosed & fixed** | 2026-06-26 (`forecasters/numeric.py`) |
+| **Affected window** | Any `discrete` integer-count question with 31–200 inbound outcomes whose median sits within a few sigma of an open bound, forecast on/after 2026-06-25 |
+
+### Symptom
+The submitted distribution had a tall, sharp bar at the leftmost `<550` cell
+(~12% of the mass) instead of tapering cleanly, even though the forecast was
+median 559 with a 25–75% range of 554–564. The body of the distribution was a
+smooth hump; only the open-bound end was "not clean."
+
+### Root cause
+`781487b` added `MAX_PMF_OUTCOMES = 30`, routing any discrete question with more
+than 30 outcomes to the **continuous mixture** path. The rig question has 40
+integer outcomes, so it switched from the per-integer **PMF** path to a smooth
+family. `spec_to_cdf` sets `raw_cdf[0] = CDF(lower_bound)`, so a normal(559, ≈7.4)
+(σ implied by the 554–564 IQR) puts `Φ((550−559)/7.4) ≈ 11%` of its mass at or
+below 550. With an **open** lower bound the standardiser keeps that mass, and
+Metaculus collapses the entire sub-bound tail into the single `<550` bar → spike.
+The math was faithful; the representation was wrong. A PMF over the integers
+assigns only the *point* mass at 550 (~3%) and tapers cleanly — no tail collapse.
+
+The 30-cutoff was added to stop the earlier "staircase" (2026-06-24), but that
+staircase was actually caused by the buggy integer outcome *labels*, which the
+same commit fixed independently. For a `discrete` question the submission grid
+step always equals the outcome step, so a correctly-labelled PMF can never
+staircase — the continuous routing was unnecessary for integer counts and
+reintroduced boundary-pileup, the older "ends not clean" failure class.
+
+### The fix (`forecasters/numeric.py`)
+- Added `MAX_PMF_INTEGER_OUTCOMES = 100`. `use_pmf` is now true when
+  `outcome_count <= MAX_PMF_OUTCOMES` **or** the outcomes are integer-spaced
+  (`step == 1`) and `outcome_count <= MAX_PMF_INTEGER_OUTCOMES`.
+- Genuine integer counts (rig question: 40) → PMF: clean taper, no spike.
+- Fine-resolution continua (Trump approval: 121 outcomes @ 0.1) → still
+  continuous: the staircase fix is preserved.
+- Very wide integer counts (>100) → continuous: too many to enumerate, and the
+  median is normally far from either bound so no spike.
+
+### Lessons
+- The right PMF-vs-continuous signal is **step size** (integer count vs
+  sub-integer continuum), not raw outcome count.
+- The continuous path's `cdf[0] = CDF(lower)` makes any smooth family pile its
+  whole lower tail into one cell at an open bound — fine when the median is far
+  from the bound, a visible spike when it is close. Check the rendered end
+  shape, not just the point count.
+
+---
+
 ## 2026-06-25 — Extract stage launders the ranker's pre-scrape "purpose" guess into stated facts (fabricated dates/values)
 
 | | |
