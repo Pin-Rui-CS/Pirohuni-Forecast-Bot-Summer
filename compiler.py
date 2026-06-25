@@ -486,14 +486,23 @@ Distill the raw research into a compact evidence brief for a forecaster. Select
 only what could plausibly change the forecast. Drop filler, vivid color, and
 broad commentary that does not bear on the resolution criteria.
 
+Consistency check (do this before selecting evidence). Cross-check the retrieved
+items against each other and against the resolution source. Flag every failure in
+"Gaps And Cautions" and never label a failing item `direct`:
+- Same value, two dates: if an identical figure is attributed to two different periods (e.g. the same number reported for both 2025 and 2026), at least one date is wrong or it is one stale item double-counted — flag it and treat neither as confirmed current data.
+- Contradicts the resolution series: if a figure conflicts with the resolution source's own table (a "latest" reading the resolution source does not show, or one out of order with its trajectory), trust the resolution source and flag the outlier.
+- Impossible superlative: if a claim like "N-month high/low" is inconsistent with the values in the extracted series, flag it.
+- Wrong-era drivers: if the reasons given for a supposedly current datapoint describe events from a different period, treat that datapoint's date as suspect.
+
 Output exactly these Markdown sections:
 
 # Compiled Research Brief
 
-## Required Artifact Status
+## Extracted Artifact Rows
 - Name the artifact the Evidence Plan says is most important.
-- COPY the status verdict from the "Automated check" above verbatim (found completely / found partially / not found). You MUST NOT upgrade or contradict it: if the check says partial or missing, never write "found" or "is present", and never present a secondary or year-ago figure as if it were the confirmed resolution value.
-- If it is a table or time series and any rows were extracted, reproduce those rows here verbatim. This is the single most important section.
+- Do NOT write a found / partial / not-found verdict here — the authoritative artifact status is shown to the forecaster in a separate fixed banner above this brief. This section is only for the data itself.
+- If it is a table or time series and any rows were extracted, reproduce those rows here verbatim, and mark the resolution-target row as "not yet released" when the resolution source does not show it. This is the single most important section.
+- Never present a secondary or year-ago figure as if it were the confirmed resolution value.
 - If the automated check lists a "Closest available adjacent metric", reproduce it here and carry it into Key Evidence as an `adjacent-metric` item. Never omit a value that was actually retrieved just because it is not the exact metric.
 
 ## Key Evidence
@@ -553,13 +562,11 @@ def _build_heuristic_report(
         and "resolution" not in provider.lower()
     ]
 
+    # The authoritative artifact status is injected as a fixed banner by the
+    # pipeline (_apply_artifact_status_banner) on both the LLM and heuristic paths,
+    # so this fallback report does not emit its own status section (avoids a
+    # duplicate block).
     lines = ["# Compiled Research Brief", ""]
-    if artifact_check:
-        lines += [
-            "## Required Artifact Status",
-            _format_artifact_check(artifact_check),
-            "",
-        ]
     lines += ["## Key Facts And Evidence"]
     if key_evidence:
         lines.extend(f"- {item}" for item in key_evidence)

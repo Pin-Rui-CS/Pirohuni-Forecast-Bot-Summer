@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import datetime
 import json
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -190,6 +191,7 @@ async def build_serp_research_result(
         groups=ranked_url_groups,
         max_cycles=max_scrape_cycles,
         model=extract_model,
+        url_dates=build_url_date_map((r.link, r.date) for r in organic_results),
     )
     return SerpResearchResult(
         queries=queries,
@@ -283,6 +285,7 @@ async def run_scrape_cycles(
     groups: list[RankedSerpUrlGroup],
     max_cycles: int = DEFAULT_MAX_SCRAPE_CYCLES,
     model: str = DEFAULT_EXTRACT_MODEL,
+    url_dates: dict[str, str] | None = None,
 ) -> list[Cycle]:
     if not groups or max_cycles < 1:
         return []
@@ -314,6 +317,7 @@ async def run_scrape_cycles(
             cycles=[*cycles, Cycle(cycle_no, scrapes, "", [])],
             previous_report=report,
             model=model,
+            url_dates=url_dates,
         )
         valid_names = {group.group for group in groups}
         lack = [name for name in lack if name in valid_names]
@@ -334,6 +338,7 @@ async def extract_serp_research(
     cycles: list[Cycle],
     previous_report: str,
     model: str = DEFAULT_EXTRACT_MODEL,
+    url_dates: dict[str, str] | None = None,
 ) -> tuple[str, list[str]]:
     prompt = _build_extract_prompt(
         title=title,
@@ -343,6 +348,7 @@ async def extract_serp_research(
         groups=groups,
         cycles=cycles,
         previous_report=previous_report,
+        url_dates=url_dates,
     )
     response = await call_llm(
         prompt,
@@ -789,18 +795,22 @@ def _build_extract_prompt(
     groups: list[RankedSerpUrlGroup],
     cycles: list[Cycle],
     previous_report: str,
+    url_dates: dict[str, str] | None = None,
 ) -> str:
     group_lines = "\n".join(
         f"- {group.group}: {group.group_purpose}"
         for group in groups
     )
     prompt_cycles = cycles[-1:] if previous_report else cycles
-    scrape_text = _format_scrapes_for_prompt(prompt_cycles)
+    scrape_text = _format_scrapes_for_prompt(prompt_cycles, url_dates)
     scrape_text = _truncate_text(scrape_text, _MAX_EXTRACT_INPUT_CHARS)
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
 
     return f"""
 You are a research assistant compiling scraped web evidence for a forecasting question.
 Do not make a prediction, estimate probabilities, or recommend an answer.
+
+Today's date is {today}.
 
 Forecasting question:
 {title}
@@ -820,6 +830,12 @@ Research categories you may use when requesting more scraping:
 Task:
 - Compile the useful facts from all scrape packets into a clean research report by category.
 - State the actual extracted contents: facts, numbers, dates, names, rules, and quoted/near-quoted source claims.
+
+Ground every statement in the scraped content — never fabricate or add information:
+- Record ONLY what the scraped page content actually states. Do not infer, assume, complete, or "fill in" any fact, value, date, or attribution that is not literally present in that page's content.
+- The "URL purpose" lines are pre-scrape guesses, not evidence. Never lift a fact, number, or date from them.
+- Specifically for dates: never attach a year (or any date) that does not appear in the source itself. To resolve the year of an undated figure, use ONLY the page's "Source publish date" line (shown with each scrape packet) or an explicit in-text date — a figure published in July 2025 describes July 2025, regardless of what the question asks about. If a figure has a month but no year and the Source publish date is "not provided", record it exactly as stated and add "(year not stated in source)". Do NOT assume it refers to {today}'s year or the year the question asks about.
+- If you are tempted to write something the source does not actually say, omit it instead. Missing information must be reported as missing, not inferred.
 - Do not write vague placeholders such as "this link contains information", "the article discusses", or "can be found at this URL" unless you also state the concrete information.
 - Use any relevant information from a URL, even if it goes beyond that URL's intended purpose.
 - Preserve source URLs next to important facts.
@@ -846,17 +862,59 @@ New scrape packets:
 """.strip()
 
 
-def _format_scrapes_for_prompt(cycles: list[Cycle]) -> str:
+def _norm_url(url: str) -> str:
+    """Normalise a URL for date-map matching (drop trailing slash, fragment, case)."""
+    url = (url or "").strip()
+    url = url.split("#", 1)[0]
+    return url.rstrip("/").lower()
+
+
+def build_url_date_map(url_date_pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
+    """Build a normalised {url: publish_date} map from a provider's search results.
+
+    Only results that actually carry a date are included; callers pass whatever
+    their organic-result objects expose (e.g. SerpAPI ``date``, Tavily
+    ``published_date``) so the extractor can date a page from its source instead
+    of inferring the year.
+    """
+    out: dict[str, str] = {}
+    for url, date in url_date_pairs:
+        date = (date or "").strip()
+        if date:
+            out[_norm_url(url)] = date
+    return out
+
+
+def _url_date_lookup(url_dates: dict[str, str] | None, url: str) -> str:
+    if not url_dates:
+        return ""
+    return url_dates.get(url) or url_dates.get(_norm_url(url), "")
+
+
+def _format_scrapes_for_prompt(
+    cycles: list[Cycle], url_dates: dict[str, str] | None = None
+) -> str:
     parts: list[str] = []
     for cycle in cycles:
         parts.append(f"## Cycle {cycle.cycle}")
         for scrape in cycle.scrapes:
+            publish_date = _url_date_lookup(url_dates, scrape.url)
             parts.extend(
                 [
                     f"### Group: {scrape.group}",
                     f"Group purpose: {scrape.group_purpose}",
                     f"URL: {scrape.url}",
-                    f"URL purpose: {scrape.purpose}",
+                    # Real publish date from the search provider's metadata, when
+                    # available — this is the authoritative way to date a page's
+                    # facts (e.g. an article that says "45.2 in July" with no year).
+                    f"Source publish date (from search metadata; use it to date this "
+                    f"page's facts): {publish_date or 'not provided'}",
+                    # `purpose` is the ranker's PRE-SCRAPE guess about what this page
+                    # might contain, written from the search snippet alone — not
+                    # verified against the page. Label it so the extractor never
+                    # promotes its guesses (e.g. an inferred year) to stated facts.
+                    f"URL purpose (pre-scrape guess only — NOT evidence; do not extract "
+                    f"any fact, value, or date from this line): {scrape.purpose}",
                     f"Scrape status: {'ok' if scrape.ok else 'failed'}",
                 ]
             )

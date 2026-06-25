@@ -549,21 +549,24 @@ def _apply_degradation_warning(report: str, degraded_search_providers: list[str]
 def _apply_artifact_status_banner(report: str, artifact_check: dict | None) -> str:
     """Inject the authoritative artifact-status verdict at the top of the brief.
 
-    The forecaster consumes only ``compiled_report``. The compiler LLM is told to
-    copy this verdict, but this deterministic injection guarantees the true status
-    survives even if the LLM upgrades "partial"/"missing" to "found" on its own.
-    Mirrors ``_apply_degradation_warning``; only fires when the resolution target
-    is not confirmed, since that is when forecasters must stay near base rates.
+    The forecaster consumes only ``compiled_report``. This deterministic injection
+    is the single authoritative status block (the compiler is told NOT to emit its
+    own verdict), so the true status survives even if the compiler LLM tries to
+    upgrade it. Mirrors ``_apply_degradation_warning``.
     """
     if not artifact_check:
         return report
     status = (artifact_check.get("status") or "").strip().lower()
-    if status not in {"partial", "missing"}:
+    if status not in {"complete", "partial", "missing"}:
         return report
 
-    label = "PARTIAL — the exact resolution value is NOT confirmed" if status == "partial" else (
-        "MISSING — the resolution value was not found in the research"
-    )
+    if status == "complete":
+        label = "FOUND — the resolution value appears in the research (see rows below)"
+    elif status == "partial":
+        label = "PARTIAL — the exact resolution value is NOT confirmed"
+    else:
+        label = "MISSING — the resolution value was not found in the research"
+
     lines = [
         "## Required Artifact Status (authoritative — do not override)",
         f"The resolution-target artifact is **{label}**.",
@@ -579,11 +582,17 @@ def _apply_artifact_status_banner(report: str, artifact_check: dict | None) -> s
         )
     if artifact_check.get("forecast_swing"):
         lines.append(f"- Forecast swing if resolved: {artifact_check['forecast_swing']}")
-    lines.append(
-        "- Forecasting rule: anchor on base rates and the recent trajectory and widen your "
-        "interval. Do NOT treat any secondary, year-ago, or adjacent-metric figure as the "
-        "resolved value, and do NOT collapse the distribution onto a single 'known' number."
-    )
+    if status == "complete":
+        lines.append(
+            "- Forecasting rule: weight this confirmed value heavily, but still sanity-check it "
+            "against the resolution source and the recent trajectory before collapsing your distribution."
+        )
+    else:
+        lines.append(
+            "- Forecasting rule: anchor on base rates and the recent trajectory and widen your "
+            "interval. Do NOT treat any secondary, year-ago, or adjacent-metric figure as the "
+            "resolved value, and do NOT collapse the distribution onto a single 'known' number."
+        )
     banner = "\n".join(lines)
 
     title_line = "# Compiled Research Brief"

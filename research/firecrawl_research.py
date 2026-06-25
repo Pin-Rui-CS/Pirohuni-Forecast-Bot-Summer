@@ -29,6 +29,7 @@ from research.serp_research import (
     _normalise_query,
     _parse_ranked_url_groups,
     _record_ranked_url_groups,
+    build_url_date_map,
     run_scrape_cycles,
 )
 import source_ledger
@@ -187,6 +188,7 @@ async def build_firecrawl_research_result(
         groups=ranked_url_groups,
         max_cycles=max_scrape_cycles,
         model=extract_model,
+        url_dates=build_url_date_map((r.url, r.date) for r in search_results),
     )
     return FirecrawlResearchResult(
         queries=queries,
