@@ -61,6 +61,87 @@ reintroduced boundary-pileup, the older "ends not clean" failure class.
 
 ---
 
+## 2026-06-25 — Compiler buries the resolution mechanism as a low-ranked anecdote → forecaster anchors recovery odds on the wrong clock (skewed MC distribution)
+
+| | |
+|---|---|
+| **Severity** | Medium — submitted multiple-choice distribution skewed to the downside bucket; modal option still correct, so not catastrophic, but mass was mis-shaped |
+| **Introduced** | Long-standing — `compiler.py` ranked every figure-with-a-date by generic "decision relevance"; the rule/mechanism that governs how the resolution value changes had no priority |
+| **Detected** | 2026-06-25 — run `2026-06-25_09-01`, question 44153 (WOAH "suspension of FMD free status" country count on Sep 1, 2026; `multiple_choice`, 4 options) |
+| **Diagnosed & fixed** | 2026-06-25 (`compiler.py`); verified with new `eval_tools/compile_replay.py` |
+| **Affected window** | Any state-transition / count / threshold question whose resolution turns on a governing rule (a recovery/eligibility clock, a reaction function, a scheduled trigger) that the raw research mentions but the compiler demoted to background color |
+
+### Symptom
+The final forecast put **28.75% on "Less than 4"** (count ≤3), which requires **both**
+Greece and Cyprus to recover **and** no new suspension — a conjunction of sub-50%
+events. All four Opus runs independently landed 0.25–0.34 there. The modal "4 or 5"
+(52%) was defensible; the distribution was skewed too far down and too thin on the
+upside ("6 or 7" 14%, "More than 7" 5%).
+
+### Root cause
+The compiler's **Key Evidence** selection ranked any dated figure by generic
+relevance, with no special status for the *mechanism that governs how the
+resolution value changes*. The WOAH reinstatement rule (recovery ≥3 months from the
+**last case** + application + Scientific Commission approval) survived only as the
+**last** item `[E10]`, framed as a duration anecdote ("suspensions last 3–7
+months"). The forecaster therefore estimated P(Greece recovers by Sep 1)=0.55 and
+P(Cyprus)=0.65 by counting months from the **suspension-announcement** date instead
+of the **last-case** date — a systematically too-fast clock — and, because the brief
+carried no per-country recovery confounders, treated Cyprus as *most* likely to
+recover when its vaccination path is actually *slower*. Inflated recovery odds fed
+through a correct conjunction produced the over-weighted downside.
+
+### Important correction (so it is not re-derived)
+The forecaster was **not** failing at arithmetic. Every run explicitly decomposed
+and multiplied the joint probability (`P(both recover) = 0.55 × 0.65 ≈ 0.36 → "Less
+than 4"`). The defect was the **inputs** to that decomposition, which trace to the
+brief, which trace to the compiler's flat ranking. "The LLM can't do the
+conjunction / needs a calculator" is the wrong diagnosis here. Separately, the
+ensemble's tight 0.25–0.34 clustering is **shared-anchor agreement** (single model,
+single brief — `FORECASTER_MODELS` is pinned to one model), not independent
+corroboration: it reads as confidence but adds no information against a biased brief.
+
+### The fix (`compiler.py`)
+Option C — a selection-criterion change, no per-type schema or router (generalises
+across question types):
+- Key Evidence now ranks as **top-tier** (1) the rule/mechanism that governs how the
+  resolution value changes and (2) the current value of each input that rule depends
+  on — including the date that *starts the clock*, not just the date a change was
+  announced — above isolated figures.
+- A statement of the governing rule/mechanism (or a confounder that materially speeds
+  or slows it) may **never** be dropped as "background color," even with no number of
+  its own.
+
+### Verification (new harness `eval_tools/compile_replay.py`)
+`replay.py` only re-runs the forecaster against the *already-compiled* brief, so it
+cannot test a compiler-prompt change. The new script reconstructs the compiler's raw
+inputs from a saved run folder (the `## Provider:` sections of research.md +
+`artifact_check` from forecast.json) and re-runs `compile_research_report`. On 44153
+the governing mechanism moved from `[E10]` (last) to `[E2]` (second), reframed as the
+clock-setting rule, and an underplayed upside hazard (Russia concealment → possible
+new suspension) surfaced.
+
+### Known limitation / next bottleneck
+Option C preserves and ranks what retrieval found; it cannot conjure facts never
+scraped. The true clock-start (each country's **last-case** date) and per-country
+confounders (Cyprus vaccination) are **absent from this run's research**, so the new
+brief still anchors the clock on the outbreak-confirmed date. The next fix is at the
+**retrieval layer** (target the structured WOAH status source and the rule's inputs),
+not the compiler.
+
+### Lessons
+- The rule that governs how the resolution value moves is **top-tier evidence**, not
+  background color; a precise figure that does not feed that rule is color, however
+  exact.
+- Don't mistake an **input error** for a **capability error**: the forecaster already
+  decomposes and multiplies — fix the brief's inputs before reaching for tools.
+- A compiler-prompt change needs a **compiler-level** replay to test; forecaster
+  replay cannot see it.
+- Preserving a fact is bounded by retrieving it — a selection fix surfaces the
+  retrieval gap as the next constraint.
+
+---
+
 ## 2026-06-25 — Extract stage launders the ranker's pre-scrape "purpose" guess into stated facts (fabricated dates/values)
 
 | | |
