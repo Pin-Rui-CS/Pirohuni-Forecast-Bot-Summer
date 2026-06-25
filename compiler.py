@@ -508,11 +508,12 @@ Output exactly these Markdown sections:
 ## Key Evidence
 A ranked list of at most 15 items, most decision-relevant first. Format each item as:
 [E1] (tier) Claim with exact numbers and dates. — Source name, publish date, URL
+- RANK BY DECISION-RELEVANCE. The most decision-relevant items, which must appear and rank near the top whenever the research supports them, are: (1) the RULE or MECHANISM that governs how the resolution value changes over time — eligibility criteria, recovery/transition conditions, the clock or event that triggers a change, a reaction function, a scheduled decision; and (2) the CURRENT VALUE of each input that rule depends on (including the date that starts the clock, not just the date a change was announced). A precise figure that does not feed this mechanism is background color, however exact. When a number's relevance hinges on a condition (a confounder that speeds or slows the mechanism), keep the condition with the number.
 - tier is one of: direct (measures the resolution target itself, from the resolution source or confirmed equal to it), adjacent-metric (same family but a different basis/series; state the relationship and any conversion toward the target), near-proxy (close but not identical; say in a few words why not identical), market (prediction-market signal).
 - Every item must carry the observation date/period of its value. If a value's date cannot be tied to the period the question asks about, append "(date unverified)" and do NOT label it `direct` — a value reported by a single article without a confirmable current date is not direct evidence.
 - Keep exact values, dates, counts, and odds. Never round away precision present in the source.
 - When several articles report the same fact (syndicated or near-identical coverage), output ONE item and list every source/URL on that item. Do not repeat the fact.
-- Exclude weak proxies and background color entirely unless fewer than 5 stronger items exist.
+- Exclude weak proxies and background color entirely unless fewer than 5 stronger items exist. A statement of the governing rule/mechanism (or a condition that materially speeds or slows it) is never background color — keep it even if it carries no number of its own.
 - Do not place the same fact in more than one item.
 
 ## Market Signals
