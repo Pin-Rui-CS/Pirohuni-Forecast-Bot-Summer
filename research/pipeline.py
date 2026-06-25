@@ -311,6 +311,7 @@ async def run_research(
     # exhausted provider in the configured order.
     retry_label = _select_retry_provider_label(chosen_search_result, ordered_search_providers)
     run_retry_search = _retry_runner_for(retry_label) if retry_label else None
+    pre_retry_result_count = len(included_results)
     if (
         artifact_check
         and artifact_check.get("status") in {"missing", "partial"}
@@ -365,6 +366,20 @@ async def run_research(
                 if chosen_search_result is None and _is_unavailable_result(retry_result[1]):
                     degraded_search_providers.append(f"Focused Artifact Retry ({retry_label})")
 
+    # Stage 5.5: if the focused retry actually added evidence, re-run the
+    # verification gate on the augmented evidence. The Stage-4 check ran on
+    # pre-retry research; without this refresh its (now stale) "missing"/"partial"
+    # verdict would be handed to the compiler and the forecaster even though the
+    # retry — which exists solely to close that gap — may have found the value.
+    if len(included_results) > pre_retry_result_count:
+        refreshed_check = await verify_required_artifact(
+            title=title,
+            evidence_plan=evidence_plan,
+            provider_results=included_results,
+        )
+        if refreshed_check is not None:
+            artifact_check = refreshed_check
+
     # Stage 6: compile everything into the forecast-ready brief.
     from compiler import compile_research_report
 
@@ -376,6 +391,7 @@ async def run_research(
         provider_results=included_results,
         artifact_check=artifact_check,
     )
+    compiled_report = _apply_artifact_status_banner(compiled_report, artifact_check)
     compiled_report = _apply_degradation_warning(compiled_report, degraded_search_providers)
 
     return ResearchBundle(
@@ -530,6 +546,53 @@ def _apply_degradation_warning(report: str, degraded_search_providers: list[str]
     return f"{warning}\n\n{report}"
 
 
+def _apply_artifact_status_banner(report: str, artifact_check: dict | None) -> str:
+    """Inject the authoritative artifact-status verdict at the top of the brief.
+
+    The forecaster consumes only ``compiled_report``. The compiler LLM is told to
+    copy this verdict, but this deterministic injection guarantees the true status
+    survives even if the LLM upgrades "partial"/"missing" to "found" on its own.
+    Mirrors ``_apply_degradation_warning``; only fires when the resolution target
+    is not confirmed, since that is when forecasters must stay near base rates.
+    """
+    if not artifact_check:
+        return report
+    status = (artifact_check.get("status") or "").strip().lower()
+    if status not in {"partial", "missing"}:
+        return report
+
+    label = "PARTIAL — the exact resolution value is NOT confirmed" if status == "partial" else (
+        "MISSING — the resolution value was not found in the research"
+    )
+    lines = [
+        "## Required Artifact Status (authoritative — do not override)",
+        f"The resolution-target artifact is **{label}**.",
+    ]
+    if artifact_check.get("what_was_found"):
+        lines.append(f"- What was found: {artifact_check['what_was_found']}")
+    if artifact_check.get("what_is_missing"):
+        lines.append(f"- Still missing: {artifact_check['what_is_missing']}")
+    if artifact_check.get("closest_available"):
+        lines.append(
+            f"- Closest available adjacent metric (use it, do not ignore it): "
+            f"{artifact_check['closest_available']}"
+        )
+    if artifact_check.get("forecast_swing"):
+        lines.append(f"- Forecast swing if resolved: {artifact_check['forecast_swing']}")
+    lines.append(
+        "- Forecasting rule: anchor on base rates and the recent trajectory and widen your "
+        "interval. Do NOT treat any secondary, year-ago, or adjacent-metric figure as the "
+        "resolved value, and do NOT collapse the distribution onto a single 'known' number."
+    )
+    banner = "\n".join(lines)
+
+    title_line = "# Compiled Research Brief"
+    if report.startswith(title_line):
+        body = report[len(title_line):].lstrip("\n")
+        return f"{title_line}\n\n{banner}\n\n{body}"
+    return f"{banner}\n\n{report}"
+
+
 _ARTIFACT_CHECK_PROMPT = """
 You audit research gathered for a forecasting question.
 
@@ -549,6 +612,7 @@ Return only valid JSON:
   "status": "complete" | "partial" | "missing",
   "what_was_found": "one or two sentences quoting the key values found, or stating none were",
   "what_is_missing": "one or two sentences naming the exact rows/values still missing, or empty string",
+  "closest_available": "if the EXACT resolution metric is absent but a same-family adjacent metric WAS actually retrieved (a related series, the same series on a different basis, or a different-but-comparable measure), quote that value WITH its date/period and state its relationship to the target (e.g. 'June 2025 I-94 visitor arrivals = 5,278,944; target is I-92 Foreign Originating, which historically runs a stable fraction of this'); empty string if no adjacent value was retrieved",
   "forecast_swing": "low" | "moderate" | "decisive",
   "retry_queries": ["up to {max_retry_queries} focused Google queries that target ONLY the missing artifact, e.g. secondary sources quoting it; empty list if status is complete or no query could plausibly find it"]
 }}
@@ -556,6 +620,7 @@ Return only valid JSON:
 Rules:
 - "complete" only if the artifact's actual values/rows appear in the research text.
 - Mentions that the artifact exists, without its values, count as "partial" at best.
+- A retrieved value that is the right family but the WRONG exact metric does NOT make status "complete", but it MUST be recorded in "closest_available" — never silently discard a value that was actually fetched just because it is not the exact metric. It is decision-relevant and must survive into the brief.
 - forecast_swing estimates how far a reasonable forecast would plausibly move if the
   missing information were resolved one way versus the other: "low" (<5 percentage
   points), "moderate" (5-15), "decisive" (>15). Use "low" when status is "complete".
@@ -604,6 +669,7 @@ async def verify_required_artifact(
             "status": status,
             "what_was_found": str(parsed.get("what_was_found", "")).strip(),
             "what_is_missing": str(parsed.get("what_is_missing", "")).strip(),
+            "closest_available": str(parsed.get("closest_available", "")).strip(),
             "forecast_swing": forecast_swing,
             "retry_queries": [str(query).strip() for query in retry_queries if str(query).strip()],
         }

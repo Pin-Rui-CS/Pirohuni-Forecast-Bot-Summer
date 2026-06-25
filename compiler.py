@@ -418,6 +418,12 @@ def _format_artifact_check(artifact_check: dict | None) -> str:
         f"What was found: {artifact_check.get('what_was_found') or 'Not stated.'}",
         f"What is missing: {artifact_check.get('what_is_missing') or 'Nothing noted.'}",
     ]
+    closest_available = artifact_check.get("closest_available")
+    if closest_available:
+        lines.append(
+            "Closest available adjacent metric (carry forward into Key Evidence, do not drop): "
+            f"{closest_available}"
+        )
     forecast_swing = artifact_check.get("forecast_swing")
     if forecast_swing:
         lines.append(
@@ -434,8 +440,22 @@ def _build_compiler_prompt(
     cleaned_sections: list[ProviderResult],
     artifact_check: dict | None = None,
 ) -> str:
-    research_text = _format_sections(cleaned_sections)
-    research_text = _truncate_text(research_text, _MAX_COMPILER_INPUT_CHARS)
+    resolution_sections = [
+        (provider, content)
+        for provider, content in cleaned_sections
+        if "resolution" in provider.lower()
+    ]
+    other_sections = [
+        (provider, content)
+        for provider, content in cleaned_sections
+        if "resolution" not in provider.lower()
+    ]
+    resolution_text = _truncate_text(
+        _format_sections(resolution_sections), _MAX_PROVIDER_CHARS
+    ) if resolution_sections else ""
+    research_text = _truncate_text(
+        _format_sections(other_sections), _MAX_COMPILER_INPUT_CHARS
+    )
 
     return f"""
 Forecast question:
@@ -453,7 +473,12 @@ Fine print:
 Automated check of whether the required evidence artifact was found:
 {_format_artifact_check(artifact_check)}
 
-Raw research provider outputs, already partially cleaned:
+RESOLUTION SOURCE material (AUTHORITATIVE — this is the page/feed the question
+resolves from; it outranks every secondary source below for the resolution value):
+{resolution_text or "No resolution-source scrape was available for this question."}
+
+Other research provider outputs, already partially cleaned (secondary; use to inform
+the forecast, never to stand in for the resolution value):
 {research_text}
 
 Task:
@@ -467,13 +492,15 @@ Output exactly these Markdown sections:
 
 ## Required Artifact Status
 - Name the artifact the Evidence Plan says is most important.
-- State plainly: found completely / found partially / not found, and exactly which values or rows are present or missing.
+- COPY the status verdict from the "Automated check" above verbatim (found completely / found partially / not found). You MUST NOT upgrade or contradict it: if the check says partial or missing, never write "found" or "is present", and never present a secondary or year-ago figure as if it were the confirmed resolution value.
 - If it is a table or time series and any rows were extracted, reproduce those rows here verbatim. This is the single most important section.
+- If the automated check lists a "Closest available adjacent metric", reproduce it here and carry it into Key Evidence as an `adjacent-metric` item. Never omit a value that was actually retrieved just because it is not the exact metric.
 
 ## Key Evidence
 A ranked list of at most 15 items, most decision-relevant first. Format each item as:
 [E1] (tier) Claim with exact numbers and dates. — Source name, publish date, URL
-- tier is one of: direct (measures the resolution target itself), near-proxy (close but not identical; say in a few words why not identical), market (prediction-market signal).
+- tier is one of: direct (measures the resolution target itself, from the resolution source or confirmed equal to it), adjacent-metric (same family but a different basis/series; state the relationship and any conversion toward the target), near-proxy (close but not identical; say in a few words why not identical), market (prediction-market signal).
+- Every item must carry the observation date/period of its value. If a value's date cannot be tied to the period the question asks about, append "(date unverified)" and do NOT label it `direct` — a value reported by a single article without a confirmable current date is not direct evidence.
 - Keep exact values, dates, counts, and odds. Never round away precision present in the source.
 - When several articles report the same fact (syndicated or near-identical coverage), output ONE item and list every source/URL on that item. Do not repeat the fact.
 - Exclude weak proxies and background color entirely unless fewer than 5 stronger items exist.
@@ -490,6 +517,8 @@ A ranked list of at most 15 items, most decision-relevant first. Format each ite
 Rules:
 - Do not make a probability estimate.
 - Do not invent facts absent from the raw research.
+- The RESOLUTION SOURCE material is authoritative. When it reports a value for the resolution target, it overrides any secondary source that disagrees. When it shows the target as blank, unpublished, or not-yet-released, say so explicitly and NEVER substitute a secondary or year-ago figure as the resolved value — secondary figures may inform the forecast but are not the resolution value.
+- Do not delete a value that was actually retrieved. If it is the wrong exact metric but a related one, keep it as an `adjacent-metric` item with its caveat and conversion path; "not extracted" is only for values that were never found.
 - Total output should be materially shorter than the input. Selectivity is the job.
 """.strip()
 
