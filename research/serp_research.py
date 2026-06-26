@@ -712,35 +712,24 @@ async def _scrape_targets(
                     engine=f"adapter:{adapter.name}",
                 )
 
-        try:
-            from Crawl4AI.crawl import (
-                AdaptiveResearchConfig,
-                adaptive_research_crawl,
-                is_duplicate_scrape_payload,
-            )
+        from Crawl4AI.crawl import basic_crawl_markdown, claim_scrape_url
 
-            config = AdaptiveResearchConfig.from_env()
-            config.max_pages = 4
-            config.max_depth = 1
-            config.top_k_links = 2
-            config.top_k_content = 4
-            config.max_chars_per_page = 16_000
-            config.max_total_chars = 40_000
-            config.content_budget = _MAX_SCRAPE_CHARS
-            content = await adaptive_research_crawl(item.url, query, config=config)
-            if is_duplicate_scrape_payload(content):
-                return _finish(
-                    Scrape(
-                        cycle=0,
-                        group=group.group,
-                        group_purpose=group.group_purpose,
-                        url=item.url,
-                        purpose=item.purpose,
-                        ok=False,
-                        error="skipped duplicate: URL has already been scraped in this process",
-                    ),
-                    engine=source_ledger.ENGINE_SKIPPED_DUPLICATE,
-                )
+        duplicate_payload = claim_scrape_url(item.url)
+        if duplicate_payload is not None:
+            return _finish(
+                Scrape(
+                    cycle=0,
+                    group=group.group,
+                    group_purpose=group.group_purpose,
+                    url=item.url,
+                    purpose=item.purpose,
+                    ok=False,
+                    error="skipped duplicate: URL has already been scraped in this process",
+                ),
+                engine=source_ledger.ENGINE_SKIPPED_DUPLICATE,
+            )
+        try:
+            content = await basic_crawl_markdown(item.url)
             return _finish(
                 Scrape(
                     cycle=0,
@@ -752,7 +741,7 @@ async def _scrape_targets(
                     content=_truncate_text(content, _MAX_SCRAPE_CHARS),
                     error="" if content.strip() else "Crawl4AI returned no content.",
                 ),
-                engine=source_ledger.ENGINE_CRAWL4AI_ADAPTIVE,
+                engine=source_ledger.ENGINE_CRAWL4AI_BASIC,
             )
         except Exception as exc:
             return _finish(
@@ -765,7 +754,7 @@ async def _scrape_targets(
                     ok=False,
                     error=f"{type(exc).__name__}: {exc}",
                 ),
-                engine=source_ledger.ENGINE_CRAWL4AI_ADAPTIVE,
+                engine=source_ledger.ENGINE_CRAWL4AI_BASIC,
             )
 
     scrapes = await _limited_gather(
@@ -940,31 +929,7 @@ def _compact_scrape_content_for_prompt(content: str) -> str:
     if content.startswith("Crawl4AI duplicate scrape skipped"):
         return ""
 
-    if content.startswith("# Adaptive Crawl Research Packet"):
-        return _compact_adaptive_crawl_packet(content)
-
     return content
-
-
-def _compact_adaptive_crawl_packet(content: str) -> str:
-    relevant_marker = "## Relevant Findings"
-    start = content.find(relevant_marker)
-    if start < 0:
-        return ""
-
-    relevant = content[start + len(relevant_marker) :].strip()
-    crawled_marker = "## Crawled URLs"
-    end = relevant.find(crawled_marker)
-    if end >= 0:
-        relevant = relevant[:end].strip()
-
-    cleaned_lines: list[str] = []
-    for line in relevant.splitlines():
-        if line.strip().startswith("Relevance score"):
-            continue
-        cleaned_lines.append(line)
-
-    return "\n".join(cleaned_lines).strip()
 
 
 def _crawl_query(

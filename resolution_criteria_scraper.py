@@ -487,22 +487,15 @@ def _format_combined_resolution_content(sources: list[tuple[str, str]]) -> str:
 async def _basic_crawl_markdown(url: str, timeout: int) -> str:
     """Fetch one page with a single-page browser crawl; return full raw markdown.
 
-    No embedding relevance filter and no link-following: the resolution source is
-    the page that holds the value being resolved, so its full markdown is what we
-    want, handed downstream to the LLM-cleaning step. Returns "" if the page did
-    not load successfully.
+    Thin wrapper over the shared ``Crawl4AI.crawl.basic_crawl_markdown`` so the
+    resolution scraper and the research scrapers use one identical basic crawl.
+    The resolution source is the page that holds the value being resolved, so its
+    full markdown is what we want, handed downstream to the LLM-cleaning step.
+    Returns "" if the page did not load successfully.
     """
-    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+    from Crawl4AI.crawl import basic_crawl_markdown
 
-    run_config = CrawlerRunConfig(page_timeout=max(1, int(timeout)) * 1000)
-    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
-        result = await crawler.arun(url=url, config=run_config)
-    if not getattr(result, "success", False):
-        return ""
-    markdown = getattr(result, "markdown", None)
-    if markdown is None:
-        return ""
-    return getattr(markdown, "raw_markdown", None) or str(markdown)
+    return await basic_crawl_markdown(url, timeout=timeout)
 
 
 def _looks_like_firecrawl_exhaustion(text: str) -> bool:
@@ -580,10 +573,9 @@ async def _scrape_resolution_url(
     Firecrawl's /v2/scrape is tried first (it renders JS and PDFs well). On a
     credit/auth exhaustion it is disabled for the rest of the run; on any other
     Firecrawl failure (timeout, page error, empty result) we fall back to the
-    local Crawl4AI basic crawl for just this URL. The Crawl4AI basic crawl is the
-    historical engine here: the embedding-filtered adaptive crawler previously
-    discarded short, semantically-thin facts (e.g. a bare "Predictions
-    3,903,957"). See tests/test_crawl_basic_vs_adaptive.py for the comparison.
+    local Crawl4AI basic crawl for just this URL. The basic crawl returns the full
+    raw page markdown (no relevance filter, no link-following) so short,
+    semantically-thin facts (e.g. a bare "Predictions 3,903,957") are preserved.
     """
     global _firecrawl_exhausted
     import source_ledger

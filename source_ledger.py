@@ -2,8 +2,8 @@
 
 Records, for each question run, which research tool surfaced a URL, in which
 phase/round, and — if the URL was scraped — which engine did the scraping
-(a named adapter, Crawl4AI adaptive crawling, or Crawl4AI basic single-page
-crawling). The orchestrator drains the ledger at the end of a question and
+(a named adapter, Firecrawl, or Crawl4AI basic single-page crawling). The
+orchestrator drains the ledger at the end of a question and
 writes it into the per-question ``audit.md`` artifact.
 
 Concurrency model mirrors the scrape dedupe registry in ``Crawl4AI/crawl.py``:
@@ -28,7 +28,6 @@ ROLE_RANKED = "ranked-for-scrape"       # LLM selected it for a scrape cycle
 ROLE_SCRAPED = "scraped"                # a scrape was actually attempted
 
 # Engines that perform a scrape.
-ENGINE_CRAWL4AI_ADAPTIVE = "crawl4ai-adaptive"
 ENGINE_CRAWL4AI_BASIC = "crawl4ai-basic"
 ENGINE_FIRECRAWL = "firecrawl-scrape"
 ENGINE_SKIPPED_DUPLICATE = "skipped-duplicate"
