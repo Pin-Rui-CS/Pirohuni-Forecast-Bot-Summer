@@ -7,6 +7,95 @@ re-deriving the same diagnosis twice — read this before touching the forecasti
 
 ---
 
+## 2026-06-30 — Artifact-check manufactures a base rate and the "authoritative" banner freezes it → ensemble anchors ~20pts low
+
+| | |
+|---|---|
+| **Severity** | High — systematic downward bias on reference-class questions; 44217 forecast 14% vs a defensible ~35–45% on the same gathered evidence. Not yet resolved, so an unconfirmed miss, but the directional bias is clear and structural |
+| **Introduced** | 2026-06-25 — the same commit that added the `closest_available` field and the "authoritative — do not override" banner (the entry below). A channel meant to carry a *raw adjacent value* was used by the artifact-check to carry a *derived base rate* |
+| **Detected** | 2026-06-30 — question 44217 ("Will Donald Trump attend UFC 330?", `binary`), run `2026-06-29_21-01` |
+| **Diagnosed & fixed** | 2026-06-30 (`research/pipeline.py`) |
+| **Affected window** | Any question whose outside view must be **constructed by counting scattered prior events** (reference-class / base-rate questions), where the artifact-check's truncated view yields a miscount the banner then stamps authoritative |
+
+### Symptom
+Three Opus runs landed 16 / 14 / 14 (median 14%) — a 2-point spread, all erring
+low. A defensible read of the **same evidence the bot itself gathered** is
+~35–45%. The tight cluster reads as confidence; it is shared-anchor agreement.
+
+### Root cause
+A chain, all pulling one way:
+1. **Artifact-check invents the anchor.** `verify_required_artifact` (Sonnet 4.6,
+   fed research truncated to 8k chars/provider, 40k total) both **under-counted**
+   ("≥2 confirmed attendances out of ~20 numbered events") and **editorialized**
+   ("~10% per event, a low base rate") inside the `closest_available` field — a
+   field meant only to *quote a retrieved adjacent value*. The raw research
+   actually held ≥4 distinct numbered attendances (UFC 309 MSG; 314 Miami Apr-2025;
+   327 Miami Apr-2026 — two separate events the brief collapsed into "maybe one
+   mislabeled"; a New Jersey event) plus Freedom 250, and a marquee-events list
+   (Super Bowl, Daytona, NCAA Wrestling *in Philadelphia*, Ryder Cup…) that defines
+   the correct reference class. None of that survived into the count.
+2. **The banner freezes it.** `_apply_artifact_status_banner` injected the derived
+   figure at the top of the brief under "authoritative — do not override" and
+   "Closest available adjacent metric (use it, do not ignore it)."
+3. **The compiler launders it.** Forbidden to compute probabilities and told to
+   carry `closest_available` forward, the compiler reproduced it as `[E3]`.
+4. **The forecaster is trapped.** All runs opened at the handed-down ~10–15% and
+   applied only ±2–5 additive nudges — one even wrote "selection effects matter
+   strongly," then applied **+5%** instead of changing the denominator.
+5. **The ensemble adds no signal.** 3× the same model, same brief → shared-anchor
+   agreement (recurring; see 2026-06-25 entries).
+6. **The decisive market was dropped.** The Kalshi market failed to scrape and was
+   abandoned without widening or pivoting; its slug
+   (`trump-attend-another-ufc-event-this-year`) suggests a *broader* market the
+   brief wrongly asserted "resolves on the same target."
+
+### Relationship to the 2026-06-25 fix (so it is not re-derived as a contradiction)
+The entry below **deliberately** added the "authoritative — do not override" banner
+(A2/A3) and the `closest_available` field (D) — correctly, for their case: a single
+resolution **datum** the compiler must not upgrade or drop. The regression is that
+the *same authority label* and the *same carry-forward channel*, applied to a
+**derived base rate** on a reference-class question, froze a miscount. This fix
+**re-scopes** that machinery; it does not revert it.
+
+### The fix (`research/pipeline.py`)
+- **Solution 1 — the blind stage can no longer interpret.** `closest_available` may
+  now quote only the retrieved value + date + source + *factual* relationship to the
+  target; it is explicitly forbidden to compute ratios/percentages/base rates/
+  averages or state a forecast implication. Added a global artifact-check rule:
+  every field records what the research *contains*, not an analysis of it.
+- **Solution 2 — authority re-scoped, forecasting rule generalized.** "authoritative
+  — do not override" now attaches **only** to `complete` (resolution-source) status.
+  `partial`/`missing` get a "starting point — reconstruct and reconcile" header;
+  `closest_available` is reframed as a starting reference the forecaster must
+  re-derive and reconcile, not accept. The partial/missing forecasting rule no
+  longer blanket-says "anchor on base rates" — it **branches**: if a comparable
+  reference class exists, build the base rate yourself (count instances, state
+  numerator/denominator, adjust for selection); if there is no comparable prior
+  class (novel / one-off), reason from mechanism and say so — do **not** force a
+  base rate.
+- **Deferred (needs credit approval):** "don't count off a truncated slice"
+  (solution 4). After 1+2 the load-bearing count moves to the forecaster reading the
+  compiled brief, so the residual risk is **compiler completeness** — a small-N
+  reference class can still be under-represented (e.g. the two Miami events
+  collapsed). The targeted lever is the compiler preserving every distinct instance,
+  not widening the blind stage; revisit if replay shows residual under-counting.
+
+### Lessons
+- A channel built to carry a **raw datum** will be used to smuggle a **derived
+  conclusion** unless explicitly forbidden; the cheapest, most-truncated stage must
+  not be the one that produces interpretation.
+- "Authoritative" belongs only to the **resolution-source value**, never to a
+  derived adjacent metric. Authority should follow context and capability, not
+  pipeline order — here the blindest junior stage out-ranked the full-context Opus
+  forecaster.
+- A tight ensemble cluster built on a shaky base rate is shared-anchor agreement,
+  not corroboration.
+- **Generalize, don't hard-wire counting.** Not every question has a usable
+  reference class; the forecasting rule must branch to mechanism-based reasoning for
+  novel/one-off events, or it will mislead the next question that has no prior class.
+
+---
+
 ## 2026-06-26 — Integer-count questions routed to the continuous path spike at an open bound
 
 | | |

@@ -562,13 +562,16 @@ def _apply_artifact_status_banner(report: str, artifact_check: dict | None) -> s
 
     if status == "complete":
         label = "FOUND — the resolution value appears in the research (see rows below)"
+        header = "## Required Artifact Status (authoritative — do not override)"
     elif status == "partial":
         label = "PARTIAL — the exact resolution value is NOT confirmed"
+        header = "## Required Artifact Status (starting point — reconstruct and reconcile)"
     else:
         label = "MISSING — the resolution value was not found in the research"
+        header = "## Required Artifact Status (starting point — reconstruct and reconcile)"
 
     lines = [
-        "## Required Artifact Status (authoritative — do not override)",
+        header,
         f"The resolution-target artifact is **{label}**.",
     ]
     if artifact_check.get("what_was_found"):
@@ -576,10 +579,18 @@ def _apply_artifact_status_banner(report: str, artifact_check: dict | None) -> s
     if artifact_check.get("what_is_missing"):
         lines.append(f"- Still missing: {artifact_check['what_is_missing']}")
     if artifact_check.get("closest_available"):
-        lines.append(
-            f"- Closest available adjacent metric (use it, do not ignore it): "
-            f"{artifact_check['closest_available']}"
-        )
+        if status == "complete":
+            lines.append(
+                f"- Closest available adjacent metric (use it, do not ignore it): "
+                f"{artifact_check['closest_available']}"
+            )
+        else:
+            lines.append(
+                f"- Closest available adjacent metric (a STARTING reference only — not the "
+                f"answer; re-derive the outside view yourself from the Key Evidence below and "
+                f"reconcile any disagreement with this figure): "
+                f"{artifact_check['closest_available']}"
+            )
     if artifact_check.get("forecast_swing"):
         lines.append(f"- Forecast swing if resolved: {artifact_check['forecast_swing']}")
     if status == "complete":
@@ -589,9 +600,14 @@ def _apply_artifact_status_banner(report: str, artifact_check: dict | None) -> s
         )
     else:
         lines.append(
-            "- Forecasting rule: anchor on base rates and the recent trajectory and widen your "
-            "interval. Do NOT treat any secondary, year-ago, or adjacent-metric figure as the "
-            "resolved value, and do NOT collapse the distribution onto a single 'known' number."
+            "- Forecasting rule: build your own outside view; do not anchor on any single figure "
+            "above. If the brief contains a reference class of comparable prior cases, construct "
+            "the base rate yourself — identify the qualifying instances, state the count and the "
+            "denominator, and adjust for how this case differs (selection or conditioning effects). "
+            "If there is no comparable prior class (a novel, unprecedented, or one-off event), "
+            "reason from mechanism and drivers instead and say so — do not force a base rate. Either "
+            "way, widen your interval and do NOT treat any secondary, year-ago, or adjacent-metric "
+            "figure as the resolved value."
         )
     banner = "\n".join(lines)
 
@@ -621,12 +637,13 @@ Return only valid JSON:
   "status": "complete" | "partial" | "missing",
   "what_was_found": "one or two sentences quoting the key values found, or stating none were",
   "what_is_missing": "one or two sentences naming the exact rows/values still missing, or empty string",
-  "closest_available": "if the EXACT resolution metric is absent but a same-family adjacent metric WAS actually retrieved (a related series, the same series on a different basis, or a different-but-comparable measure), quote that value WITH its date/period and state its relationship to the target (e.g. 'June 2025 I-94 visitor arrivals = 5,278,944; target is I-92 Foreign Originating, which historically runs a stable fraction of this'); empty string if no adjacent value was retrieved",
+  "closest_available": "if the EXACT resolution metric is absent but a same-family adjacent metric WAS actually retrieved (a related series, the same series on a different basis, or a different-but-comparable measure), quote that value WITH its date/period and source, and state its factual relationship to the target (e.g. 'June 2025 I-94 visitor arrivals = 5,278,944; target is I-92 Foreign Originating, which historically runs a stable fraction of this'); empty string if no adjacent value was retrieved. Quote ONLY what was retrieved: do not compute ratios, percentages, base rates, or averages from it, do not characterize it as high/low, and do not state a forecast implication — rate-construction and interpretation are the forecaster's job",
   "forecast_swing": "low" | "moderate" | "decisive",
   "retry_queries": ["up to {max_retry_queries} focused Google queries that target ONLY the missing artifact, e.g. secondary sources quoting it; empty list if status is complete or no query could plausibly find it"]
 }}
 
 Rules:
+- Every field records what the research CONTAINS, not an analysis of it. In ANY field, do not perform arithmetic, construct a base rate or reference-class frequency, estimate a probability, or editorialize about what a value implies. Quote values with their dates and sources; the forecaster computes rates and draws conclusions.
 - "complete" only if the artifact's actual values/rows appear in the research text.
 - Mentions that the artifact exists, without its values, count as "partial" at best.
 - A retrieved value that is the right family but the WRONG exact metric does NOT make status "complete", but it MUST be recorded in "closest_available" — never silently discard a value that was actually fetched just because it is not the exact metric. It is decision-relevant and must survive into the brief.
