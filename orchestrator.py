@@ -212,6 +212,10 @@ async def forecast_individual_question(
     summary_of_forecast += f"Estimated OpenRouter LLM tokens: {estimated_tokens}\n"
     summary_of_forecast += f"{usage_yaml_table}\n"
 
+    # A forecaster may abstain (forecast is None) when it has no usable signal —
+    # e.g. every numeric run landed off the grid. Record the run for inspection
+    # but never submit a non-forecast to Metaculus.
+    abstained = result.forecast is None
     forecast_payload = create_forecast_payload(result.forecast, question_type)
 
     artifacts.save_runs(
@@ -235,11 +239,17 @@ async def forecast_individual_question(
             "estimated_tokens": estimated_tokens,
             "timings": timings,
             "usage_yaml_table": usage_yaml_table,
-            "submitted": submit_prediction,
+            "submitted": submit_prediction and not abstained,
         }
     )
 
-    if submit_prediction:
+    if abstained:
+        logger.warning(
+            "Abstaining on post %s (question %s): no usable forecast; nothing submitted.",
+            post_id, question_id,
+        )
+        summary_of_forecast += "Abstained: no usable forecast; nothing submitted.\n"
+    elif submit_prediction:
         await post_question_prediction(question_id, forecast_payload)
         await post_question_comment(post_id, result.comment)
         summary_of_forecast += "Posted: Forecast was posted to Metaculus.\n"

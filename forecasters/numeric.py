@@ -41,6 +41,12 @@ This question's outcome will be determined by the specific criteria below. These
 {fine_print}
 
 Units for answer: {units}
+CRITICAL — units: every number you put in the final JSON (every mean, sd, lo, hi,
+location, scale, median, implied_p50, and each value in implied_90ci) MUST be
+expressed in the units above. Research sources very often quote this quantity in
+a different unit (for example millions where the answer unit is thousands, or a
+fraction where the answer unit is a percent). If so, convert to the answer unit
+BEFORE you write any number. Do not reason in one unit and report in another.
 {lower_bound_message}
 {upper_bound_message}
 {distribution_guidance}
@@ -210,6 +216,9 @@ Parameter reference (params must match the chosen family exactly):
 - "beta": {{"a": float, "b": float, "lower": float, "upper": float}}
 
 Rules:
+- UNITS: every numeric value below must be in {units}. Never mix units; if the
+  research used a different unit, convert first. State the unit you used in
+  reasoning_summary so the conversion is explicit.
 - 1–3 components; weights positive and summing to 1; each component is smooth and single-peaked.
   Any multimodality comes from the MIXTURE, never from a single component.
 - The chosen family's support must contain every plausible outcome and violate no stated bound.
@@ -390,42 +399,77 @@ def _distribution_location_values(spec: dict) -> list[float]:
     ]
 
 
-def _values_use_millions_against_raw_grid(
-    value_axis_params: list[float],
-    raw_grid: np.ndarray,
-    *,
-    open_upper_bound: bool,
-    open_lower_bound: bool,
-) -> bool:
-    if not value_axis_params:
-        return False
+# --- Unit-slip auto-correction -----------------------------------------------
+# A model often reasons in whatever unit dominates its research (millions of
+# barrels, a fraction instead of a percent, ...) and emits its final numbers in
+# that unit even when the Metaculus grid uses another. The tell is that the
+# model's location parameters are off the grid by a *clean power of ten*. We
+# rescale ONLY when the evidence is unambiguous; every other case is left at
+# scale 1.0 so the run loop can drop a genuinely off-grid run rather than guess.
+# Maximum distance (in log10 units) the grid/param ratio may sit from an exact
+# power of ten and still count as a deliberate unit mismatch.
+UNIT_SCALE_SNAP_TOL = 0.15
 
+
+def _generous_grid_window(raw_grid: np.ndarray) -> tuple[float, float]:
+    """A finite window one full range-width beyond each grid edge. Values inside
+    it are 'close enough' to the grid to be treated as already in the right
+    units. A finite window is essential: for open bounds the true compatibility
+    window is infinite, so it cannot distinguish a unit slip from a correct
+    forecast — this one always can."""
     raw_min = float(np.nanmin(raw_grid))
     raw_max = float(np.nanmax(raw_grid))
-    max_abs_raw = max(abs(raw_min), abs(raw_max))
-    max_abs_param = max(abs(value) for value in value_axis_params)
+    lo, hi = min(raw_min, raw_max), max(raw_min, raw_max)
+    rng = max(hi - lo, 1.0)
+    return lo - rng, hi + rng
 
-    if max_abs_raw < 1_000_000 or max_abs_param <= 0:
-        return False
 
-    # Metaculus returns some money/population quantities as raw units while LLMs
-    # often express the same outcome in millions. Require a clear 1e6-scale gap
-    # and that the model's location-like parameters are plausible on x/1e6.
-    if max_abs_param >= max_abs_raw / 1_000:
-        return False
+def _detect_power_of_ten_scale(
+    value_axis_params: list[float],
+    raw_grid: np.ndarray,
+) -> float:
+    """Return the power-of-ten factor that maps the model's location parameters
+    back onto the grid, or 1.0 when no unambiguous unit slip is detected.
 
-    scaled_min = raw_min / 1_000_000
-    scaled_max = raw_max / 1_000_000
-    scaled_low = min(scaled_min, scaled_max)
-    scaled_high = max(scaled_min, scaled_max)
-    scaled_range = max(scaled_high - scaled_low, 1.0)
-    compatibility_low = -np.inf if open_lower_bound else scaled_low - 2 * scaled_range
-    compatibility_high = np.inf if open_upper_bound else scaled_high + 2 * scaled_range
+    Three gates, all of which must pass:
+      (a) the raw params sit clearly OFF the grid (outside a generous finite
+          window around it) — params already on the grid are never touched;
+      (b) the grid/param magnitude ratio is within ``UNIT_SCALE_SNAP_TOL`` of an
+          exact power of ten (so we know the factor, and that it is a unit slip
+          rather than an arbitrary offset);
+      (c) applying that factor lands the params back inside the window.
+    """
+    finite = [
+        float(v)
+        for v in value_axis_params
+        if isinstance(v, (int, float)) and np.isfinite(float(v)) and float(v) != 0.0
+    ]
+    if not finite:
+        return 1.0
 
-    return any(
-        compatibility_low <= value <= compatibility_high
-        for value in value_axis_params
-    )
+    window_lo, window_hi = _generous_grid_window(raw_grid)
+    representative = float(np.median(finite))
+
+    # Gate (a): already on (or near) the grid -> no unit problem.
+    if window_lo <= representative <= window_hi:
+        return 1.0
+
+    grid_scale = float(np.median(np.abs(raw_grid)))
+    param_scale = float(np.median([abs(v) for v in finite]))
+    if grid_scale <= 0 or param_scale <= 0:
+        return 1.0
+
+    log_ratio = float(np.log10(grid_scale / param_scale))
+    exponent = round(log_ratio)
+    # Gate (b): an actual gap, and a clean power of ten.
+    if exponent == 0 or abs(log_ratio - exponent) > UNIT_SCALE_SNAP_TOL:
+        return 1.0
+
+    factor = 10.0**exponent
+    # Gate (c): the rescale must actually bring the params back onto the grid.
+    if not (window_lo <= representative * factor <= window_hi):
+        return 1.0
+    return factor
 
 
 # Component value-axis parameters scale linearly with the outcome unit (so they
@@ -511,12 +555,16 @@ def detect_component_unit_scale(
     open_lower_bound: bool,
 ) -> float:
     """Detect the unit-conversion factor between the model's components and the
-    Metaculus grid. Returns 1e6 when the model expressed the quantity in
-    millions against a raw-unit grid, else 1.0.
+    Metaculus grid, as a power of ten. Returns e.g. 1000.0 when the model wrote
+    millions against a thousand-unit grid, 1e6 for the millions-vs-raw money
+    case, or 1.0 when the components already match the grid (or the mismatch is
+    not an unambiguous power of ten).
 
     Detection runs on the raw components BEFORE any guardrail so that unit
     normalisation and the width floor always operate in the same units (the
-    raw question units)."""
+    raw question units). ``open_upper_bound``/``open_lower_bound`` are accepted
+    for caller symmetry; the detector uses a finite window that works for both
+    open and closed bounds."""
     value_axis_params: list[float] = []
     for raw in components:
         if not isinstance(raw, dict):
@@ -525,14 +573,7 @@ def detect_component_unit_scale(
         value_axis_params.extend(
             _distribution_location_values({"type": family, "params": params})
         )
-    if _values_use_millions_against_raw_grid(
-        value_axis_params,
-        raw_grid,
-        open_upper_bound=open_upper_bound,
-        open_lower_bound=open_lower_bound,
-    ):
-        return 1_000_000.0
-    return 1.0
+    return _detect_power_of_ten_scale(value_axis_params, raw_grid)
 
 
 def spec_to_cdf(spec: dict, grid: np.ndarray) -> list[float]:
@@ -1723,9 +1764,9 @@ def numeric_response_to_raw_cdf(
     if unit_scale != 1.0:
         components = [_rescale_raw_component(c, unit_scale) for c in parsed["components"]]
         unit_note = (
-            "Metaculus grid appears to be raw units; distribution parameters "
-            "appeared to be in millions. Rescaled component parameters "
-            "x1,000,000 into raw units before applying guardrails."
+            f"Detected a unit mismatch: component parameters sat off the Metaculus "
+            f"grid by a clean factor of {unit_scale:g}. Rescaled every component "
+            f"parameter x{unit_scale:g} into the grid's units before applying guardrails."
         )
     else:
         components = parsed["components"]
@@ -1777,6 +1818,38 @@ def _make_numeric_validator(geometry: dict):
     return _validate
 
 
+def _cdf_is_degenerate_off_grid(
+    raw_cdf: np.ndarray, location_values: list[float], grid: np.ndarray
+) -> bool:
+    """True when a run's whole distribution sits off the grid: the CDF is flat
+    across the entire grid because all the mass is below the lower bound (CDF
+    ~1 everywhere) or above the upper bound (CDF ~0 everywhere).
+
+    Such a run carries no shape information on the grid; after standardisation it
+    becomes a near-uniform ramp, and averaging that into the ensemble only smears
+    the consensus (the 44218 SPR failure). It is dropped rather than blended in.
+    This fires only on a truly flat curve, so a run that genuinely varies across
+    the grid — even one skewed hard against an open bound — is kept."""
+    if len(raw_cdf) < 2:
+        return False
+    first, last = float(raw_cdf[0]), float(raw_cdf[-1])
+    if last - first >= 0.02:
+        return False  # the distribution varies across the grid -> informative
+    all_below = first > 0.98   # mass piled at/under the lower bound
+    all_above = last < 0.02    # mass entirely above the upper bound
+    if not (all_below or all_above):
+        return False
+    # Corroborate with the model's own location params when we have them: only
+    # call it off-grid if those params agree the mass lies off the relevant edge.
+    if location_values:
+        lo, hi = float(grid[0]), float(grid[-1])
+        if all_below and max(location_values) >= lo:
+            return False
+        if all_above and min(location_values) <= hi:
+            return False
+    return True
+
+
 async def get_numeric_gpt_prediction(
     question_details: dict,
     num_runs: int,
@@ -1826,6 +1899,21 @@ async def get_numeric_gpt_prediction(
             record["error"] = str(exc)
             ensemble.append(record)
             continue
+        record["used_fallback"] = used_fallback
+        location_values = _run_location_values(parsed)
+        # A run whose entire distribution lies off the grid (e.g. an uncorrected
+        # unit slip) is uninformative — standardisation would turn it into a
+        # near-uniform ramp that smears the ensemble. Drop it instead of blending.
+        if _cdf_is_degenerate_off_grid(raw_cdf, location_values, grid):
+            logger.warning(
+                "[ensemble] numeric run (%s) is entirely off-grid (flat CDF across "
+                "the whole grid; unit conversion: %s); dropping it as uninformative.",
+                run.model, unit_note,
+            )
+            record["dropped"] = True
+            record["off_grid"] = True
+            ensemble.append(record)
+            continue
         if used_fallback:
             # Parseable JSON but no usable components — make the broad-normal
             # substitution visible and attributable instead of silent (con 1).
@@ -1833,14 +1921,12 @@ async def get_numeric_gpt_prediction(
                 "[ensemble] numeric run (%s) had no valid components; used a broad-normal fallback.",
                 run.model,
             )
-        record["used_fallback"] = used_fallback
         ensemble.append(record)
         logger.info("question title: %s", title)
         logger.info("model: %s | grid x first/last: %s %s", run.model, float(grid[0]), float(grid[-1]))
         logger.info("unit conversion: %s", unit_note)
         logger.info("run forecast: %s", json.dumps(parsed, default=str)[:600])
         log_cdf_summary("raw run distribution summary:", raw_cdf.tolist())
-        location_values = _run_location_values(parsed)
         log_numeric_cdf_sanity_checks(location_values, grid, raw_cdf.tolist())
 
         raw_cdfs.append(raw_cdf)
@@ -1855,16 +1941,29 @@ async def get_numeric_gpt_prediction(
         )
 
     if not raw_cdfs:
+        # Every run was unusable — unparseable, or its whole distribution lay off
+        # the grid (a unit slip that auto-correction could not resolve). Abstain
+        # rather than submit a meaningless broad-normal: a flat guess scores worse
+        # than no forecast, and an all-off-grid ensemble means we have no signal.
         logger.warning(
-            "all %d numeric run(s) failed for %r; submitting a broad-normal fallback.",
+            "all %d numeric run(s) for %r were unusable (unparseable or entirely "
+            "off-grid); abstaining — no forecast will be submitted.",
             len(runs), title,
         )
-        # The fallback spec is built from the raw question bounds, so it is
-        # already in canonical raw units — evaluate it directly on the grid.
-        fallback_spec = _fallback_mixture_spec(geometry)
-        raw_cdfs.append(np.asarray(spec_to_cdf(fallback_spec, grid)))
-        run_values.append({"kind": "mixture", "spec": fallback_spec})
-        comments.append("All runs failed to parse; using a broad-normal fallback.")
+        comment = (
+            "No usable forecast: every run was either unparseable or placed its "
+            "entire distribution off the question grid (a unit mismatch that could "
+            "not be auto-corrected). Abstaining rather than submitting a "
+            "meaningless distribution."
+        )
+        return ForecastResult(
+            forecast=None,
+            comment=comment,
+            prompt=prompt,
+            run_transcripts=transcripts,
+            run_values=run_values,
+            extra={"geometry": geometry, "ensemble": ensemble, "abstained": True},
+        )
 
     aggregated = aggregate_run_cdfs(raw_cdfs, geometry["use_pmf"])
 
