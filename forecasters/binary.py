@@ -61,6 +61,12 @@ Before forecasting, audit the research material. Answer briefly:
 4. Are any sources weak, stale, or likely misinterpreted?
 5. Which evidence items are strongest and most decision-relevant (cite their IDs)?
 6. Which important facts are missing?
+7. TEMPORAL VALIDITY — today is {today}. Check every evidence item's claimed event or
+   publication date. A "report" about a date AFTER today cannot exist: its date is wrong
+   (almost always a prior-year event mislabeled with the current year). Such items are not
+   "unconfirmed" — they are FALSE as dated. EXCLUDE them from your reasoning and re-anchor
+   on confirmed evidence. Items whose dates lack a year, or are marked "(date unverified)",
+   must not be assumed to fall inside the resolution window.
 
 If the research material is insufficient, say so explicitly and lower confidence.
 
@@ -69,6 +75,7 @@ Output:
 - Main research limitations
 - Most important reliable evidence items (by ID)
 - Missing information that could change the forecast
+- Temporal validity: [pass, or list each misdated/impossible item excluded]
 
 ---
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ from config import (
 )
 from llm_client import call_llm
 from monetary_cost_manager import HardLimitExceededError
-from utils import _truncate_text
+from utils import _truncate_text, find_future_full_dates
 import source_ledger
 
 logger = logging.getLogger(__name__)
@@ -376,6 +377,7 @@ async def run_research(
             title=title,
             evidence_plan=evidence_plan,
             provider_results=included_results,
+            prior_check=artifact_check,
         )
         if refreshed_check is not None:
             artifact_check = refreshed_check
@@ -621,6 +623,8 @@ def _apply_artifact_status_banner(report: str, artifact_check: dict | None) -> s
 _ARTIFACT_CHECK_PROMPT = """
 You audit research gathered for a forecasting question.
 
+Today's date is {today}.
+
 Forecasting question:
 {title}
 
@@ -629,7 +633,7 @@ The evidence plan named a required evidence artifact:
 
 Research gathered so far (per provider, truncated):
 {research_excerpt}
-
+{prior_check_section}
 Decide whether the required artifact was actually found in the research.
 
 Return only valid JSON:
@@ -644,6 +648,18 @@ Return only valid JSON:
 
 Rules:
 - Every field records what the research CONTAINS, not an analysis of it. In ANY field, do not perform arithmetic, construct a base rate or reference-class frequency, estimate a probability, or editorialize about what a value implies. Quote values with their dates and sources; the forecaster computes rates and draws conclusions.
+- TEMPORAL IMPOSSIBILITY: today is {today}. A report or observation whose claimed event or
+  publication date is AFTER today cannot exist — its date is wrong (almost always a prior-year
+  event mislabeled with the current year, e.g. a year-less "Aug 7" snippet from an old post).
+  Such a value must NOT be presented as a candidate for the resolution window: classify it as
+  misdated historical data, say so explicitly, and exclude it from "closest_available".
+- NEVER assign a year that no source states. A date without a year ("Aug 7", "posted 16h ago")
+  must not be assumed to fall in the current year or in the question's resolution window; record
+  it as "(year not stated in source)".
+- CORRECTIONS OUTRANK EARLIER INFERENCES: if any scraped extract explicitly corrects, redates,
+  or retracts a claim made elsewhere in the research (e.g. "Important note: this event is dated
+  8 August 2025, not 2026"), the correction wins. Report the corrected fact and do not restate
+  the superseded claim anywhere in your output.
 - "complete" only if the artifact's actual values/rows appear in the research text.
 - Mentions that the artifact exists, without its values, count as "partial" at best.
 - A retrieved value that is the right family but the WRONG exact metric does NOT make status "complete", but it MUST be recorded in "closest_available" — never silently discard a value that was actually fetched just because it is not the exact metric. It is decision-relevant and must survive into the brief.
@@ -658,19 +674,65 @@ Rules:
 """.strip()
 
 
+_PRIOR_CHECK_SECTION = """
+An EARLIER automated check of the pre-retry research produced the verdict below, and a
+focused retry then scraped additional sources specifically to verify it. Your job now is to
+RECONCILE, not restate: check each claim in the earlier verdict against what the retry
+actually retrieved. If a retry extract corrects, redates, or contradicts an earlier claim,
+the retry's scraped content OUTRANKS the earlier inference — report the corrected fact and
+drop the superseded claim. Do not carry any earlier claim forward unexamined.
+
+Earlier (pre-retry) verdict to reconcile:
+{prior_check_json}
+"""
+
+
+def _flag_future_dated_claims(check: dict, today: datetime.date | None = None) -> dict:
+    """Deterministic temporal gate over the artifact-check verdict.
+
+    Any full date strictly after the run date appearing in the fields that
+    describe *found* evidence is impossible by construction (a report about a
+    future day cannot have been published). Annotate those fields in place so
+    the warning survives verbatim into the compiler prompt and the brief's
+    authoritative status banner. Fields describing *missing* data legitimately
+    reference future dates and are not scanned.
+    """
+    today = today or datetime.date.today()
+    for field_name in ("what_was_found", "closest_available"):
+        text = check.get(field_name) or ""
+        future_dates = find_future_full_dates(text, today)
+        if future_dates:
+            check[field_name] = (
+                f"{text} [TEMPORAL IMPOSSIBILITY — automated gate: this field claims evidence "
+                f"dated {', '.join(future_dates)}, which is after today ({today.isoformat()}). "
+                f"A report about that date cannot exist yet; the claim is misdated (almost "
+                f"certainly a prior-year event). Treat it as historical data OUTSIDE the "
+                f"resolution window, NOT as an unverified current value.]"
+            )
+    return check
+
+
 async def verify_required_artifact(
     title: str,
     evidence_plan: str,
     provider_results: list[tuple[str, str]],
     model: str = ARTIFACT_CHECK_MODEL,
+    prior_check: dict | None = None,
 ) -> dict | None:
     research_excerpt = "\n\n".join(
         f"## {name}\n{_truncate_text(content, 8_000)}" for name, content in provider_results
     )
+    prior_check_section = (
+        _PRIOR_CHECK_SECTION.format(prior_check_json=json.dumps(prior_check, indent=2))
+        if prior_check
+        else ""
+    )
     prompt = _ARTIFACT_CHECK_PROMPT.format(
         title=title,
+        today=datetime.date.today().isoformat(),
         evidence_plan_excerpt=_truncate_text(evidence_plan, 4_000),
         research_excerpt=_truncate_text(research_excerpt, _MAX_ARTIFACT_CHECK_INPUT_CHARS),
+        prior_check_section=prior_check_section,
         max_retry_queries=_MAX_RETRY_QUERIES,
     )
     try:
@@ -691,14 +753,14 @@ async def verify_required_artifact(
         forecast_swing = str(parsed.get("forecast_swing", "")).strip().lower()
         if forecast_swing not in {"low", "moderate", "decisive"}:
             forecast_swing = ""
-        return {
+        return _flag_future_dated_claims({
             "status": status,
             "what_was_found": str(parsed.get("what_was_found", "")).strip(),
             "what_is_missing": str(parsed.get("what_is_missing", "")).strip(),
             "closest_available": str(parsed.get("closest_available", "")).strip(),
             "forecast_swing": forecast_swing,
             "retry_queries": [str(query).strip() for query in retry_queries if str(query).strip()],
-        }
+        })
     except HardLimitExceededError:
         raise
     except Exception as exc:

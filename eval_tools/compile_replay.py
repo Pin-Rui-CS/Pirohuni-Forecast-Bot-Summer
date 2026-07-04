@@ -10,7 +10,13 @@ prints the new brief alongside the old one saved in research.md.
 Usage:
     poetry run python eval_tools/compile_replay.py 2026-06-25_09-01/<question_dir> [--save]
 
-Nothing is submitted to Metaculus. Cost is one compiler call (~Sonnet, cents).
+Nothing is submitted to Metaculus. Cost is one compiler call (Opus 4.8; roughly
+$0.15 at the 44267 run's size: ~19k input / ~2k output tokens).
+
+To mirror the live pipeline, the saved artifact_check is passed through the
+deterministic future-date gate (using the ORIGINAL run date from forecast.json,
+so replays of old runs behave as the run would have) and the authoritative
+status banner is applied to the new brief — the saved old brief includes it too.
 """
 from __future__ import annotations
 
@@ -29,7 +35,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 dotenv.load_dotenv()
 
 from compiler import compile_research_report  # noqa: E402
+from research.pipeline import (  # noqa: E402
+    _apply_artifact_status_banner,
+    _flag_future_dated_claims,
+)
 from run_logging import setup_run_logging  # noqa: E402
+
+
+def parse_run_date(record: dict) -> datetime.date | None:
+    """Original run date from forecast.json's run_timestamp ('2026-07-03_17-01')."""
+    stamp = str(record.get("run_timestamp") or "")
+    try:
+        return datetime.datetime.strptime(stamp.split("_")[0], "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
 _COMPILED_BRIEF_HEADER = "## Compiled Brief (sent to forecaster)"
 _PROVIDER_RE = re.compile(r"^## Provider:\s*(?P<name>.+?)\s*$", re.MULTILINE)
@@ -78,6 +97,16 @@ async def main() -> None:
     provider_results = load_provider_sections(research_md)
     old_brief = load_old_brief(research_md)
 
+    # Mirror the live pipeline: run the deterministic future-date gate over the
+    # saved artifact_check before compiling. Gate at the ORIGINAL run date so a
+    # replay of an old run flags exactly what the run itself would have flagged.
+    artifact_check = record.get("artifact_check")
+    run_date = parse_run_date(record)
+    if artifact_check:
+        artifact_check = _flag_future_dated_claims(dict(artifact_check), run_date)
+        if "TEMPORAL IMPOSSIBILITY" in json.dumps(artifact_check):
+            print(f"Future-date gate fired (run date {run_date}) — see annotated artifact check.")
+
     print(f"Compiler replay: {record['title']}")
     print(f"Providers reconstructed: {[name for name, _ in provider_results]}")
     print(f"Old brief: {len(old_brief)} chars\n")
@@ -88,8 +117,11 @@ async def main() -> None:
         background=qd.get("description", ""),
         fine_print=qd.get("fine_print", ""),
         provider_results=provider_results,
-        artifact_check=record.get("artifact_check"),
+        artifact_check=artifact_check,
     )
+    # The saved old brief includes the pipeline's authoritative status banner;
+    # apply it to the new brief too so the comparison is like-for-like.
+    new_brief = _apply_artifact_status_banner(new_brief, artifact_check)
 
     print("=" * 70)
     print("NEW BRIEF (current compiler code)")

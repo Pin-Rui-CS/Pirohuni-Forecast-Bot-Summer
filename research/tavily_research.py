@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -31,6 +32,7 @@ from research.serp_research import (
     run_scrape_cycles,
 )
 import source_ledger
+from utils import display_source_date
 
 
 DEFAULT_TAVILY_MAX_RESULTS_PER_QUERY = 10
@@ -262,14 +264,20 @@ def format_tavily_research(result: TavilyResearchResult) -> str:
             )
         ranked_group_lines.append("")
 
-    raw_lines = []
+    raw_lines = [
+        "NOTE: snippets below may show dates without a year (e.g. \"Aug 7\") — these are "
+        "often OLD posts; never assume such a date is current-year or falls in the "
+        "question's resolution window. Where a Date line is decoded from a tweet ID it is "
+        "authoritative for that post.",
+        "",
+    ]
     for index, item in enumerate(result.search_results, start=1):
         raw_lines.extend(
             [
                 f"[{index}] {item.title}",
                 f"    URL: {item.url}",
                 f"    Score: {item.score if item.score is not None else 'Not provided.'}",
-                f"    Date: {item.date or 'Not provided.'}",
+                f"    Date: {display_source_date(item.url, item.date)}",
                 f"    Query: {item.query}",
                 f"    Content: {item.content or 'Not provided.'}",
                 "",
@@ -400,15 +408,23 @@ def _build_ranking_prompt(
                     f"{index}. Title: {item.title}",
                     f"   URL: {item.url}",
                     f"   Score: {item.score if item.score is not None else 'Not provided.'}",
-                    f"   Date: {item.date or 'Not provided.'}",
+                    f"   Date: {display_source_date(item.url, item.date)}",
                     f"   Query: {item.query}",
                     f"   Content: {item.content or 'Not provided.'}",
                 ]
             )
         )
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
 
     return f"""
 You are ranking Tavily search result URLs for a forecasting research pipeline.
+
+Today's date is {today}. Date discipline: a result whose "Date" line is missing or whose
+content shows a date WITHOUT a year (e.g. "Aug 7") must never be assumed to be from the
+current year or from the question's resolution window — old posts and syndicated copies
+surface constantly. No report can describe events after today. If you select such a URL,
+its stated purpose must say "date unconfirmed" rather than asserting it covers the
+resolution window.
 
 Forecasting question:
 {title}

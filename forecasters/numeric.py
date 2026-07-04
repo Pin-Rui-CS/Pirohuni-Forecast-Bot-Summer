@@ -71,6 +71,18 @@ Before forecasting, audit the research material. Answer briefly:
 4. Are any sources weak, stale, or likely misinterpreted?
 5. Which evidence items are strongest and most decision-relevant (cite their IDs)?
 6. Which important facts are missing?
+7. TEMPORAL VALIDITY — today is {today}. Check every evidence item's claimed event or
+   publication date. A "report" about a date AFTER today cannot exist: its date is wrong
+   (almost always a prior-year event mislabeled with the current year). Such items are not
+   "unconfirmed" — they are FALSE as dated. EXCLUDE them as candidate resolution values and
+   re-anchor on confirmed evidence; do NOT spread probability mass around an impossible value.
+   Items whose dates lack a year, or are marked "(date unverified)", must not be assumed to
+   fall inside the resolution window.
+8. RESOLUTION METRIC LOCK — quote the exact field/series/column the question resolves on,
+   from the resolution criteria. If the research reports multiple related measures (a total
+   and a subset, e.g. total sorties vs the count that entered a zone; seasonally-adjusted vs
+   raw), state which single measure resolves the question and use ONLY that measure for
+   every floor, ceiling, anchor, and base rate that follows.
 
 If the research material is insufficient, say so explicitly and lower confidence.
 
@@ -79,6 +91,8 @@ Output:
 - Main research limitations
 - Most important reliable evidence items (by ID)
 - Missing information that could change the forecast
+- Temporal validity: [pass, or list each misdated/impossible item excluded]
+- Resolution metric: [the exact measure that resolves the question]
 
 ---
 
@@ -128,6 +142,13 @@ Before finalising, stress-test your current distribution by seeking the stronges
 - What is the single strongest argument that your central estimate is too HIGH?
 - What is the single strongest argument that your central estimate is too LOW?
 - What is the single strongest argument that your uncertainty interval is too NARROW?
+- KEYSTONE EVIDENCE CHECK: name the single evidence item that, if false, would most change
+  your forecast. Then interrogate it: could it actually exist as dated (see the temporal
+  validity rule in Phase 0)? Is it confirmed by a second INDEPENDENT origin, or are the
+  "corroborating" items just the same underlying event/report repeated (syndicated copies,
+  a tweet quoting the same article)? Correlated echoes count as ONE observation. If the
+  keystone item is unconfirmed or impossible, rebuild your estimate WITHOUT it rather than
+  hedging around it, and say so.
 - Are there important considerations the research material does NOT cover that could meaningfully change the picture?
 - Weigh these challenges honestly. Adjust your distribution if warranted.
 - Consider the duration till resolution.
@@ -137,6 +158,7 @@ Output format:
 - Best case for a higher outcome
 - Best case for a lower outcome
 - Case for wider uncertainty
+- Keystone evidence item, and whether it survives scrutiny
 - Key information gaps
 - **Adjusted estimate after adversarial review: [central value] (90% CI: [low] – [high])**
 

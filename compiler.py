@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import logging
 import re
 from dataclasses import dataclass
@@ -421,7 +422,10 @@ def _format_artifact_check(artifact_check: dict | None) -> str:
     closest_available = artifact_check.get("closest_available")
     if closest_available:
         lines.append(
-            "Closest available adjacent metric (carry forward into Key Evidence, do not drop): "
+            "Closest available adjacent metric (carry forward into Key Evidence UNLESS the "
+            "scraped research explicitly corrects, redates, or refutes it — a correction found "
+            "in the research outranks this line; in that case carry the CORRECTED fact instead "
+            "and flag the discrepancy in Gaps And Cautions): "
             f"{closest_available}"
         )
     forecast_swing = artifact_check.get("forecast_swing")
@@ -457,7 +461,10 @@ def _build_compiler_prompt(
         _format_sections(other_sections), _MAX_COMPILER_INPUT_CHARS
     )
 
+    today = datetime.date.today().isoformat()
     return f"""
+Today's date is {today}.
+
 Forecast question:
 {title}
 
@@ -489,6 +496,9 @@ broad commentary that does not bear on the resolution criteria.
 Consistency check (do this before selecting evidence). Cross-check the retrieved
 items against each other and against the resolution source. Flag every failure in
 "Gaps And Cautions" and never label a failing item `direct`:
+- Temporally impossible evidence: today is {today}. A report or observation whose claimed event or publication date is AFTER today cannot exist — the date is wrong (almost always a prior-year event mislabeled with the current year). Reclassify it as misdated historical data, flag it, and NEVER present its value as a candidate for the resolution window. This rule outranks the automated artifact check above: if that check carries a future-dated claim, correct it here rather than repeating it.
+- Corrections outrank earlier inferences: if any scrape-cycle extract explicitly corrects, redates, or retracts a claim made elsewhere in the research (e.g. "Important note: this event is dated 8 August 2025, not 2026"), the correction wins. Carry the corrected fact into the brief, drop the superseded claim, and flag the contamination in Gaps And Cautions.
+- Year-less dates: never assume a date without a year ("Aug 7") falls in the current year or the resolution window; keep the item marked "(year not stated in source)" and do not label it `direct`.
 - Same value, two dates: if an identical figure is attributed to two different periods (e.g. the same number reported for both 2025 and 2026), at least one date is wrong or it is one stale item double-counted — flag it and treat neither as confirmed current data.
 - Contradicts the resolution series: if a figure conflicts with the resolution source's own table (a "latest" reading the resolution source does not show, or one out of order with its trajectory), trust the resolution source and flag the outlier.
 - Impossible superlative: if a claim like "N-month high/low" is inconsistent with the values in the extracted series, flag it.

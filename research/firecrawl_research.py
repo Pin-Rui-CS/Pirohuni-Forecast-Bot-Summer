@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import logging
 import math
 from dataclasses import asdict, dataclass
@@ -33,6 +34,7 @@ from research.serp_research import (
     run_scrape_cycles,
 )
 import source_ledger
+from utils import display_source_date
 
 
 logger = logging.getLogger(__name__)
@@ -460,15 +462,23 @@ def _build_ranking_prompt(
                     f"   URL: {item.url}",
                     f"   Source: {item.source or 'Not provided.'}",
                     f"   Category: {item.category or 'Not provided.'}",
-                    f"   Date: {item.date or 'Not provided.'}",
+                    f"   Date: {display_source_date(item.url, item.date)}",
                     f"   Query: {item.query}",
                     f"   Description: {item.description or 'Not provided.'}",
                 ]
             )
         )
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
 
     return f"""
 You are ranking Firecrawl search result URLs for a forecasting research pipeline.
+
+Today's date is {today}. Date discipline: a result whose "Date" line is missing or whose
+description shows a date WITHOUT a year (e.g. "Aug 7") must never be assumed to be from the
+current year or from the question's resolution window — old posts and syndicated copies
+surface constantly. No report can describe events after today. If you select such a URL,
+its stated purpose must say "date unconfirmed" rather than asserting it covers the
+resolution window.
 
 Forecasting question:
 {title}

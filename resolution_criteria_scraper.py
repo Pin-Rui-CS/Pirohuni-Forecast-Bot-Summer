@@ -618,6 +618,39 @@ async def _scrape_resolution_url(
         )
 
     # ------------------------------------------------------------------
+    # 0. Google Sheets: fetch the CSV export directly. Page-scraping a large
+    #    sheet returns whatever rows the rendered grid shows (for PLATracker
+    #    that meant early-2021 rows only, dropping the resolution window), so
+    #    the deterministic export path always runs first for sheet URLs.
+    # ------------------------------------------------------------------
+    try:
+        from Adapters.GoogleSheets import GoogleSheetsAdapter
+
+        _sheets_adapter = GoogleSheetsAdapter()
+        if _sheets_adapter.can_handle(url):
+            try:
+                result = await _sheets_adapter.extract(url, query=question_text, timeout=timeout)
+                content = _truncate_scrape_content(result.content)
+                if content.strip():
+                    return _record_and_return(
+                        f"adapter:{_sheets_adapter.name}",
+                        f"adapter:{_sheets_adapter.name}",
+                        content,
+                        "",
+                    )
+                logger.info(
+                    "Google Sheets CSV export returned no content for %s; "
+                    "falling back to page scraping.", url,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Google Sheets CSV export failed for %s: %s — falling back to "
+                    "page scraping.", url, exc,
+                )
+    except ImportError as exc:
+        logger.warning("Google Sheets adapter unavailable: %s", exc)
+
+    # ------------------------------------------------------------------
     # 1. Firecrawl single-page scrape (skipped once credits/auth exhausted).
     # ------------------------------------------------------------------
     if not _firecrawl_exhausted:

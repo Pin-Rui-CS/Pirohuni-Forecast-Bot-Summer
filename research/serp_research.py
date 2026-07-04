@@ -10,7 +10,7 @@ import httpx
 
 from config import SERPAPI_API_KEY
 from llm_client import call_llm
-from utils import _truncate_text
+from utils import _truncate_text, display_source_date, tweet_url_date
 import source_ledger
 from query_maker import (
     DEFAULT_QUERY_COUNT,
@@ -540,15 +540,23 @@ def _build_ranking_prompt(
                 [
                     f"{index}. Title: {item.title}",
                     f"   URL: {item.link}",
-                    f"   Date: {item.date or 'Not provided.'}",
+                    f"   Date: {display_source_date(item.link, item.date)}",
                     f"   Query: {item.query}",
                     f"   Snippet: {item.snippet or 'Not provided.'}",
                 ]
             )
         )
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
 
     return f"""
 You are ranking Google Search result URLs for a forecasting research pipeline.
+
+Today's date is {today}. Date discipline: a result whose "Date" line is missing or whose
+snippet shows a date WITHOUT a year (e.g. "Aug 7") must never be assumed to be from the
+current year or from the question's resolution window — old posts and syndicated copies
+surface constantly. No report can describe events after today. If you select such a URL,
+its stated purpose must say "date unconfirmed" rather than asserting it covers the
+resolution window.
 
 Forecasting question:
 {title}
@@ -875,9 +883,16 @@ def build_url_date_map(url_date_pairs: Iterable[tuple[str, str]]) -> dict[str, s
 
 
 def _url_date_lookup(url_dates: dict[str, str] | None, url: str) -> str:
-    if not url_dates:
-        return ""
-    return url_dates.get(url) or url_dates.get(_norm_url(url), "")
+    if url_dates:
+        provider_date = url_dates.get(url) or url_dates.get(_norm_url(url), "")
+        if provider_date:
+            return provider_date
+    # X/Twitter status URLs: the snowflake ID encodes the authoritative post
+    # date; scraped X pages show year-less dates that otherwise get misread.
+    decoded = tweet_url_date(url)
+    if decoded:
+        return f"{decoded} (decoded from the tweet ID; authoritative post date)"
+    return ""
 
 
 def _format_scrapes_for_prompt(
