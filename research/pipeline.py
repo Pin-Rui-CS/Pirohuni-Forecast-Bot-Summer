@@ -23,7 +23,7 @@ import source_ledger
 
 logger = logging.getLogger(__name__)
 
-ARTIFACT_CHECK_MODEL = "anthropic/claude-sonnet-4.6"
+ARTIFACT_CHECK_MODEL = "anthropic/claude-sonnet-5"
 _MAX_ARTIFACT_CHECK_INPUT_CHARS = 40_000
 _MAX_RETRY_QUERIES = 4
 ARTIFACT_RETRY_TIMEOUT_SECONDS = float(os.getenv("ARTIFACT_RETRY_TIMEOUT_SECONDS", "150"))

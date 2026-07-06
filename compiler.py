@@ -9,7 +9,11 @@ from typing import Iterable
 from openai import AsyncOpenAI
 
 from config import OPENROUTER_API_KEY, llm_rate_limiter
-from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
+from monetary_cost_manager import (
+    OPENROUTER_USAGE_ACCOUNTING,
+    HardLimitExceededError,
+    MonetaryCostManager,
+)
 from utils import _truncate_text
 
 logger = logging.getLogger(__name__)
@@ -397,6 +401,7 @@ async def _try_llm_compile(
                 temperature=0.1,
                 max_tokens=5000,
                 stream=False,
+                extra_body=OPENROUTER_USAGE_ACCOUNTING,
             )
         usage_handle.record_response(response)
         logger.info("research-compiler | model=%s | OpenRouter usage recorded", model)

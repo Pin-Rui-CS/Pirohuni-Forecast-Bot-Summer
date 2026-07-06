@@ -29,7 +29,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
+from monetary_cost_manager import (
+    OPENROUTER_USAGE_ACCOUNTING,
+    HardLimitExceededError,
+    MonetaryCostManager,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -37,7 +41,7 @@ from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
 
 _OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-_KALSHI_SCORING_MODEL = "anthropic/claude-sonnet-4.6"
+_KALSHI_SCORING_MODEL = "anthropic/claude-sonnet-5"
 
 _KALSHI_API_BASE = "https://external-api.kalshi.com/trade-api/v2"
 _MAX_RESULTS = 3
@@ -98,6 +102,7 @@ def _generate_search_queries(question: str) -> list[str]:
             model=_KALSHI_SCORING_MODEL,
             messages=messages,
             temperature=0,
+            extra_body=OPENROUTER_USAGE_ACCOUNTING,
         )
         usage_handle.record_response(response)
         content = response.choices[0].message.content.strip()
@@ -365,6 +370,7 @@ def _score_markets(question: str, markets: list[dict]) -> list[float]:
         model=_KALSHI_SCORING_MODEL,
         messages=messages,
         temperature=0,
+        extra_body=OPENROUTER_USAGE_ACCOUNTING,
     )
     usage_handle.record_response(response)
     content = response.choices[0].message.content.strip()

@@ -16,6 +16,9 @@ from utils import _get_field, _json_default
 logger = logging.getLogger(__name__)
 
 OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
+# Pass as extra_body on chat.completions.create so OpenRouter returns the
+# detailed usage breakdown (completion_tokens_details.reasoning_tokens, cost).
+OPENROUTER_USAGE_ACCOUNTING: Final[dict[str, Any]] = {"usage": {"include": True}}
 CHARACTERS_PER_TOKEN = 4
 DEFAULT_INPUT_TOKEN_HARD_LIMIT = 250_000
 DEFAULT_OUTPUT_TOKEN_HARD_LIMIT = 50_000
@@ -35,13 +38,21 @@ class OpenRouterUsageRecord:
     output_tokens: int
     model_used: str
     duration_seconds: float = 0.0
+    reasoning_tokens: int = 0
 
 
 class OpenRouterUsageHandle:
     """Mutable handle for one OpenRouter call recorded across active managers."""
 
-    def __init__(self, records: list[OpenRouterUsageRecord]) -> None:
+    def __init__(
+        self,
+        records: list[OpenRouterUsageRecord],
+        name_of_task: str = "",
+        model: str = "",
+    ) -> None:
         self._records = records
+        self._name_of_task = name_of_task
+        self._model = model
         self._finished = False
         self._started_at = time.monotonic()
 
@@ -54,6 +65,16 @@ class OpenRouterUsageHandle:
         return self._records[0].input_tokens if self._records else 0
 
     def record_response(self, response: Any) -> None:
+        reasoning_tokens = count_openrouter_reasoning_tokens(response)
+        if not self._finished:
+            for record in self._records:
+                record.reasoning_tokens = reasoning_tokens
+            logger.info(
+                "[reasoning] %s | model=%s | reasoning_tokens=%d",
+                self._name_of_task,
+                self._model,
+                reasoning_tokens,
+            )
         self.record_output_characters(count_openrouter_output_characters(response))
 
     def record_output(self, output: Any) -> None:
@@ -140,6 +161,11 @@ class MonetaryCostManager:
             return sum(record.output_tokens for record in self._records)
 
     @property
+    def total_reasoning_tokens(self) -> int:
+        with self._lock:
+            return sum(record.reasoning_tokens for record in self._records)
+
+    @property
     def total_tokens(self) -> int:
         return self.total_input_tokens + self.total_output_tokens
 
@@ -166,6 +192,7 @@ class MonetaryCostManager:
                     output_tokens=record.output_tokens,
                     model_used=record.model_used,
                     duration_seconds=record.duration_seconds,
+                    reasoning_tokens=record.reasoning_tokens,
                 )
                 for record in self._records
             ]
@@ -180,6 +207,7 @@ class MonetaryCostManager:
             f"  input_token_hard_limit: {self.input_token_hard_limit}",
             f"  total_output_characters: {self.total_output_characters}",
             f"  total_output_tokens: {self.total_output_tokens}",
+            f"  total_reasoning_tokens: {self.total_reasoning_tokens}  # provider-reported; included in output billing, not in the char-based estimates above",
             f"  output_token_hard_limit: {self.output_token_hard_limit}",
             f"  total_tokens: {self.total_tokens}",
             f"  total_token_hard_limit: {self.hard_limit}",
@@ -264,7 +292,7 @@ class MonetaryCostManager:
                         input_characters,
                         input_tokens,
                     )
-        return OpenRouterUsageHandle(records)
+        return OpenRouterUsageHandle(records, name_of_task=name_of_task, model=model)
 
     @classmethod
     def _check_active_limits_after_usage_update(cls) -> None:
@@ -310,6 +338,18 @@ def count_serialized_characters(value: Any) -> int:
         return len(str(value))
 
 
+def count_openrouter_reasoning_tokens(response: Any) -> int:
+    """Provider-reported reasoning tokens (0 when the model didn't think or the
+    provider omitted the breakdown)."""
+    usage = _get_field(response, "usage")
+    details = _get_field(usage, "completion_tokens_details")
+    value = _get_field(details, "reasoning_tokens")
+    try:
+        return max(0, int(value)) if value is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def count_openrouter_output_characters(response: Any) -> int:
     output_parts: list[str] = []
     choices = _get_field(response, "choices")
@@ -335,8 +375,8 @@ def count_openrouter_output_characters(response: Any) -> int:
 
 def _format_usage_markdown_table(records: list[OpenRouterUsageRecord]) -> str:
     lines = [
-        "| no. | name of task | input characters | input tokens | output characters | output tokens | seconds | model used |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| no. | name of task | input characters | input tokens | output characters | output tokens | reasoning tokens | seconds | model used |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for record in records:
         lines.append(
@@ -347,6 +387,7 @@ def _format_usage_markdown_table(records: list[OpenRouterUsageRecord]) -> str:
             f"{record.input_tokens} | "
             f"{record.output_characters} | "
             f"{record.output_tokens} | "
+            f"{record.reasoning_tokens} | "
             f"{record.duration_seconds:.1f} | "
             f"{_table_cell(record.model_used)} |"
         )

@@ -21,8 +21,8 @@ from query_maker import (
 
 
 DEFAULT_SERP_NUM_RESULTS = 10
-DEFAULT_SERP_RANKING_MODEL = "anthropic/claude-sonnet-4.6"
-DEFAULT_EXTRACT_MODEL = "anthropic/claude-sonnet-4.6"
+DEFAULT_SERP_RANKING_MODEL = "anthropic/claude-sonnet-5"
+DEFAULT_EXTRACT_MODEL = "anthropic/claude-sonnet-5"
 DEFAULT_MAX_RANKED_URLS = 20
 DEFAULT_MAX_SCRAPE_CYCLES = 3
 SERPAPI_SEARCH_URL = "https://serpapi.com/search"

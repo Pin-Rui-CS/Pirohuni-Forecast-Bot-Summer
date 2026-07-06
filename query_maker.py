@@ -10,7 +10,7 @@ from utils import _truncate_text
 
 
 DEFAULT_QUERY_COUNT = 8
-DEFAULT_QUERY_GENERATION_MODEL = "anthropic/claude-sonnet-4.6"
+DEFAULT_QUERY_GENERATION_MODEL = "anthropic/claude-sonnet-5"
 DEFAULT_ASKNEWS_CHAR_LIMIT = 14_000
 
 

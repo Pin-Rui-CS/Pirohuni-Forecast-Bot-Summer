@@ -7,7 +7,7 @@ from monetary_cost_manager import HardLimitExceededError
 from utils import _truncate_text
 
 
-DEFAULT_EVIDENCE_PLAN_MODEL = "anthropic/claude-sonnet-4.6"
+DEFAULT_EVIDENCE_PLAN_MODEL = "anthropic/claude-sonnet-5"
 _MAX_ASKNEWS_CHARS = 12_000
 
 

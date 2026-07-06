@@ -28,7 +28,11 @@ from dataclasses import dataclass
 import httpx
 
 from config import FIRECRAWL_API_KEY, OPENROUTER_API_KEY, llm_rate_limiter  # noqa: E402
-from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager  # noqa: E402
+from monetary_cost_manager import (  # noqa: E402
+    OPENROUTER_USAGE_ACCOUNTING,
+    HardLimitExceededError,
+    MonetaryCostManager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +363,7 @@ async def _llm_summarize(
             messages=messages,
             max_tokens=max_tokens,
             temperature=0.1,
+            extra_body=OPENROUTER_USAGE_ACCOUNTING,
         )
     usage_handle.record_response(response)
     _log_openrouter_call("resolution-scraper/page-summary", model)
@@ -450,6 +455,7 @@ async def _compile_summaries(
             messages=messages,
             max_tokens=2000,
             temperature=0.1,
+            extra_body=OPENROUTER_USAGE_ACCOUNTING,
         )
     usage_handle.record_response(response)
     _log_openrouter_call("resolution-scraper/compile-summaries", model)
@@ -724,7 +730,7 @@ async def _legacy_scrape_resolution_sources_with_followups(
     resolution_criteria: str,
     question_text: str = "",
     use_llm_cleaning: bool = False,
-    llm_model: str = "anthropic/claude-sonnet-4.6",
+    llm_model: str = "anthropic/claude-sonnet-5",
     max_concurrent: int = 3,
     timeout: int = 30,
 ) -> str:
@@ -915,7 +921,7 @@ async def scrape_resolution_sources(
     resolution_criteria: str,
     question_text: str = "",
     use_llm_cleaning: bool = False,
-    llm_model: str = "anthropic/claude-sonnet-4.6",
+    llm_model: str = "anthropic/claude-sonnet-5",
     max_concurrent: int = 5,
     timeout: int = 30,
     max_urls: int = 10,

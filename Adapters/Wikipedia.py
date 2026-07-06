@@ -17,7 +17,7 @@ USER_AGENT = (
     "Pirohuni-Forecast-Bot/0.1 "
     "(https://github.com/Pirohuni/Pirohuni-Forecast-Bot-Summer; forecasting research)"
 )
-DEFAULT_EXTRACT_MODEL = "anthropic/claude-sonnet-4.6"
+DEFAULT_EXTRACT_MODEL = "anthropic/claude-sonnet-5"
 MAX_WIKIPEDIA_SOURCE_CHARS = 80_000
 MAX_TABLE_ROWS = 80
 MAX_CELL_CHARS = 260

@@ -13,7 +13,7 @@ from typing import Any
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
 
 from config import OPENROUTER_API_KEY, llm_rate_limiter
-from monetary_cost_manager import MonetaryCostManager
+from monetary_cost_manager import OPENROUTER_USAGE_ACCOUNTING, MonetaryCostManager
 from utils import _get_field, _json_default, _truncate_text
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,7 @@ async def _create_chat_completion_with_retries(
             try:
                 response = await client.chat.completions.create(
                     model=model,
+                    extra_body=OPENROUTER_USAGE_ACCOUNTING,
                     **request_payload,
                 )
             except (APIConnectionError, APIStatusError, APITimeoutError, RateLimitError) as exc:
