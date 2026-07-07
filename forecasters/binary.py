@@ -79,9 +79,26 @@ Output:
 
 ---
 
+## PHASE 0.5 — RESOLUTION MECHANICS (model the resolution procedure before the event)
+
+How will the resolution value actually be produced? If the question resolves by direct observation of an event, say so in one line and move on to Phase 1.
+
+If it resolves off a published source (a curated page, tracker, leaderboard, or scheduled data release):
+1. Enumerate the states the source can be in at the deadline as explicit branches (e.g. "not updated — the currently displayed value stands" vs "updated — showing what the update can actually contain"). Use the brief's Resolution Mechanics section; stable procedural facts (reporting calendars, disclosure lags, filing deadlines) may be resolved "[from background knowledge]" per the discipline rules.
+2. Assign a probability to each branch, citing the cadence evidence: stated update policy, the observed freshness gap between fetch date and displayed data cutoff, and scheduled data events before the deadline.
+3. State what each branch implies for YES/NO. In a "source not updated" branch the currently displayed value usually decides the outcome with near-certainty — say so rather than re-litigating the underlying event inside that branch.
+4. Carry the branches through the rest of your analysis: Phases 1–4 refine P(YES | branch) for the branches where the outcome is genuinely open, and your final estimate must be the mixture P(YES) = Σ over branches of P(branch) × P(YES | branch). Show that arithmetic explicitly.
+
+Output format:
+- Branches, their probabilities, and the evidence for each
+- What each branch implies for YES/NO
+- **Estimate implied by the branch structure: X% (or "Not applicable — direct observation")**
+
+---
+
 ## PHASE 1 — OUTSIDE VIEW (Base Rate)
 
-Establish a starting probability using base rates and reference classes.
+Establish a starting probability using base rates and reference classes. If Phase 0.5 produced branches, the base-rate work in this phase applies WITHIN the branches where the outcome is open — do not overwrite the branch structure with a generic prior over the whole question.
 
 - Identify the most relevant reference class for this question. What is the general category of event being predicted?
 - State the historical counts or rates you are using as explicit numbers, with their source or evidence ID. Show the simple arithmetic that turns them into a base rate.
@@ -159,6 +176,7 @@ Summarise your forecast in this structure:
 **Final Probability:** X%
 **Key drivers:** [2-3 most influential evidence items by ID, ranked]
 **Biggest uncertainty:** [the single factor that could most change this forecast]
+**Branch arithmetic:** [if Phase 0.5 produced branches, show the mixture: P(YES) = P(branch_1) × P(YES | branch_1) + ... ; otherwise "not applicable"]
 **Estimate trajectory:** Starting X% → After inside view X% → After adversarial review X% → Final X%
 
 The last thing you write is your final answer as: "Probability: ZZ%", 0-100

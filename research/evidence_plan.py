@@ -84,6 +84,11 @@ Return only valid JSON in this shape:
     "ideal_sources": ["official source", "primary dataset"],
     "fields_to_extract": ["year", "value", "source_url", "notes"]
   }},
+  "resolution_mechanics": {{
+    "source_update_behavior": "Does the resolution source update or publish again before the resolution deadline? State the known or likely cadence, the next expected update, and what evidence would pin it down",
+    "update_content_limits": "What new information CAN appear in the source before the deadline, and what CANNOT arrive in time (reporting calendars, disclosure deadlines, data-pipeline or publication lags)",
+    "mechanics_queries": ["search query targeting the source's update schedule or the underlying reporting calendar"]
+  }},
   "direct_evidence": ["Evidence that directly resolves or measures the question"],
   "near_proxy_evidence": ["Evidence that is close but not exact"],
   "weak_proxy_evidence": ["Evidence that is only indirectly related"],
@@ -96,6 +101,8 @@ Rules:
 - Prefer official, source-of-truth artifacts over broad news.
 - For count questions, the required artifact is usually a historical count table.
 - For direct prediction markets, distinguish exact-human/outcome markets from adjacent proxy markets.
+- When the question resolves off a curated page, tracker, leaderboard, or scheduled data release ("as shown/displayed on X as of date D"), the source's update mechanics — whether it refreshes before the deadline and what a refresh can legally or physically contain — are often MORE decision-relevant than the underlying race. Fill resolution_mechanics with concrete cadences, calendars, and lags to verify (e.g. filing deadlines, release schedules, disclosure windows), and add mechanics_queries that target them specifically.
+- When the question resolves by direct observation of an event rather than a published source, set both resolution_mechanics text fields to "Not applicable — resolves by direct observation of the event" and leave mechanics_queries empty.
 - Do not forecast or estimate probabilities.
 """.strip()
 
@@ -123,6 +130,10 @@ def _extract_json_object(text: str) -> dict:
 
 def _format_plan(plan: dict) -> str:
     artifact = plan.get("required_artifact") if isinstance(plan.get("required_artifact"), dict) else {}
+    mechanics = plan.get("resolution_mechanics") if isinstance(plan.get("resolution_mechanics"), dict) else {}
+    search_queries = plan.get("search_queries") if isinstance(plan.get("search_queries"), list) else []
+    mechanics_queries = mechanics.get("mechanics_queries") if isinstance(mechanics.get("mechanics_queries"), list) else []
+    combined_queries = list(search_queries) + [q for q in mechanics_queries if q not in search_queries]
     lines = [
         "# Evidence Plan",
         "",
@@ -131,6 +142,10 @@ def _format_plan(plan: dict) -> str:
         f"- Why it matters: {artifact.get('why_it_matters') or 'Not stated.'}",
         f"- Ideal sources: {_format_list(artifact.get('ideal_sources'))}",
         f"- Fields to extract: {_format_list(artifact.get('fields_to_extract'))}",
+        "",
+        "## Resolution Mechanics",
+        f"- Source update behavior: {mechanics.get('source_update_behavior') or 'Not assessed.'}",
+        f"- What an update can contain before the deadline: {mechanics.get('update_content_limits') or 'Not assessed.'}",
         "",
         "## Direct Evidence To Find",
         *_format_bullets(plan.get("direct_evidence")),
@@ -148,7 +163,7 @@ def _format_plan(plan: dict) -> str:
         *_format_bullets(plan.get("contradictions_to_check")),
         "",
         "## Search Queries To Prefer",
-        *_format_bullets(plan.get("search_queries")),
+        *_format_bullets(combined_queries),
     ]
     return "\n".join(lines).strip()
 
@@ -164,6 +179,10 @@ Evidence planning failed: {type(exc).__name__}: {exc}
 - Why it matters: The forecast should be anchored to the most direct base-rate or official artifact available.
 - Ideal sources: official source, primary dataset, reputable archive
 - Fields to extract: date or year, value or status, source_url, notes
+
+## Resolution Mechanics
+- Source update behavior: Not assessed (evidence planning failed).
+- What an update can contain before the deadline: Not assessed (evidence planning failed).
 
 ## Direct Evidence To Find
 - Official resolution-source facts and direct markets that match the exact question.

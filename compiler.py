@@ -486,7 +486,10 @@ Automated check of whether the required evidence artifact was found:
 {_format_artifact_check(artifact_check)}
 
 RESOLUTION SOURCE material (AUTHORITATIVE — this is the page/feed the question
-resolves from; it outranks every secondary source below for the resolution value):
+resolves from; it outranks every secondary source below for the resolution value.
+It was scraped DURING THIS RESEARCH RUN, i.e. on {today}; if the page displays a
+data cutoff or "as of" date older than that, the gap between the two dates is
+direct evidence of how often the source actually updates):
 {resolution_text or "No resolution-source scrape was available for this question."}
 
 Other research provider outputs, already partially cleaned (secondary; use to inform
@@ -519,6 +522,13 @@ Output exactly these Markdown sections:
 - If it is a table or time series and any rows were extracted, reproduce those rows here verbatim, and mark the resolution-target row as "not yet released" when the resolution source does not show it. This is the single most important section.
 - Never present a secondary or year-ago figure as if it were the confirmed resolution value.
 - If the automated check lists a "Closest available adjacent metric", reproduce it here and carry it into Key Evidence as an `adjacent-metric` item. Never omit a value that was actually retrieved just because it is not the exact metric.
+
+## Resolution Mechanics
+Only when the question resolves off a published source (a curated page, tracker, leaderboard, or scheduled data release) rather than by direct observation of an event; if it resolves by direct observation, write the single bullet "Not applicable — resolves by direct observation of the event." Otherwise, at most 4 bullets, each citing its evidence:
+- Whether the resolution source will or may update again before the resolution deadline: stated cadence (e.g. "updated periodically"), scheduled releases, and the observed freshness gap. If the resolution-source scrape (fetched {today}) displays a data cutoff or "as of" date older than the fetch date, state both dates explicitly — that gap is direct update-cadence evidence.
+- What new information CAN appear in the source before the deadline, and what CANNOT arrive in time (reporting calendars, disclosure deadlines, publication or data-pipeline lags). Distinguish activity that will be observable by the deadline from activity that happens before the deadline but is disclosed only after it.
+- Any scheduled data event between today and the deadline (filing deadline, release date) that would change what the source shows.
+- If the research contains nothing on these mechanics, write one bullet saying exactly that — do not invent a cadence or calendar.
 
 ## Key Evidence
 A list of at most 15 items. Do NOT sort by relevance — order does not matter, and the [E#] labels are just citation handles, not a priority ranking. Format each item as:

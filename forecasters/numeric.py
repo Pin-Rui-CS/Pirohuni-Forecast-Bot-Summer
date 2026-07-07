@@ -103,6 +103,7 @@ Establish a starting distribution using base rates and reference classes.
 - Identify the most relevant reference class. What is the typical range of outcomes for this type of quantity?
 - State the historical values you are using as an explicit list, with their source or evidence ID. Reason about central tendency, spread, and skew from those stated values, showing simple arithmetic in-line.
 - Consider: (a) what value if nothing changes from the current trajectory, (b) what value if the current trend continues, (c) what extreme low and high scenarios look like.
+- If the question resolves off a published source (a curated page, tracker, or scheduled data release), check the brief's Resolution Mechanics section first: whether the source updates again before the deadline and what an update can contain. "Source not updated — the displayed value stands" is a legitimate and often high-probability future; model it as a narrow component centered on the displayed value rather than widening one distribution around it.
 - Treat prediction market data carefully: Polymarket and Kalshi are real-money market priors weighted by their volume, liquidity, bid/ask spread, and relevance to the question; Manifold is a play-money crowd signal and should be discounted relative to comparable real-money markets.
 
 Output format:
@@ -152,7 +153,7 @@ Before finalising, stress-test your current distribution by seeking the stronges
 - Are there important considerations the research material does NOT cover that could meaningfully change the picture?
 - Weigh these challenges honestly. Adjust your distribution if warranted.
 - Consider the duration till resolution.
-- If your reasoning here identifies genuinely distinct futures (e.g. "report published on time" vs "publication delayed"), name them — they become the scenarios of your final output.
+- If your reasoning here identifies genuinely distinct futures (e.g. "report published on time" vs "publication delayed", or "resolution source updates before the deadline" vs "it does not and the displayed value stands"), name them — they become the scenarios of your final output.
 
 Output format:
 - Best case for a higher outcome

@@ -7,6 +7,131 @@ re-deriving the same diagnosis twice — read this before touching the forecasti
 
 ---
 
+## 2026-07-07 — Ensemble shares a base-rate construction error (ignored the zero months) and the median ratifies it → binary forecast ~15–20pts high
+
+| | |
+|---|---|
+| **Severity** | High — 44379 submitted 61% where a defensible read of the bot's own brief is ~40–45%. Question resolves 2026-08-05, so an unconfirmed miss, but the error is structural and reproduced on replay |
+| **Introduced** | Long-standing — the binary prompt lets a rate be computed over a hand-picked dense sub-window, and the median aggregator has no defence against a *correlated* (shared-method) error; `spread_pp` was logged but gated nothing below 30 |
+| **Detected** | 2026-07-07 — question 44379 ("Will any of OpenAI, Anthropic, or Mistral AI have a funding round listed by TracXn dated July 2026?", `binary`), run `2026-07-07_06-01` |
+| **Diagnosed** | 2026-07-07 — root cause confirmed; fixes proposed and replay-validated (2 Opus calls) but **not yet committed** |
+| **Affected window** | Any binary/count question whose outside view is a rate over time, where recent zero periods are the most diagnostic observations and two of three ensemble members build the rate from the same peak sub-window |
+
+### Symptom
+Three Opus runs landed 67 / 46 / 61 (median 61%, `spread_pp: 21`). The 21-point
+spread was one disagreement: **whether May and June 2026 (two consecutive zero
+months, the most recent data) entered the base rate.** Run 2 (46%) extended its
+window to the present and counted them; Run 1 (67%) and Run 3 (61%) computed a
+rate from the Feb–Apr peak burst and never registered them. The median then selected the
+contaminated methodology 2-to-1. This is the mirror image of the shared-brief
+failures below: there a bad brief poisoned every run; here the **brief was good**
+(the postmortem rates the research stage as sound) and the runs manufactured
+correlated *reasoning* errors from it.
+
+### Root cause
+A cluster of forecasting-stage defects, all in `forecasters/binary.py`:
+1. **Contaminated base rate.** Nothing forced the rate to be computed over a
+   window ending at *today*. Two runs used the Feb–Apr dense sub-window
+   (Anthropic ~0.5/mo, OpenAI ~0.6–0.8/mo → ~77–79% raw) and extrapolated it as
+   steady state, silently dropping the two most recent (zero) months.
+2. **Extrapolating a dead pattern.** All three leaned on "OpenAI logs small Series
+   F tranches nearly monthly" as the top YES driver — a three-observation pattern
+   (Feb 27 / Mar 20 / Apr 22) that had **already been silent ten weeks** at
+   forecast time. This also double-counts: the tranche pattern (E5) and the
+   cadence base rate (E2) derive from the same TracXn table, yet Runs 1 and 3
+   baked cadence into Phase 1 and re-added +3 to +5 for tranches in Phase 2,
+   against the prompt's own correlated-evidence rule. Symptom: Run 1's estimate
+   moved *up* through the inside view (70→72) even though the genuinely new
+   information in the brief was net negative.
+3. **A rumor paid three times.** E6 (OpenAI government-stake rumor, single Chinese
+   aggregator, "preliminary discussions", a secondary equity sale TracXn has no
+   precedent for listing as a round) got +2/+3/+2. The prompt allowed it to be
+   discounted but not dropped.
+4. **The median can't catch a majority error.** `FORECASTER_MODELS` is pinned to
+   one model, so three runs on one brief produce correlated errors; the median is
+   variance-resistant but ratifies a shared mistake. The tiebreaker threshold
+   (`SPREAD_THRESHOLD = 30`) never fired on this 21pp spread, so no adjudicator
+   read the transcripts to confront the May/June disagreement.
+5. **No resolution-mechanism modelling.** The real crux was TracXn's
+   data-generating process (backdating to transaction date, listing latency,
+   what counts as a "round"), which no run modelled beyond noting the Anthropic
+   Apr-logged/late-May-closed discrepancy exists. Backdating cuts both ways: an
+   Aug 1–5 row carrying a July date resolves YES (window wider than modelled); a
+   July close dated June resolves NO.
+
+### The fix (proposed + replay-validated, NOT yet committed)
+The resolution-mechanics half (defect 5) is **already in the working tree** —
+Phase 0.5 in `forecasters/binary.py`, the "Resolution Mechanics" brief section in
+`compiler.py`, and the `resolution_mechanics` plan block in
+`research/evidence_plan.py` — but this run predated it. The remaining, proposed
+edits (hardened after a robustness review to avoid over-correction):
+- **Window audit (defect 1)** — Phase 1 gains a *mandatory output field*: "Window:
+  <start> to <today>. Periods with zero events: <enumerate>. Trailing periods
+  possibly incomplete due to source logging/backdating lag: <yes/no — why>." Made
+  a required field, not a prose rule, because the existing correlated-evidence
+  *rule* was already ignored by 2 of 3 runs. The right-censoring caveat is
+  deliberate: on a backdating source, trailing zeros must be discounted as partial,
+  not counted as hard zeros, or the fix over-corrects downward.
+- **Pattern-continuation check (defect 2)** — Phase 2 gains a mandatory line for
+  every extrapolated pattern: "Last instance / typical interval / elapsed since."
+  No bright-line threshold (that was brittle); forcing the computation is enough.
+- **Narrowed droppable-evidence rule (defect 3)** — an item may be dropped to zero
+  *only* when it is a single-source rumor **and** its impact hinges on an
+  unprecedented classification decision by the resolution source; otherwise it must
+  be modelled explicitly (P(counts) × P(happens)). Rumor status alone never
+  justifies a drop — this keeps legitimate leading indicators (e.g. Mistral's €3B
+  talks) alive while killing E6.
+- **Tiebreaker gate (defect 4)** — lower `SPREAD_THRESHOLD` toward ~15 and turn the
+  tiebreaker into an *adjudicator* ("identify the primary disagreement and rule on
+  it; answer must lie within the run range"). Deploy in **shadow mode** first
+  (log both, submit the median) until resolved-question Brier data justifies the
+  switch — this is the only change that can make a quiet-question submission worse.
+
+### Verification (replay, 2 Opus calls, `scratchpad/replay.py`)
+The three prompt edits were spliced into the live template and replayed against the
+archived briefs. 44379 (failure case) → **33%**, and the transcript shows the
+mechanism: it enumerated the five zero months, computed the pattern's 2.5-month
+gap and declined to treat it as live, and modelled E6 explicitly (~6%) instead of
+a flat bump. Control question 44375 (Mpox/WNV, which the pipeline got right at
+median 0.22) → **14%** with no over-correction: the right-censoring caveat kept
+recent zeros as *partial*, the pattern check correctly judged WNV season *live*,
+and Rule 8 did **not** over-drop (kept E5 via ordinary downweighting). Grading was
+on **process compliance** (deterministic from one transcript), not on averaging out
+sampling noise, so one call per question sufficed. Caveat: n=1 per question proves
+the disciplines fire, not the estimate distribution — the full N=5 replay across a
+failure+control set is still the thing to run before committing.
+
+### Free findings (no LLM calls)
+- **Spread scan** — only two binaries archived (44379: 21pp; 44375: 8pp), both
+  under the current 30 gate. Consistent with a 15pp gate catching the miss and
+  sparing the hit, but far too small a sample to set the threshold on; scan the
+  full archive first.
+- **Social-URL prefilter** — 14 of 89 ranking candidates were
+  Facebook/Instagram/YouTube/X/Reddit/LinkedIn, which essentially never scrape.
+  Excluding them from the *scrape pool* (but keeping their search snippets — one
+  was OpenAI's own X announcement) removes them from the `tavily-url-ranking`
+  payload, the run's single largest input line (~24% of input tokens).
+
+### Lessons
+- The median protects against **outlier noise**, not against a **majority sharing a
+  method error**. Single-model ensembles need an adjudicator that reads the
+  reasoning, gated on spread, not just a vote.
+- A discipline expressed as a **prose rule** decays as rules accumulate (the
+  correlated-evidence rule was already present and ignored). Convert load-bearing
+  disciplines into **required output fields** — models fill fields reliably and
+  skim admonitions.
+- On a backdating/lagging resolution source, recent zero periods are *partly
+  censored*, not hard evidence — a "count the zero months" fix must carry that
+  caveat or it over-corrects the very lag-prone questions it should protect.
+- "Drop the rumor" is too blunt; the droppable property is *rumor × unprecedented
+  source-classification dependency*, not rumor alone — or you delete the leading
+  indicators that beat base rates.
+- Validate a prompt change on **process**, not the number: "lands near 40%" is
+  overfitting one datum; "enumerates the zero months before computing a rate" is
+  the thing that generalizes.
+
+---
+
 ## 2026-06-30 — Artifact-check manufactures a base rate and the "authoritative" banner freezes it → ensemble anchors ~20pts low
 
 | | |

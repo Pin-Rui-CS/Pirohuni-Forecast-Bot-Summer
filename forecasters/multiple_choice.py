@@ -17,7 +17,10 @@ You must complete every phase below in order. At the end of each phase, state yo
 Discipline rules that apply to every phase:
 - The research material labels evidence items with IDs like [E1], [E2]. Every probability adjustment must cite the specific evidence item(s) that justify it. An adjustment with no citable evidence must be small and explicitly labelled as judgment.
 - Keep arithmetic simple and show it in-line. State the counts/rates you use explicitly.
-- If the Required Artifact Status says the key evidence is missing or partial, keep your distribution closer to the base rate with reduced confidence. Do not fill gaps with invented certainty.
+- If the Required Artifact Status says the key evidence is missing or partial, WIDEN your uncertainty and say so. Then classify each missing fact before reacting to it:
+  - Contingent / current facts (unobserved recent activity, current totals or standings, who has committed, current status): do NOT guess — treat as genuinely unknown.
+  - Stable institutional, legal, or procedural facts (how an established process works, fixed rules, reporting/disclosure calendars, update schedules, well-documented precedent): you MAY resolve these from your own established knowledge. Label such reasoning "[from background knowledge]" so it is auditable, and reason from it rather than leaving it "unresolved".
+  A partial artifact means WIDEN along the axes that are genuinely unknown — it does NOT mean drift toward a uniform distribution. When the brief or your background knowledge documents the mechanism that will produce the resolution value (update schedules, monotonic/cumulative structure, what new information can arrive before the deadline), reconstruct what the artifact will show from that mechanism: concentrate probability where the mechanism leaves little room for change, and spread it only where the mechanism genuinely permits movement. Do not fill gaps with invented certainty — but do not discard certainty the mechanism actually provides.
 - Avoid double-counting correlated evidence. Items tracing to the same source, event, or announcement are largely one signal — corroboration of reliability, not additive weight — so update for them roughly once, and do not re-apply a fact in both the base rate and an inside-view update. Genuinely independent lines of evidence that happen to agree DO each add weight; the caution is against inflating one signal into many, not against real confirmation.
 
 ---
@@ -74,12 +77,31 @@ Output:
 
 ---
 
+## PHASE 0.5 — RESOLUTION MECHANICS (model the resolution procedure before the race)
+
+How will the resolution value actually be produced? If the question resolves by direct observation of an event, say so in one line and move on to Phase 1.
+
+If it resolves off a published source (a curated page, tracker, leaderboard, or scheduled data release):
+1. Enumerate the states the source can be in at the deadline as explicit branches (e.g. "not updated — the currently displayed value stands" vs "updated — showing what the update can actually contain"). Use the brief's Resolution Mechanics section; stable procedural facts (reporting calendars, disclosure lags, filing deadlines) may be resolved "[from background knowledge]" per the discipline rules.
+2. Assign a probability to each branch, citing the cadence evidence: stated update policy, the observed freshness gap between fetch date and displayed data cutoff, and scheduled data events before the deadline.
+3. State what each branch implies for the options. In a "source not updated" branch the currently displayed value usually decides the outcome with near-certainty — say so rather than re-running the race inside that branch.
+4. Carry the branches through the rest of your analysis: Phases 1–4 refine P(option | branch) for the branches where the outcome is genuinely open, and your final distribution must be the mixture P(option) = Σ over branches of P(branch) × P(option | branch). Show that arithmetic explicitly.
+
+Output format:
+- Branches, their probabilities, and the evidence for each
+- What each branch implies for each option
+- **Distribution implied by the branch structure: Option_A: X%, Option_B: Y%, ... (or "Not applicable — direct observation")**
+
+---
+
 ## PHASE 1 — OUTSIDE VIEW (Base Rate)
 
-Establish a starting distribution using base rates and reference classes.
+Establish a starting distribution using base rates and reference classes. If Phase 0.5 produced branches, the base-rate work in this phase applies WITHIN the branches where the outcome is open — do not overwrite the branch structure with a generic prior over the whole question.
 
 - Identify the most relevant reference class for this type of question. How are outcomes of this kind typically distributed across similar option sets?
 - State the historical frequencies or structural priors you are using as explicit numbers (e.g. incumbency advantage, status quo bias), with their source or evidence ID, and show the simple arithmetic that turns them into a starting distribution.
+- A base rate must be structurally justified, not invented: name the reference class and why this question belongs to it. If no comparable prior class exists, say so explicitly and reason from the mechanism that generates the outcome instead — do not force a round number and treat it as a base rate.
+- Match the prior to the process structure. Cumulative or monotonic quantities (running totals, leaderboards of sums, counts that never decrease) are NOT polls or races: no one's number can go down, so the current leader loses only if a trailer closes the entire gap with newly observable activity before the deadline. Leader persistence in such processes is typically far higher than in a symmetric race, and your prior should concentrate accordingly — quantify the gap against the plausible observable flow rather than assigning a generic "tight race" split.
 - If the options are asymmetric in their prior likelihood, reflect that in your distribution.
 - Treat prediction market data carefully: Polymarket and Kalshi are real-money market priors weighted by their volume, liquidity, bid/ask spread, and relevance to the question; Manifold is a play-money crowd signal and should be discounted relative to comparable real-money markets.
 
@@ -118,6 +140,7 @@ Before finalising, stress-test your current distribution by seeking the stronges
 - What is the single strongest argument that your leading option is over-rated?
 - What is the single strongest argument that your least favoured option is under-rated?
 - Are there important considerations the research material does NOT cover that could meaningfully change the picture?
+- If resolution depends on a third-party source's categorization or presentation (labels, entity groupings, methodology), reserve a small reasoned floor on residual/"someone else"-type buckets for clerical or re-categorization risk — that floor comes from a named mechanism, not from leftover probability.
 - Weigh these challenges honestly. Adjust your distribution if warranted.
 - Consider the duration till resolution.
 
@@ -154,6 +177,7 @@ Summarise your forecast in this structure:
 **Confidence tier:** Very Low | Low | Moderate (based on spread of probabilities and evidence quality)
 **Key drivers:** [2-3 most influential evidence items by ID, ranked]
 **Biggest uncertainty:** [the single factor that could most change this forecast]
+**Branch arithmetic:** [if Phase 0.5 produced branches, show the mixture for the leading option: P = P(branch_1) × P(option | branch_1) + ... ; otherwise "not applicable"]
 **Estimate trajectory:** (leading option) Starting X% → After inside view X% → After adversarial review X% → Final X%
 
 The last thing you write is your final probabilities for the N options in this exact order {options} as:
