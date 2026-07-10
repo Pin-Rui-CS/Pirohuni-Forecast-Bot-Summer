@@ -28,6 +28,12 @@ import os
 import re
 import sys
 
+# Windows consoles default to cp1252; brief text contains arrows/dashes that
+# crash print(). Never let console encoding lose a paid compiler call.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 import dotenv
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,6 +45,7 @@ from research.pipeline import (  # noqa: E402
     _apply_artifact_status_banner,
     _flag_future_dated_claims,
 )
+from utils import find_future_full_dates  # noqa: E402
 from run_logging import setup_run_logging  # noqa: E402
 
 
@@ -100,11 +107,34 @@ async def main() -> None:
     # Mirror the live pipeline: run the deterministic future-date gate over the
     # saved artifact_check before compiling. Gate at the ORIGINAL run date so a
     # replay of an old run flags exactly what the run itself would have flagged.
+    # The saved check may carry the annotation the ORIGINAL run's gate injected;
+    # strip it first so the replay reflects the CURRENT gate (whitelist included)
+    # rather than double-flagging.
     artifact_check = record.get("artifact_check")
     run_date = parse_run_date(record)
     if artifact_check:
-        artifact_check = _flag_future_dated_claims(dict(artifact_check), run_date)
-        if "TEMPORAL IMPOSSIBILITY" in json.dumps(artifact_check):
+        artifact_check = dict(artifact_check)
+        stale_gate_note = re.compile(r"\s*\[TEMPORAL (?:IMPOSSIBILITY|FLAG) — automated gate:.*?\]", re.DOTALL)
+        for field in ("what_was_found", "closest_available"):
+            if isinstance(artifact_check.get(field), str):
+                artifact_check[field] = stale_gate_note.sub("", artifact_check[field]).strip()
+        question_dates = frozenset(
+            find_future_full_dates(
+                "\n".join(
+                    part for part in (
+                        qd.get("title", ""),
+                        qd.get("resolution_criteria", ""),
+                        qd.get("description", ""),
+                        qd.get("fine_print", ""),
+                    ) if part
+                ),
+                run_date,
+            )
+        )
+        artifact_check = _flag_future_dated_claims(
+            artifact_check, run_date, question_dates=question_dates
+        )
+        if "TEMPORAL" in json.dumps(artifact_check):
             print(f"Future-date gate fired (run date {run_date}) — see annotated artifact check.")
 
     print(f"Compiler replay: {record['title']}")
@@ -123,17 +153,19 @@ async def main() -> None:
     # apply it to the new brief too so the comparison is like-for-like.
     new_brief = _apply_artifact_status_banner(new_brief, artifact_check)
 
-    print("=" * 70)
-    print("NEW BRIEF (current compiler code)")
-    print("=" * 70)
-    print(new_brief)
-
+    # Save FIRST: the compiler call is paid for, and printing must never be
+    # the step that loses its output.
     if args.save:
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         out = os.path.join(args.question_dir, f"compile_replay_{stamp}.md")
         with open(out, "w", encoding="utf-8") as f:
             f.write(f"# Compiler replay {stamp}\n\n## OLD BRIEF\n\n{old_brief}\n\n## NEW BRIEF\n\n{new_brief}\n")
-        print(f"\nSaved {out}")
+        print(f"Saved {out}")
+
+    print("=" * 70)
+    print("NEW BRIEF (current compiler code)")
+    print("=" * 70)
+    print(new_brief)
 
 
 if __name__ == "__main__":

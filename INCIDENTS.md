@@ -7,6 +7,112 @@ re-deriving the same diagnosis twice — read this before touching the forecasti
 
 ---
 
+## 2026-07-09 — Serp scrape path is PDF-blind (browser crawl on `application/pdf` returns nothing) → decisive statistical releases silently lost; brief anchored on an n=1 forum comment
+
+| | |
+|---|---|
+| **Severity** | High — 44412 (Tampa liquid sulphur Q3 2026, `numeric`) submitted median ~592 vs community ~761 with ~1.6% above $890. The PDF gap is one of several contributing causes (see below for the forecast-layer defects, not fixed here), but it removed every official statistical source from the brief |
+| **Introduced** | Long-standing — the serp/artifact-retry path has always scraped via `Crawl4AI.crawl.basic_crawl_markdown`, a Playwright DOM crawl. The resolution-scraper path gained Firecrawl (which parses PDFs) on 2026-07-01; the serp path never did |
+| **Detected** | 2026-07-09 — post-mortem of run `2026-07-08_01-01`, question 44412 |
+| **Diagnosed & fixed** | 2026-07-09 (`Adapters/Pdf.py`, `Adapters/registry.py`, deps) — **not yet committed** |
+| **Affected window** | Every question whose decisive artifact is a PDF (or any non-HTML document) reached through the serp path — statistical releases (World Bank, USGS, BLS-style), agency reports, filings. Failure is deterministic: any URL served as `application/pdf` returned "Crawl4AI returned no content" |
+
+### Symptom
+All four hard scrape failures in the 44412 run were PDFs, each ranked as a
+top-priority source and each failing identically ("Crawl4AI returned no
+content."): the World Bank Pink Sheet June 2026, CMO April 2026 (+ its forecast
+annex), and the USGS 2026 sulfur summary. The retry cycle re-attempted and
+re-failed. With every official source gone, the brief's only same-series anchor
+was a Metaculus commenter's unofficial "$655" and the same commenter's personal
+distribution (median $499) — which then appeared in **Market Signals** and
+anchored all three ensemble runs. Each downloaded instantly with a plain HTTP
+GET; access was never the problem.
+
+### Root cause
+`basic_crawl_markdown` renders a page in a headless browser and converts the
+DOM to markdown. A URL served as `application/pdf` has no DOM (the browser
+hands it to a viewer plugin), so `result.markdown` is empty and the wrapper
+returns `""` — recorded as a generic scrape failure, indistinguishable from a
+dead page. Deterministic for every PDF. The adapter registry
+(`find_adapter`, consulted before Crawl4AI in `serp_research`) had adapters for
+Metaculus/Wikipedia/Sheets/Trends but nothing extension-based for documents.
+
+### Phantom-artifact finding (recorded so it is not re-derived)
+Fetching the actual files during diagnosis disproved the run's premise: the
+Pink Sheet (June **and** July 2026 editions) and the CMO monthly xlsx carry
+**no Sulphur (Tampa) series at all** — the World Bank blog charted Argus data
+the Pink Sheet never published. The evidence plan's named required artifact
+("Pink Sheet monthly series for Sulphur (Tampa)") did not exist, and the retry
+loop burned cycles hunting it. The genuinely recoverable loss was the **USGS
+PDF**, which carries the historical Tampa contract trajectory ("began 2025 at
+$116 per long ton… increased to $270… decreased to $252…") — exactly the
+base-rate series the brief lacked (note: $/long ton vs the question's
+$/metric ton). Open follow-up: the pipeline has no way to conclude "source
+retrieved, series confirmed absent," which is itself decision-relevant
+(resolution then rides on paywalled Argus alone → higher annulment risk).
+
+### The fix (`Adapters/Pdf.py`, registered in `Adapters/registry.py`)
+A `PdfAdapter` in the existing registry (extension-based `can_handle`, placed
+after the host-specific adapters; zero pipeline changes — `find_adapter`
+already runs before Crawl4AI):
+- Plain streaming HTTP download (25MB cap), `%PDF` magic-byte check so HTML
+  error pages are rejected rather than parsed.
+- **pymupdf4llm** primary (markdown with table structure preserved), **pypdf**
+  plain-text fallback; parse runs in a worker thread with a 120s cap; 40-page
+  and 18K-char caps (aligned with `_MAX_SCRAPE_CHARS`).
+- A scanned/textless PDF **raises** "no extractable text layer" so the failure
+  is visible in the source ledger — no more silent `""`.
+- Extractor choice was benchmarked on the real failed files: pdfplumber at
+  zero-config split digits ("550.0" → "5 50.0") and collapsed all columns into
+  one cell — worse than no data for an LLM consumer; pymupdf4llm kept the Pink
+  Sheet's DAP row fully column-aligned. Known quirk: it occasionally merges two
+  adjacent rows into one `<br>` cell (values stay paired). License note:
+  PyMuPDF is AGPL-3.0 in an MIT repo — accepted for this bot's personal,
+  non-distributed use.
+- Deps: `pymupdf4llm>=1.28,<2.0` (pulls onnxruntime + pymupdf-layout),
+  `pypdf>=6,<7`.
+
+### Verification
+- `tests/test_pdf_adapter.py` (repo main()-convention): 6/6 — routing,
+  registry dispatch, non-PDF rejection, generated-PDF extraction, textless-PDF
+  error, plus the **live USGS acceptance test** (Tampa `$116` sentence must
+  extract; skips offline). Do NOT write a "Sulphur (Tampa) row in Pink Sheet"
+  test — the row doesn't exist (see phantom-artifact finding).
+- `tests/test_imports.py` all OK.
+- End-to-end: `find_adapter` on the exact failed Pink Sheet URL → dispatched
+  to `pdf` → 17.1K chars of markdown, DAP price row column-aligned, where the
+  run recorded "Crawl4AI returned no content."
+
+### Related defects in the same run (diagnosed, NOT fixed here)
+The forecast-layer half of the 44412 miss is out of scope for this entry and
+still open: (1) no evidence-ordering rule — the mid-June truce narrative was
+allowed to override *newer* July post-truce price observations whose levels
+already impounded it; (2) "do not map fob benchmarks 1:1" was applied as
+"ignore their direction," asymmetrically against the hard up-pointing data;
+(3) an n=1 commenter distribution occupied Market Signals with no
+provenance/sample-size labeling, and the community aggregate was never
+captured; (4) 3× same-model ensemble quantile-averaged into false precision
+(recurring; see 2026-07-07 and 2026-06-30 entries).
+
+### Lessons
+- A browser crawler is a *renderer*, not a *fetcher* — any non-HTML content
+  type fails deterministically and silently. Route by content type/extension
+  before reaching for a browser.
+- Statistical releases — the most common decisive artifact for numeric
+  questions — are disproportionately PDF/XLSX; a research pipeline without a
+  document path is blind exactly where questions resolve.
+- For table-bearing documents feeding an LLM, extraction fidelity is
+  binary-critical: misaligned digits are worse than a visible failure. Bench
+  the extractor on the real document class, not the library's reputation.
+- Verify the named artifact actually exists in the named source; "the source
+  does not carry this series" is decision-relevant evidence, and a retry loop
+  cannot find numbers that were never published.
+- "Failed scrape" hid three distinct realities (unfetchable page, fetchable
+  non-HTML document, nonexistent series). Error taxonomy in the ledger is what
+  lets the next diagnosis skip the re-derivation.
+
+---
+
 ## 2026-07-07 — Ensemble shares a base-rate construction error (ignored the zero months) and the median ratifies it → binary forecast ~15–20pts high
 
 | | |

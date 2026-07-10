@@ -31,6 +31,7 @@ ROLE_SCRAPED = "scraped"                # a scrape was actually attempted
 ENGINE_CRAWL4AI_BASIC = "crawl4ai-basic"
 ENGINE_FIRECRAWL = "firecrawl-scrape"
 ENGINE_SKIPPED_DUPLICATE = "skipped-duplicate"
+ENGINE_CACHE = "cache"  # content served from this run's scrape cache (no re-fetch)
 
 
 @dataclass

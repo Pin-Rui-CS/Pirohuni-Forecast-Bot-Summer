@@ -119,12 +119,22 @@ _FULL_DATE_RES = [
 ]
 
 
-def find_future_full_dates(text: str, today: datetime.date | None = None) -> list[str]:
+def find_future_full_dates(
+    text: str,
+    today: datetime.date | None = None,
+    exclude: frozenset[str] | set[str] | None = None,
+) -> list[str]:
     """Return the distinct full dates in ``text`` that fall strictly after
-    ``today`` (default: the current date), formatted YYYY-MM-DD."""
+    ``today`` (default: the current date), formatted YYYY-MM-DD.
+
+    ``exclude`` is a set of ISO dates to ignore — used to whitelist dates the
+    question itself names (resolution/check/close dates), which legitimately
+    appear in descriptions of evidence without being evidence dates.
+    """
     if not text:
         return []
     today = today or datetime.date.today()
+    exclude = exclude or frozenset()
     found: list[str] = []
     for pattern in _FULL_DATE_RES:
         for match in pattern.finditer(text):
@@ -141,6 +151,6 @@ def find_future_full_dates(text: str, today: datetime.date | None = None) -> lis
                 continue
             if parsed > today:
                 iso = parsed.isoformat()
-                if iso not in found:
+                if iso not in found and iso not in exclude:
                     found.append(iso)
     return sorted(found)

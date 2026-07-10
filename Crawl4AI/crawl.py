@@ -20,6 +20,7 @@ for stream in (sys.stdout, sys.stderr):
 DEFAULT_PAGE_TIMEOUT = 30
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 _SCRAPED_URL_KEYS: set[str] = set()
+_SCRAPED_URL_CONTENT: dict[str, str] = {}
 _SCRAPED_URL_LOCK = Lock()
 _DUPLICATE_SCRAPE_MARKER = "Crawl4AI duplicate scrape skipped"
 _SCRAPE_DEDUPE_SCOPE: ContextVar[str] = ContextVar(
@@ -72,19 +73,22 @@ async def basic_crawl_markdown(url: str, timeout: int = DEFAULT_PAGE_TIMEOUT) ->
 
 
 # ===========================================================================
-# Scrape dedupe registry
+# Scrape dedupe registry + content cache
 #
-# A process-local registry so the same canonical URL is scraped at most once per
-# question run, regardless of which provider (SERP/Tavily/Firecrawl/resolution)
-# requested it. The active scope is held in a ContextVar so concurrently
-# forecast questions keep separate registries.
+# A process-local registry so the same canonical URL is *fetched* at most once
+# per question run, regardless of which provider (SERP/Tavily/Firecrawl/
+# resolution) requested it. Successful scrapes also store their content here so
+# later requests for the same URL (e.g. the focused artifact retry re-targeting
+# the resolution source) receive the already-fetched content instead of a
+# content-less "skipped duplicate" tombstone. The active scope is held in a
+# ContextVar so concurrently forecast questions keep separate registries.
 # ===========================================================================
 def claim_scrape_url(url: str) -> str | None:
     """Reserve a URL for scraping.
 
     Returns a tiny duplicate payload when this process has already attempted the
-    canonical URL. The payload intentionally omits scraped content so callers can
-    log the duplicate without bloating downstream LLM prompts.
+    canonical URL. Callers should then consult get_cached_scrape_content(); the
+    payload itself omits content so pure logging paths stay small.
     """
 
     scope = _SCRAPE_DEDUPE_SCOPE.get()
@@ -94,6 +98,36 @@ def claim_scrape_url(url: str) -> str | None:
             return duplicate_scrape_payload(url)
         _SCRAPED_URL_KEYS.add(key)
     return None
+
+
+def record_scrape_content(url: str, content: str) -> None:
+    """Store a successful scrape's content so duplicate requests can reuse it.
+
+    Call with the full pre-truncation content; each consumer applies its own
+    length budget. Empty/whitespace content is not stored (a failed scrape
+    should stay recoverable as a tombstone, not a cached blank page).
+    """
+
+    content = str(content or "")
+    if not content.strip():
+        return
+    scope = _SCRAPE_DEDUPE_SCOPE.get()
+    key = _scoped_scrape_key(url, scope)
+    with _SCRAPED_URL_LOCK:
+        _SCRAPED_URL_CONTENT[key] = content
+
+
+def get_cached_scrape_content(url: str) -> str | None:
+    """Return the stored content for an already-scraped URL, or None.
+
+    None means the URL either was never scraped successfully or returned no
+    content — callers should treat that as the old skipped-duplicate case.
+    """
+
+    scope = _SCRAPE_DEDUPE_SCOPE.get()
+    key = _scoped_scrape_key(url, scope)
+    with _SCRAPED_URL_LOCK:
+        return _SCRAPED_URL_CONTENT.get(key)
 
 
 def canonical_scrape_url(url: str) -> str:
@@ -145,11 +179,15 @@ def reset_scrape_dedupe_registry(scope: str | None = None) -> None:
     with _SCRAPED_URL_LOCK:
         if scope is None:
             _SCRAPED_URL_KEYS.clear()
+            _SCRAPED_URL_CONTENT.clear()
             return
         prefix = f"{scope}\0"
         stale_keys = [key for key in _SCRAPED_URL_KEYS if key.startswith(prefix)]
         for key in stale_keys:
             _SCRAPED_URL_KEYS.remove(key)
+        stale_content_keys = [key for key in _SCRAPED_URL_CONTENT if key.startswith(prefix)]
+        for key in stale_content_keys:
+            del _SCRAPED_URL_CONTENT[key]
 
 
 # ===========================================================================

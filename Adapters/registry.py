@@ -3,6 +3,7 @@ from __future__ import annotations
 from Adapters.GoogleSheets import GoogleSheetsAdapter
 from Adapters.GoogleTrends import GoogleTrendsAdapter
 from Adapters.Metaculus import MetaculusAdapter
+from Adapters.Pdf import PdfAdapter
 from Adapters.base import UrlAdapter
 from Adapters.Wikipedia import WikipediaAdapter
 
@@ -12,6 +13,8 @@ ADAPTERS: list[UrlAdapter] = [
     GoogleTrendsAdapter(),
     GoogleSheetsAdapter(),
     WikipediaAdapter(),
+    # Extension-based, so it goes after the host-specific adapters.
+    PdfAdapter(),
 ]
 
 

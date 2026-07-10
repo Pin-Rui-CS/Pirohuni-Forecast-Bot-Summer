@@ -299,10 +299,19 @@ async def run_research(
         )
 
     # Stage 4: verification gate — did research find the required artifact?
+    # The question's own future dates (resolution/check/close dates named in its
+    # text) are whitelisted from the temporal-impossibility gate: describing
+    # evidence relative to them is normal, not a misdating signal.
+    question_dates = frozenset(
+        find_future_full_dates(
+            "\n".join(part for part in (title, resolution_criteria, background, fine_print) if part)
+        )
+    )
     artifact_check = await verify_required_artifact(
         title=title,
         evidence_plan=evidence_plan,
         provider_results=included_results,
+        question_dates=question_dates,
     )
 
     # Stage 5: focused retry aimed only at the missing artifact. Reuse the search
@@ -378,6 +387,7 @@ async def run_research(
             evidence_plan=evidence_plan,
             provider_results=included_results,
             prior_check=artifact_check,
+            question_dates=question_dates,
         )
         if refreshed_check is not None:
             artifact_check = refreshed_check
@@ -662,6 +672,12 @@ Rules:
   the superseded claim anywhere in your output.
 - "complete" only if the artifact's actual values/rows appear in the research text.
 - Mentions that the artifact exists, without its values, count as "partial" at best.
+- If the resolution value is a count or aggregate over an enumerable set (rows,
+  member states, entries), "complete" additionally requires the row-level
+  breakdown behind the headline number (which members are in which category).
+  A headline count whose composition was not retrieved (e.g. a truncated table)
+  is "partial", "what_is_missing" must name the missing rows, and at least one
+  retry query must target that row-level breakdown.
 - A retrieved value that is the right family but the WRONG exact metric does NOT make status "complete", but it MUST be recorded in "closest_available" — never silently discard a value that was actually fetched just because it is not the exact metric. It is decision-relevant and must survive into the brief.
 - forecast_swing estimates how far a reasonable forecast would plausibly move if the
   missing information were resolved one way versus the other: "low" (<5 percentage
@@ -687,27 +703,40 @@ Earlier (pre-retry) verdict to reconcile:
 """
 
 
-def _flag_future_dated_claims(check: dict, today: datetime.date | None = None) -> dict:
+def _flag_future_dated_claims(
+    check: dict,
+    today: datetime.date | None = None,
+    question_dates: frozenset[str] | None = None,
+) -> dict:
     """Deterministic temporal gate over the artifact-check verdict.
 
-    Any full date strictly after the run date appearing in the fields that
-    describe *found* evidence is impossible by construction (a report about a
-    future day cannot have been published). Annotate those fields in place so
+    A full date strictly after the run date appearing in the fields that
+    describe *found* evidence is impossible as an evidence date (a report about
+    a future day cannot have been published). Annotate those fields in place so
     the warning survives verbatim into the compiler prompt and the brief's
     authoritative status banner. Fields describing *missing* data legitimately
     reference future dates and are not scanned.
+
+    ``question_dates`` are the question's own future dates (resolution/check/
+    close dates parsed from its text). These are whitelisted: describing
+    evidence relative to the resolution date ("2.5 months before the Aug 31,
+    2026 check date") is normal and must not trigger the gate — in the 44382
+    run this false positive stamped a misdating warning onto the single most
+    important evidence field.
     """
     today = today or datetime.date.today()
     for field_name in ("what_was_found", "closest_available"):
         text = check.get(field_name) or ""
-        future_dates = find_future_full_dates(text, today)
+        future_dates = find_future_full_dates(text, today, exclude=question_dates)
         if future_dates:
             check[field_name] = (
-                f"{text} [TEMPORAL IMPOSSIBILITY — automated gate: this field claims evidence "
-                f"dated {', '.join(future_dates)}, which is after today ({today.isoformat()}). "
-                f"A report about that date cannot exist yet; the claim is misdated (almost "
-                f"certainly a prior-year event). Treat it as historical data OUTSIDE the "
-                f"resolution window, NOT as an unverified current value.]"
+                f"{text} [TEMPORAL FLAG — automated gate: this field mentions "
+                f"{', '.join(future_dates)}, which is after today ({today.isoformat()}). "
+                f"If the text presents that date as when the evidence was published or "
+                f"observed, the item is misdated — a report about a future date cannot "
+                f"exist yet — and its value must not be treated as current or in-window. "
+                f"If the date is a deadline, target, or scheduled effective date that the "
+                f"evidence merely mentions, this flag is a false positive; disregard it.]"
             )
     return check
 
@@ -718,6 +747,7 @@ async def verify_required_artifact(
     provider_results: list[tuple[str, str]],
     model: str = ARTIFACT_CHECK_MODEL,
     prior_check: dict | None = None,
+    question_dates: frozenset[str] | None = None,
 ) -> dict | None:
     research_excerpt = "\n\n".join(
         f"## {name}\n{_truncate_text(content, 8_000)}" for name, content in provider_results
@@ -760,7 +790,7 @@ async def verify_required_artifact(
             "closest_available": str(parsed.get("closest_available", "")).strip(),
             "forecast_swing": forecast_swing,
             "retry_queries": [str(query).strip() for query in retry_queries if str(query).strip()],
-        })
+        }, question_dates=question_dates)
     except HardLimitExceededError:
         raise
     except Exception as exc:

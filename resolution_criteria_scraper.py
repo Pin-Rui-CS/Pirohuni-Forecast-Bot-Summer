@@ -113,7 +113,14 @@ def extract_urls(text: str) -> list[str]:
 # ===========================================================================
 
 _MAX_CONTENT_CHARS = 8_000
-_CRAWL4AI_CONTENT_BUDGET = 18_000
+# Per-URL budget for resolution-source scrapes. The resolution source is by
+# definition the page the question resolves off, and a head-truncation here
+# silently drops whatever the page keeps at its tail (the 44382 miss: an
+# 18k budget cut a 27-row country table to 6 alphabetical rows, making the
+# counted set unverifiable). The budget therefore matches the summarizer's own
+# input capacity; pages larger than the summarizer input are chunk-summarized
+# in scrape_resolution_sources rather than silently cut.
+_CRAWL4AI_CONTENT_BUDGET = 100_000
 
 # Lines matching any of these patterns are likely boilerplate
 _BOILERPLATE_PATTERNS = [
@@ -235,6 +242,14 @@ def _build_resolution_summary_prompt(
         "- Do not use external knowledge to fill gaps in the scraped data.\n"
         "- If information is missing, say 'not present in scraped content'.\n"
         "- Quote exact strings where they are important to the resolution criteria.\n"
+        "- TABLES AND ENUMERATIONS: if the content contains a table or list that the "
+        "resolution value counts over or reads from, reproduce the resolution-relevant "
+        "rows (entity + status/value) rather than summarizing them away — for a question "
+        "that counts rows in a category, that means EVERY row and its classification. "
+        "Then state the row arithmetic explicitly (e.g. '27 rows present: 9 Clear, 12 "
+        "Partial, 6 Unclear'). If the rows present do not add up to a total the page "
+        "states, or the table appears cut off, say so explicitly ('N of M rows present; "
+        "content appears truncated').\n"
         "- Summarize by reading for relevance, not to hit a length. Include every "
         "detail that bears on the resolution criteria, however small — do NOT drop "
         "or compress resolution-relevant facts to make the summary shorter. The "
@@ -326,6 +341,125 @@ def _summary_token_cap(num_pages: int) -> int:
     legitimate content to report, so the budget grows with the number of pages.
     """
     return min(2000 + 1500 * max(0, num_pages), 8000)
+
+
+async def _summarize_snapshot_history(
+    url: str,
+    snapshots: list,
+    question_text: str,
+    resolution_criteria: str,
+    model: str,
+    max_tokens: int = 1200,
+) -> str:
+    """Turn dated Wayback captures of the resolution source into a compact,
+    dated history: value time series, update cadence, and observed changes.
+
+    One LLM call regardless of snapshot count. The output feeds the compiler's
+    Resolution Mechanics section, giving the forecaster a real same-source flow
+    rate instead of an improvised one.
+    """
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=_get_openrouter_api_key(),
+    )
+
+    snapshot_blocks = "\n\n---\n\n".join(
+        f"## Snapshot captured {snapshot.iso_date}\n{snapshot.text}"
+        for snapshot in snapshots
+    )
+    prompt = (
+        "You are a research assistant reconstructing the HISTORY of the official "
+        "resolution source for a forecasting question, from dated Wayback Machine "
+        "captures of the page.\n\n"
+        f"## Forecast Question\n{question_text}\n\n"
+        f"## Resolution Criteria\n{resolution_criteria}\n\n"
+        f"## Dated captures of {url} (oldest first)\n{snapshot_blocks[:_LLM_MAX_INPUT]}\n\n"
+        "## Task\n"
+        "Write a compact history with exactly these three sections:\n\n"
+        "**1. VALUE TIME SERIES:** For each capture date, the value(s) the "
+        "resolution criteria care about, one line per capture: "
+        "`YYYY-MM-DD (capture): <value(s)>`. Quote exact figures/labels. If a "
+        "capture does not show the value, write 'not visible in capture'.\n\n"
+        "**2. UPDATE CADENCE:** Any 'last updated'/'as of' stamps visible in the "
+        "captures, and what the differences between captures imply about how often "
+        "the page actually changes. State the observed gaps in weeks/months.\n\n"
+        "**3. OBSERVED CHANGES:** What changed between consecutive captures "
+        "(entries added/removed, statuses reclassified, totals moved). Compute the "
+        "simple rate of change per month where the series allows it, showing the "
+        "arithmetic.\n\n"
+        "## Rules\n"
+        "- Use ONLY the captures above. No external knowledge, no speculation "
+        "about what later values 'should' be.\n"
+        "- These captures are HISTORICAL. Do not present any of them as the "
+        "current value; the live page was scraped separately.\n"
+        "- If the captures are unreadable or irrelevant to the resolution "
+        "criteria, say exactly that in one line per section."
+    )
+    messages = [{"role": "user", "content": prompt}]
+
+    async with llm_rate_limiter:
+        usage_handle = MonetaryCostManager.start_openrouter_call(
+            "resolution-scraper/wayback-history",
+            model,
+            {"messages": messages, "max_tokens": max_tokens},
+        )
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.1,
+            extra_body=OPENROUTER_USAGE_ACCOUNTING,
+        )
+    usage_handle.record_response(response)
+    _log_openrouter_call("resolution-scraper/wayback-history", model)
+    return response.choices[0].message.content.strip()
+
+
+async def _build_wayback_history_section(
+    url: str,
+    question_text: str,
+    resolution_criteria: str,
+    model: str,
+) -> str:
+    """Fetch Wayback history for the primary resolution URL and summarize it.
+
+    Returns a ready-to-append markdown section, or "" when no usable history
+    exists. Every failure is soft — history is a bonus, never a blocker.
+    """
+    try:
+        from Adapters.Wayback import fetch_snapshot_history
+
+        snapshots = await fetch_snapshot_history(url)
+    except Exception as exc:
+        logger.warning("Wayback history fetch failed for %s: %s", url, exc)
+        return ""
+    if len(snapshots) < 2:
+        return ""
+    try:
+        history = await _summarize_snapshot_history(
+            url=url,
+            snapshots=snapshots,
+            question_text=question_text,
+            resolution_criteria=resolution_criteria,
+            model=model,
+        )
+    except HardLimitExceededError:
+        raise
+    except Exception as exc:
+        logger.warning("Wayback history summarization failed for %s: %s", url, exc)
+        return ""
+    if not history.strip():
+        return ""
+    capture_dates = ", ".join(snapshot.iso_date for snapshot in snapshots)
+    return (
+        "\n\n## Resolution Source History (Wayback Machine)\n\n"
+        f"Historical captures of {url} ({capture_dates}) — use for the value's "
+        "flow rate and the page's real update cadence; the live scrape above "
+        "remains the current value.\n\n"
+        f"{history}"
+    )
 
 
 async def _llm_summarize(
@@ -490,6 +624,55 @@ def _format_combined_resolution_content(sources: list[tuple[str, str]]) -> str:
     )
 
 
+# Hard cap on summary LLM calls per question when the combined resolution
+# content exceeds one summarizer input. Bounds token spend on pathological
+# link-heavy questions; sources are ordered resolution-criteria-first, so the
+# batches that matter most are always summarized.
+_MAX_SUMMARY_CALLS = 3
+
+
+def _batch_resolution_sources(
+    sources: list[tuple[str, str]], max_chars: int = _LLM_MAX_INPUT
+) -> list[list[tuple[str, str]]]:
+    """Group (url, content) sources into batches that each fit one summarizer
+    input, instead of silently tail-truncating the combined content.
+
+    An individual source larger than ``max_chars`` is split into sequential
+    labelled parts so no portion of a resolution page is dropped unseen.
+    Source order is preserved.
+    """
+    batches: list[list[tuple[str, str]]] = []
+    current: list[tuple[str, str]] = []
+    current_size = 0
+    overhead = 40  # per-source "## Source:" header/separator allowance
+
+    def flush() -> None:
+        nonlocal current, current_size
+        if current:
+            batches.append(current)
+            current = []
+            current_size = 0
+
+    for url, content in sources:
+        pieces: list[tuple[str, str]] = []
+        if len(content) > max_chars:
+            n_parts = -(-len(content) // max_chars)
+            for i in range(n_parts):
+                pieces.append(
+                    (f"{url} (part {i + 1}/{n_parts})", content[i * max_chars:(i + 1) * max_chars])
+                )
+        else:
+            pieces.append((url, content))
+        for piece_url, piece in pieces:
+            size = len(piece) + len(piece_url) + overhead
+            if current and current_size + size > max_chars:
+                flush()
+            current.append((piece_url, piece))
+            current_size += size
+    flush()
+    return batches
+
+
 async def _basic_crawl_markdown(url: str, timeout: int) -> str:
     """Fetch one page with a single-page browser crawl; return full raw markdown.
 
@@ -586,9 +769,26 @@ async def _scrape_resolution_url(
     global _firecrawl_exhausted
     import source_ledger
 
-    from Crawl4AI.crawl import claim_scrape_url
+    from Crawl4AI.crawl import claim_scrape_url, get_cached_scrape_content, record_scrape_content
 
     if claim_scrape_url(url) is not None:
+        cached = get_cached_scrape_content(url)
+        if cached:
+            content = _truncate_scrape_content(cached)
+            source_ledger.record_url_event(
+                url,
+                source_ledger.ROLE_SCRAPED,
+                engine=source_ledger.ENGINE_CACHE,
+                ok=True,
+                chars=len(content),
+                round_label="single pass",
+            )
+            return _ResolutionScrapeResult(
+                url=url,
+                provider_used="scrape cache",
+                success=True,
+                content=content,
+            )
         source_ledger.record_url_event(
             url,
             source_ledger.ROLE_SCRAPED,
@@ -636,6 +836,7 @@ async def _scrape_resolution_url(
         if _sheets_adapter.can_handle(url):
             try:
                 result = await _sheets_adapter.extract(url, query=question_text, timeout=timeout)
+                record_scrape_content(url, result.content)
                 content = _truncate_scrape_content(result.content)
                 if content.strip():
                     return _record_and_return(
@@ -661,7 +862,9 @@ async def _scrape_resolution_url(
     # ------------------------------------------------------------------
     if not _firecrawl_exhausted:
         try:
-            content = _truncate_scrape_content(await _firecrawl_scrape_markdown(url, timeout))
+            raw = await _firecrawl_scrape_markdown(url, timeout)
+            record_scrape_content(url, raw)
+            content = _truncate_scrape_content(raw)
             if content.strip():
                 return _record_and_return(
                     source_ledger.ENGINE_FIRECRAWL, "firecrawl-scrape", content, ""
@@ -683,7 +886,9 @@ async def _scrape_resolution_url(
     # 2. Crawl4AI basic crawl fallback.
     # ------------------------------------------------------------------
     try:
-        content = _truncate_scrape_content(await _basic_crawl_markdown(url, timeout))
+        raw = await _basic_crawl_markdown(url, timeout)
+        record_scrape_content(url, raw)
+        content = _truncate_scrape_content(raw)
         return _record_and_return(
             source_ledger.ENGINE_CRAWL4AI_BASIC,
             "crawl4ai-basic",
@@ -938,9 +1143,10 @@ async def scrape_resolution_sources(
     counts) is scraped concurrently rather than pre-filtered.
     """
 
+    criteria_urls = extract_urls(resolution_criteria)
     seen: set[str] = set()
     urls: list[str] = []
-    for url in [*extract_urls(resolution_criteria), *extract_urls(question_text)]:
+    for url in [*criteria_urls, *extract_urls(question_text)]:
         if url not in seen:
             seen.add(url)
             urls.append(url)
@@ -986,28 +1192,62 @@ async def scrape_resolution_sources(
     if not sections:
         return ""
 
+    # Historical captures of the primary resolution URL (the page the value
+    # resolves off). Gives the forecaster a same-source flow rate and update
+    # cadence; soft-fails to "" when the page has no usable archive history.
+    history_section = ""
+    if use_llm_cleaning:
+        history_section = await _build_wayback_history_section(
+            criteria_urls[0] if criteria_urls else urls[0],
+            question_text=question_text,
+            resolution_criteria=resolution_criteria,
+            model=llm_model,
+        )
+
     if use_llm_cleaning and cleaned_sources:
         try:
-            combined_content = _format_combined_resolution_content(cleaned_sources)
-            summary = await _llm_summarize(
-                url=", ".join(url for url, _ in cleaned_sources),
-                content=combined_content,
-                question_text=question_text,
-                resolution_criteria=resolution_criteria,
-                model=llm_model,
-                max_tokens=_summary_token_cap(len(cleaned_sources)),
-            )
+            batches = _batch_resolution_sources(cleaned_sources)
+            omitted_urls = [url for batch in batches[_MAX_SUMMARY_CALLS:] for url, _ in batch]
+            batches = batches[:_MAX_SUMMARY_CALLS]
+            summaries: list[str] = []
+            for index, batch in enumerate(batches, start=1):
+                summary = await _llm_summarize(
+                    url=", ".join(url for url, _ in batch),
+                    content=_format_combined_resolution_content(batch),
+                    question_text=question_text,
+                    resolution_criteria=resolution_criteria,
+                    model=llm_model,
+                    max_tokens=_summary_token_cap(len(batch)),
+                )
+                if len(batches) > 1:
+                    summary = (
+                        f"### Summary part {index}/{len(batches)} "
+                        f"(covers: {', '.join(url for url, _ in batch)})\n\n{summary}"
+                    )
+                summaries.append(summary)
+            summary_text = "\n\n".join(summaries)
+            if omitted_urls:
+                summary_text += (
+                    "\n\n_Note: content from the following source(s) exceeded the "
+                    "summarization budget and was NOT summarized: "
+                    + ", ".join(omitted_urls) + "_"
+                )
             source_lines = "\n".join(f"- {url}" for url, _ in cleaned_sources)
             return (
                 "# Resolution Criteria Sources\n\n"
                 "## Summary\n\n"
-                f"{summary}\n\n"
+                f"{summary_text}\n\n"
                 "## Scraped Sources\n\n"
                 f"{source_lines}"
+                f"{history_section}"
             )
         except HardLimitExceededError:
             raise
         except Exception as exc:
             logger.warning("LLM summary failed: %s - returning heuristic output", exc)
 
-    return "# Resolution Criteria Sources\n\n" + "\n\n---\n\n".join(sections)
+    return (
+        "# Resolution Criteria Sources\n\n"
+        + "\n\n---\n\n".join(sections)
+        + history_section
+    )

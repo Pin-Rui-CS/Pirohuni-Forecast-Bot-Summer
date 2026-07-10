@@ -674,10 +674,24 @@ async def _scrape_targets(
             print(f"[adapter] registry unavailable for {item.url}: {type(exc).__name__}: {exc}")
 
         if adapter is not None:
-            from Crawl4AI.crawl import claim_scrape_url
+            from Crawl4AI.crawl import claim_scrape_url, get_cached_scrape_content, record_scrape_content
 
             duplicate_payload = claim_scrape_url(item.url)
             if duplicate_payload is not None:
+                cached = get_cached_scrape_content(item.url)
+                if cached:
+                    return _finish(
+                        Scrape(
+                            cycle=0,
+                            group=group.group,
+                            group_purpose=group.group_purpose,
+                            url=item.url,
+                            purpose=item.purpose,
+                            ok=True,
+                            content=_truncate_text(cached, _MAX_SCRAPE_CHARS),
+                        ),
+                        engine=source_ledger.ENGINE_CACHE,
+                    )
                 return _finish(
                     Scrape(
                         cycle=0,
@@ -693,6 +707,7 @@ async def _scrape_targets(
             try:
                 print(f"[adapter] {adapter.name} handling {item.url}")
                 result = await adapter.extract(item.url, query=query)
+                record_scrape_content(item.url, result.content)
                 return _finish(
                     Scrape(
                         cycle=0,
@@ -720,10 +735,29 @@ async def _scrape_targets(
                     engine=f"adapter:{adapter.name}",
                 )
 
-        from Crawl4AI.crawl import basic_crawl_markdown, claim_scrape_url
+        from Crawl4AI.crawl import (
+            basic_crawl_markdown,
+            claim_scrape_url,
+            get_cached_scrape_content,
+            record_scrape_content,
+        )
 
         duplicate_payload = claim_scrape_url(item.url)
         if duplicate_payload is not None:
+            cached = get_cached_scrape_content(item.url)
+            if cached:
+                return _finish(
+                    Scrape(
+                        cycle=0,
+                        group=group.group,
+                        group_purpose=group.group_purpose,
+                        url=item.url,
+                        purpose=item.purpose,
+                        ok=True,
+                        content=_truncate_text(cached, _MAX_SCRAPE_CHARS),
+                    ),
+                    engine=source_ledger.ENGINE_CACHE,
+                )
             return _finish(
                 Scrape(
                     cycle=0,
@@ -738,6 +772,7 @@ async def _scrape_targets(
             )
         try:
             content = await basic_crawl_markdown(item.url)
+            record_scrape_content(item.url, content)
             return _finish(
                 Scrape(
                     cycle=0,
