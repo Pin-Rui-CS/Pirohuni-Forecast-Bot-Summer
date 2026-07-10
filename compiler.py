@@ -21,8 +21,21 @@ logger = logging.getLogger(__name__)
 ProviderResult = tuple[str, str]
 
 _DEFAULT_MODEL = "anthropic/claude-opus-4.8"
+# Market provider sections only (already line-filtered; small). Research
+# sections are NOT hard-truncated any more — see _fit_sections_to_budget.
 _MAX_PROVIDER_CHARS = 24_000
-_MAX_COMPILER_INPUT_CHARS = 60_000
+# Total budget for all sections handed to the compiler LLM. When the combined
+# research exceeds it, oversized sections are COMPRESSED WITH A READER (a
+# cheaper LLM pass that must preserve every distinct claim), never cut with
+# [:N]. A head-keep [:N] here is what caused the 44619 miss: the 24K
+# per-provider cut silently discarded all of the YES-leaning evidence, which
+# sat deep in the search-snippet dump, and the compiler built a one-sided
+# brief from what was left.
+_COMPILER_INPUT_BUDGET_CHARS = 120_000
+_PRECOMPRESS_MODEL = "anthropic/claude-sonnet-5"
+_MAX_PRECOMPRESS_CALLS = 3
+_PRECOMPRESS_CHUNK_CHARS = 90_000
+_PRECOMPRESS_MIN_TARGET_CHARS = 10_000
 _MAX_ARTICLE_BODY_CHARS = 2_400
 _MAX_KEY_EVIDENCE_ITEMS = 10
 _SIMILAR_ARTICLE_THRESHOLD = 0.82
@@ -191,7 +204,10 @@ def _clean_provider_content(provider_name: str, content: str | None) -> str:
     if "kalshi" in lowered_name or "manifold" in lowered_name or "polymarket" in lowered_name:
         return _clean_market_text(text)
 
-    return _truncate_text(text, _MAX_PROVIDER_CHARS)
+    # No [:N] truncation here. Research sections go to the compiler whole;
+    # _fit_sections_to_budget compresses (with an LLM) only when the combined
+    # total exceeds the compiler input budget.
+    return text
 
 
 def _clean_generic_text(text: str) -> str:
@@ -349,6 +365,176 @@ def _format_article_citation(article: Article) -> str:
     return " | ".join(parts)
 
 
+_PRECOMPRESS_PROMPT = """
+You are condensing one section of raw research so a downstream evidence compiler
+can read all of it within its input budget. You are a lossless-as-possible
+compressor, NOT a summarizer.
+
+Rules:
+- Keep EVERY distinct factual claim, statistic, date, quoted statement, market
+  price, source name, and URL. Exact values and dates must survive verbatim.
+- Remove only: navigation/boilerplate text, repeated headers, and content that
+  is an exact or near-exact duplicate of content earlier in this same section
+  (syndicated reposts of one story collapse to one entry listing the duplicate
+  sources).
+- DIRECTIONAL BALANCE IS MANDATORY: never drop a claim because it cuts against
+  the apparent majority narrative of the section. If claims point both toward
+  and against the event in question, both sides must survive compression.
+- Preserve the section's heading structure and the original order of items.
+- Target length: about {target_chars} characters. Completeness beats the
+  target — if honoring the target would force dropping a distinct claim, run
+  longer instead and say nothing about it.
+
+Section name: {name}
+
+Section content:
+{content}
+""".strip()
+
+
+async def _compress_section_text(name: str, content: str, target_chars: int) -> str | None:
+    """One reader-aware compression call. Returns None on failure so the caller
+    can fall back to a visible (never silent) truncation."""
+    from llm_client import call_llm
+
+    max_tokens = max(2_000, min(16_000, target_chars // 3))
+    try:
+        compressed = await call_llm(
+            _PRECOMPRESS_PROMPT.format(
+                name=name,
+                target_chars=target_chars,
+                content=content,
+            ),
+            model=_PRECOMPRESS_MODEL,
+            temperature=0.1,
+            use_tools=False,
+            max_tokens=max_tokens,
+            _label="compiler/precompress",
+        )
+    except HardLimitExceededError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - compression is best-effort
+        logger.warning(
+            "compiler precompress failed for section %r: %s: %s",
+            name, type(exc).__name__, exc,
+        )
+        return None
+    compressed = (compressed or "").strip()
+    if not compressed:
+        return None
+    return (
+        f"[Section condensed by a lossless-compression pass from "
+        f"{len(content):,} to {len(compressed):,} chars — duplicates and "
+        f"boilerplate removed; all distinct claims retained.]\n{compressed}"
+    )
+
+
+def _visible_truncate(name: str, content: str, target_chars: int) -> str:
+    """Last-resort cut. Unlike the old silent [:N], it names what was lost."""
+    if target_chars >= len(content):
+        return content
+    dropped = len(content) - target_chars
+    marker = (
+        f"\n\n[COMPILER INPUT BUDGET TRUNCATION — {dropped:,} chars dropped from "
+        f"the tail of section '{name}'. Evidence beyond this point was NOT seen "
+        f"by the compiler; treat this section as incomplete.]"
+    )
+    logger.warning(
+        "compiler budget truncation: dropped %d chars from section %r", dropped, name
+    )
+    return content[: max(0, target_chars)].rstrip() + marker
+
+
+async def _fit_sections_to_budget(
+    sections: list[ProviderResult],
+    budget: int = _COMPILER_INPUT_BUDGET_CHARS,
+) -> list[ProviderResult]:
+    """Fit the combined sections into the compiler's input budget without any
+    silent loss.
+
+    Typical questions fit as-is and pay nothing. When over budget, the largest
+    NON-resolution sections are compressed with an LLM (resolution-source
+    material is authoritative and compressed only if nothing else is left),
+    up to _MAX_PRECOMPRESS_CALLS calls. Only if the budget is still exceeded
+    afterwards is anything cut — and then with a loud in-band marker, never
+    silently.
+    """
+    total = sum(len(content) for _, content in sections)
+    if total <= budget:
+        return sections
+
+    fitted: list[list[str]] = [[name, content] for name, content in sections]
+
+    def _total() -> int:
+        return sum(len(content) for _, content in fitted)
+
+    # Compress research sections first (largest first); resolution-source
+    # sections only as a last resort.
+    def _is_resolution(index: int) -> bool:
+        return "resolution" in fitted[index][0].lower()
+
+    candidates = sorted(
+        (i for i in range(len(fitted)) if not _is_resolution(i)),
+        key=lambda i: len(fitted[i][1]),
+        reverse=True,
+    ) + sorted(
+        (i for i in range(len(fitted)) if _is_resolution(i)),
+        key=lambda i: len(fitted[i][1]),
+        reverse=True,
+    )
+
+    calls_left = _MAX_PRECOMPRESS_CALLS
+    for index in candidates:
+        if _total() <= budget or calls_left <= 0:
+            break
+        name, content = fitted[index]
+        overflow = _total() - budget
+        target = max(
+            len(content) - overflow,
+            len(content) // 4,
+            _PRECOMPRESS_MIN_TARGET_CHARS,
+        )
+        if target >= len(content):
+            continue
+        # A section larger than one compression input is split into chunks;
+        # each chunk is its own call against the call budget.
+        chunks = [
+            content[i: i + _PRECOMPRESS_CHUNK_CHARS]
+            for i in range(0, len(content), _PRECOMPRESS_CHUNK_CHARS)
+        ]
+        per_chunk_target = max(_PRECOMPRESS_MIN_TARGET_CHARS // 2, target // len(chunks))
+        new_parts: list[str] = []
+        for idx, chunk in enumerate(chunks):
+            if calls_left <= 0 or len(chunk) <= per_chunk_target:
+                new_parts.append(chunk)  # kept raw; final marker pass may cut it
+                continue
+            calls_left -= 1
+            label = name if len(chunks) == 1 else f"{name} (part {idx + 1}/{len(chunks)})"
+            compressed = await _compress_section_text(label, chunk, per_chunk_target)
+            if compressed is None:
+                new_parts.append(_visible_truncate(label, chunk, per_chunk_target))
+            else:
+                new_parts.append(compressed)
+        fitted[index][1] = "\n\n".join(new_parts)
+        logger.info(
+            "compiler precompress: section %r %d -> %d chars",
+            name, len(content), len(fitted[index][1]),
+        )
+
+    if _total() > budget:
+        # Still over after the compression budget: cut the largest research
+        # section visibly. Resolution sections are never cut here.
+        research_indexes = [i for i in range(len(fitted)) if not _is_resolution(i)]
+        if research_indexes:
+            largest = max(research_indexes, key=lambda i: len(fitted[i][1]))
+            name, content = fitted[largest]
+            target = max(_PRECOMPRESS_MIN_TARGET_CHARS, len(content) - (_total() - budget))
+            if target < len(content):
+                fitted[largest][1] = _visible_truncate(name, content, target)
+
+    return [(name, content) for name, content in fitted]
+
+
 async def _try_llm_compile(
     title: str,
     resolution_criteria: str,
@@ -361,6 +547,8 @@ async def _try_llm_compile(
     if not OPENROUTER_API_KEY:
         logger.info("Research compiler skipped LLM pass because OPENROUTER_API_KEY is not set.")
         return None
+
+    cleaned_sections = await _fit_sections_to_budget(cleaned_sections)
 
     prompt = _build_compiler_prompt(
         title=title,
@@ -393,13 +581,13 @@ async def _try_llm_compile(
             usage_handle = MonetaryCostManager.start_openrouter_call(
                 "compiler/research-brief",
                 model,
-                {"messages": messages, "max_tokens": 5000},
+                {"messages": messages, "max_tokens": 6000},
             )
             response = await client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=0.1,
-                max_tokens=5000,
+                max_tokens=6000,
                 stream=False,
                 extra_body=OPENROUTER_USAGE_ACCOUNTING,
             )
@@ -459,12 +647,11 @@ def _build_compiler_prompt(
         for provider, content in cleaned_sections
         if "resolution" not in provider.lower()
     ]
-    resolution_text = _truncate_text(
-        _format_sections(resolution_sections), _MAX_PROVIDER_CHARS
-    ) if resolution_sections else ""
-    research_text = _truncate_text(
-        _format_sections(other_sections), _MAX_COMPILER_INPUT_CHARS
-    )
+    # Sections arrive already fitted to _COMPILER_INPUT_BUDGET_CHARS by
+    # _fit_sections_to_budget (LLM compression, visible markers) — no [:N]
+    # truncation happens here.
+    resolution_text = _format_sections(resolution_sections) if resolution_sections else ""
+    research_text = _format_sections(other_sections)
 
     today = datetime.date.today().isoformat()
     return f"""
@@ -535,6 +722,8 @@ Only when the question resolves off a published source (a curated page, tracker,
 A list of at most 15 items. Do NOT sort by relevance — order does not matter, and the [E#] labels are just citation handles, not a priority ranking. Format each item as:
 [E1] (tier) Claim with exact numbers and dates. — Source name, publish date, URL
 - SELECT BY DECISION-RELEVANCE (this governs which items make the list, not their order). The items that must appear whenever the research supports them are: (1) the RULE or MECHANISM that governs how the resolution value changes over time — eligibility criteria, recovery/transition conditions, the clock or event that triggers a change, a reaction function, a scheduled decision; and (2) the CURRENT VALUE of each input that rule depends on (including the date that starts the clock, not just the date a change was announced). A precise figure that does not feed this mechanism is background color, however exact. When a number's relevance hinges on a condition (a confounder that speeds or slows the mechanism), keep the condition with the number.
+- OBSERVED BEHAVIOR OUTRANKS FORMAL PROCESS: when the question resolves on an observed event or action, a reported instance of that same behavior actually happening (a precedent, a completed prior step, a dry run) is top-tier evidence even if it carries no number and sits outside the formal process the documents describe. Do not drop a behavioral precedent in favor of one more restatement of the process rules.
+- DIRECTIONAL BALANCE (required): after drafting the list, check it as a whole. Include the strongest items pointing EACH way that the research supports — toward YES and toward NO for a binary question; toward higher and lower values otherwise. If the raw research contains a plausibly decision-relevant item pointing against the majority of your list and you have excluded it, that is a selection error: include it. A lopsided list is acceptable ONLY when the research itself contains no credible opposing items — in that case say so explicitly in the Balance Check section below. Do not manufacture balance that the research does not contain; the requirement is that no side's strongest evidence is silently dropped.
 - tier is one of: direct (measures the resolution target itself, from the resolution source or confirmed equal to it), adjacent-metric (same family but a different basis/series; state the relationship and any conversion toward the target), near-proxy (close but not identical; say in a few words why not identical), market (prediction-market signal).
 - Every item must carry the observation date/period of its value. If a value's date cannot be tied to the period the question asks about, append "(date unverified)" and do NOT label it `direct` — a value reported by a single article without a confirmable current date is not direct evidence.
 - Keep exact values, dates, counts, and odds. Never round away precision present in the source.
@@ -543,8 +732,15 @@ A list of at most 15 items. Do NOT sort by relevance — order does not matter, 
 - Exclude weak proxies and background color entirely unless fewer than 5 stronger items exist. A statement of the governing rule/mechanism (or a condition that materially speeds or slows it) is never background color — keep it even if it carries no number of its own.
 - Do not place the same fact in more than one item.
 
+## Balance Check
+Exactly these three lines, filled in (required — the forecaster reads them; this is the audit trail proving no direction's evidence was dropped):
+- Strongest evidence FOR the event / higher values: [E#, E#, ...] — or "none found in the research"
+- Strongest evidence AGAINST the event / lower values: [E#, E#, ...] — or "none found in the research"
+- Decision-relevant items EXCLUDED from Key Evidence: one short clause each with source and URL (e.g. "LAF entered vacated positions at X — site.com/url — excluded as single-sourced"); write "none" only if nothing plausibly decision-relevant was left out.
+
 ## Market Signals
 - One bullet per relevant market: question, current odds, volume/liquidity/open interest when present, URL. Real-money markets (Polymarket, Kalshi) before play-money (Manifold).
+- For every market, state in the same bullet whether its resolution condition MATCHES this question's or DIFFERS (broader/narrower/different event). A differing market is a directional floor or ceiling only — label it as such.
 - If no market bears directly on the question, say so in one bullet and do not pad with adjacent markets.
 
 ## Gaps And Cautions
@@ -742,19 +938,13 @@ def _extract_keywords(text: str) -> set[str]:
 
 
 def _format_sections(sections: list[ProviderResult]) -> str:
-    chunks: list[str] = []
-    total_chars = 0
-    for provider, content in sections:
-        trimmed = _truncate_text(content, _MAX_PROVIDER_CHARS)
-        chunk = f"## Provider: {provider}\n{trimmed}"
-        if total_chars + len(chunk) > _MAX_COMPILER_INPUT_CHARS:
-            remaining = max(0, _MAX_COMPILER_INPUT_CHARS - total_chars)
-            if remaining <= 500:
-                break
-            chunk = _truncate_text(chunk, remaining)
-        chunks.append(chunk)
-        total_chars += len(chunk)
-    return "\n\n---\n\n".join(chunks)
+    # No truncation: callers hand in sections already fitted to the compiler
+    # input budget by _fit_sections_to_budget. This function used to apply the
+    # 24K/60K [:N] cuts that caused the 44619 miss (all YES-leaning evidence
+    # sat past the cut point of one 116K-char section).
+    return "\n\n---\n\n".join(
+        f"## Provider: {provider}\n{content}" for provider, content in sections
+    )
 
 
 def _join_compact(parts: list[str], max_chars: int) -> str:

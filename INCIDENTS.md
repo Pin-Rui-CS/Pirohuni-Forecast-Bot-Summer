@@ -7,6 +7,268 @@ re-deriving the same diagnosis twice — read this before touching the forecasti
 
 ---
 
+## 2026-07-10 — Compiler-input head-truncation cut ALL of a question's YES evidence → 7% vs ~35–45% fair value; brief-level skew reproduced by 3 same-model runs
+
+| | |
+|---|---|
+| **Severity** | High — 44619 (LAF deploy to two pilot zones before Sept 2026, `binary`) submitted 7% (runs 7/7/6); fair ex-ante ~35–45%; a Metaculus forecaster whose comment the pipeline itself scraped was at 41%. Resolves 2026-09-01 — unconfirmed miss, but the mechanism is deterministic and reproduced from the artifacts |
+| **Introduced** | Long-standing — `compiler.py` `_MAX_PROVIDER_CHARS = 24_000` / `_MAX_COMPILER_INPUT_CHARS = 60_000` head-keep `[:N]` predate the overhaul. Same defect class as the 18K scrape truncation fixed in the entry below — one layer downstream; that fix removed `[:N]` at the scrape/resolution layer but the compiler kept its own |
+| **Detected** | 2026-07-10 — post-mortem of run `2026-07-08_14-02`. NOTE: the in-folder post-mortem's original diagnosis ("compiler selection failure") was wrong — the compiler never SAW the evidence; see the CORRECTION block in `postmortem-laf-pilot-zones-44619.md` |
+| **Diagnosed & fixed** | 2026-07-10 (`compiler.py`, `research/serp_research.py`, `research/tavily_research.py`, `research/firecrawl_research.py`, `research/pipeline.py`, `forecasters/{base,binary,numeric,multiple_choice}.py`, `orchestrator.py`, `config.py`, `llm_client.py`) — **not yet committed** |
+| **Affected window** | Any question whose research exceeds ~24K chars in one provider section — i.e. essentially every research-heavy question. Worst when the decisive evidence arrives late in the section (raw search snippets sit after the scraped extracts, so snippet-only evidence was ALWAYS in the cut zone) |
+
+### Symptom
+All three ensemble runs (same model, same brief; 1pp spread = sampling noise)
+built a uniformly NO-leaning case: E1–E10 all negative, E11–E13 mildly positive
+with negative riders. The raw research contained direct YES evidence the brief
+never mentioned: the Debbine handover precedent (LAF physically entering
+positions vacated by Israeli troops — the exact resolution behavior;
+research.md:571), i24's "LAF deployed in two towns" (:664), Ynet's "Israel set
+to hand zones to Lebanese army / security cabinet convened" (:704), Netanyahu
+calling the zones militarily non-essential (:495), and a Metaculus forecaster
+at 41% with the achievable-by-design argument (:423). The forecast prompt's
+citation rule (every adjustment must cite an [E#]) made the omission
+unrecoverable downstream. Forecaster-layer errors amplified: the annex step
+sequence treated as a hard gate on an observed-event question, a "~20%" base
+rate with no count/denominator, 40% blend weight on a non-comparable
+full-withdrawal market (a floor for a strictly harder event), and one Asharq
+Al-Awsat article booked as −12pp across three separate updates.
+
+### Root cause
+`_clean_provider_content` cut every research section to 24,000 chars head-keep
+(and `_format_sections` re-cut the combined text to 60K). The 44619 Tavily
+section is ~116K chars; the cut lands at research.md line 383. Everything
+after — the community-context scrape and the ENTIRE raw-snippet dump — was
+mechanically discarded before any LLM read it. Value-blind `[:N]` + arbitrary
+section ordering (snippets last) meant snippet-only evidence never survived on
+any research-heavy question. The audit table proves it: compiler input 80,927
+chars vs ~180K+ of research.
+
+### The fix (all implemented, uncommitted)
+- **`[:N]` removed at the compiler input** (`compiler.py`) — sections go in
+  whole; `_fit_sections_to_budget` engages only when the combined total
+  exceeds `_COMPILER_INPUT_BUDGET_CHARS = 120_000`: oversized non-resolution
+  sections are compressed by a Sonnet "lossless compressor" pass (keep every
+  distinct claim/number/date/URL; directional balance mandatory; ≤3 calls),
+  resolution sections only as a last resort; any residual cut is announced
+  with an in-band `COMPILER INPUT BUDGET TRUNCATION` marker — never silent.
+- **Snippet dedup** (all three provider formatters) — a scraped-ok URL's raw
+  snippet body is replaced by a pointer note (its extract is a strict
+  superset); snippets of UNSCRAPED urls are never touched — for those the
+  snippet is the only copy in the pipeline (this run's entire YES case).
+  ~30–45K chars saved on a heavy question, funding most of the budget raise.
+- **Compiler Balance Check** (required output section) — strongest items each
+  direction + a named list of decision-relevant items excluded from Key
+  Evidence; "observed behavior outranks formal process" added to the
+  selection rules. Defense-in-depth: could not have saved THIS run alone.
+- **Forecaster hard rules** (`binary.py`) — required "Base rate cases: N of D"
+  field (no more count-free rates); markets whose resolution condition
+  differs are bounds-only with ZERO blend weight (required "Market treatment"
+  field); process-documents-don't-gate-observable-events rule with a priced
+  political-shortcut path; selection-effect check for deliberately-achievable
+  first milestones; citation rule generalized to source/URL cites.
+- **Heterogeneous ensemble member** (`config.py`, `forecasters/*`,
+  `pipeline.py`, `orchestrator.py`) — the LAST run is swapped (not added) to
+  read the raw deduplicated research on `HETEROGENEOUS_RUN_MODEL`
+  (Sonnet 5); roughly cost-neutral vs a third identical Opus brief-run. The
+  only ensemble member that can catch a compile-stage omission. Env-gated:
+  `HETEROGENEOUS_RUN_ENABLED` / `HETEROGENEOUS_RUN_MODEL`.
+- **Social-URL prefilter** (provider rankers) — social hosts leave the
+  ranking payload/scrape pool (they never scrape; 14/89 candidates in the
+  44379 run); their snippets stay in the research.
+- **`call_llm` gains `max_tokens`** (`llm_client.py`) for bounded utility
+  passes.
+
+### Verification
+- `tests/test_44619_fixes.py` (new, free): 16/16 — dedup keeps unscraped/
+  failed-scrape snippets (the Debbine case pinned as a named test), social
+  filter drops socials from ranking but not from the dump, budget fitting
+  compresses largest-research-first and never touches resolution sections
+  while research suffices, compression failure produces a visible marker,
+  the 24K cut is gone (100K-char section passes through whole), prompt
+  contracts (Balance Check, N-of-D, bounds-only, process-gate), heterogeneous
+  swap semantics (never fires on 1-run ensembles), and the temporal gate's
+  soft deadline flag on the exact 44619 Polymarket sub-market text.
+- Full existing suite: all pass except `test_numeric_elicitation.py` /
+  `test_curve_quality.py`, which fail identically with these changes stashed
+  (pre-existing `percentiles_to_cdf` import breakage from the June mixture
+  rework — not from this change).
+- Test-exposed bug fixed before landing: `_visible_truncate` produced a
+  "dropped -10,000 chars" marker when a chunk's target exceeded its length.
+- **Not yet exercised**: a paid compile replay of the saved 44619 run
+  (`eval_tools/compile_replay.py`) to confirm Debbine/i24/Ynet reach Key
+  Evidence, and one live dry-run before the next tournament batch.
+
+### Lessons
+- A fixed char budget at ANY layer silently decides what the whole pipeline
+  can know. The scrape-layer lesson from the entry below applied verbatim one
+  layer downstream; when a `[:N]` is removed, grep for the same pattern in
+  every consumer of the same data.
+- Section ordering + head-keep truncation = a systematic bias, not random
+  loss: whatever category of evidence is serialized last (here: raw snippets,
+  the only home of unscraped-page evidence) is ALWAYS what dies.
+- Dedup direction matters: dropping a snippet is safe only when its own full
+  extract is present. The reverse heuristic ("snippets are low-value noise")
+  would have deleted this run's entire YES case.
+- An ensemble of N same-model runs on one compiled brief measures sampling
+  noise. This is the FOURTH incident (2026-06-30, 2026-07-07, 44382-deferred,
+  now 44619) where one raw-input or different-model member would plausibly
+  have caught the miss; the swap is now implemented.
+- A post-mortem that stops at the first plausible layer misdirects the fix:
+  "the compiler dropped X" and "the compiler never received X" demand
+  different repairs. Verify against the char offsets and the audit's token
+  counts before naming a root cause.
+
+---
+
+## 2026-07-10 — Count question forecast off a truncated set: head-truncation + dedup tombstone + no page history let a phantom "upward mover" and an invented flow rate drive ≤9 ~20pts high
+
+| | |
+|---|---|
+| **Severity** | High — 44382 (AI Act tracker "Clear" count on Aug 31, 2026, `multiple_choice`) submitted ≤9: 43.7% vs community ~20%; a defensible read of the same evidence is ~22–28%, 10–11 modal. Question closed 2026-07-08, resolves 2026-08-31 — unconfirmed miss, but every driver is structural and reproduced from the artifacts |
+| **Introduced** | Long-standing — `_CRAWL4AI_CONTENT_BUDGET = 18_000` head-truncation and the content-less dedup registry predate the overhaul; the temporal gate shipped without a whitelist; Wayback retrieval never existed (evidence plans requested it, search queries can't fetch it) |
+| **Detected** | 2026-07-09 — post-mortem of run `2026-07-07_21-01` (full inventory in the question folder's `postmortem-ai-act-tracker-44382.md`, independently verified against research.md/runs.md/audit.md) |
+| **Diagnosed & fixed** | 2026-07-10 (`Crawl4AI/crawl.py`, `research/serp_research.py`, `resolution_criteria_scraper.py`, `research/pipeline.py`, `utils.py`, `compiler.py`, `Adapters/Wayback.py` new, forecaster templates, `eval_tools/compile_replay.py`) — **not yet committed** |
+| **Affected window** | Any question resolving off a curated/living source — worst for count/membership questions (the counted set must be enumerable) and for any question whose outside view is the source's own flow rate |
+
+### Symptom
+All three ensemble runs (same model, same 6,233-token brief; ≤9 spread 0.40–0.49
+= sampling noise) built the ≤9 case from three claims, all pipeline artifacts:
+(1) Italy as the "strongest upward candidate" to flip Clear — but Italy had been
+Clear since Oct 2025 (Law 132/2025); the raw AskNews extract even said "decrees
+**implementing** Law 132/2025" and the compiler still coded a pending
+designation; (2) "unchanged at 9 over ~3 months" — manufactured by comparing
+IAPP's "9 designated, early 2026" against the tracker's "9 Clear, June 2026",
+two different instruments whose coincidental equality was read as a time series
+(true same-source rate ≈ 0.9/month → ~11 by Aug 31); (3) a tracker-lag discount
+applied in Phase 0.5, again in Phase 3, again in Phase 4. Meanwhile the real
+conversion pipeline (Poland passed the Sejm 11 June) was invisible — its status
+came from a February document.
+
+### Root cause (five code-level defects, one chain)
+1. **Head-truncation of the resolution source** —
+   `_truncate_scrape_content` cut the tracker page at 18K chars *before* the
+   summary LLM (whose own input cap is 100K). The 27-row country table survived
+   only through "Czech Republic" (6/27, alphabetical), so the composition of the
+   "9 Clear" was unverifiable and nothing could contradict the Italy misread.
+2. **Dedup tombstone, not cache** — `claim_scrape_url` returned a content-less
+   "skipped duplicate" payload. The resolution scraper fetched the tracker first;
+   when the artifact-check retry re-targeted that exact URL to close the
+   *flagged* gap, it got nothing, four times. The retry loop was structurally
+   unable to re-examine the most important URL of any run (same signature in
+   44412: worldbank.org "skipped duplicate").
+3. **No page-history capability** — the evidence plan named the tracker's
+   Wayback series as *the* base-rate anchor; the pipeline's only tool for a plan
+   is web search, so it became Google queries ("wayback machine <url> snapshot
+   July 2026") that found nothing. No flow rate, no update cadence → defects the
+   forecasters filled by improvisation (symptom claims 2 and 3).
+4. **Temporal gate flagged the question's own resolution date** —
+   `_flag_future_dated_claims` regexed *any* future full date in
+   `closest_available`; the field legitimately said "…before the Aug 31, 2026
+   check date" and the gate stamped "Treat it as historical data OUTSIDE the
+   resolution window" onto the single most important evidence field. All three
+   runs burned Phase 0 dismissing it. Same failure family as 2026-06-30: a
+   deterministic annotation outranking correct content.
+5. **Nothing reconciled movers against the baseline** — the compiler had no rule
+   asking "is this entity already inside the current value?", so follow-up
+   coverage of an old event (Italy's implementing decrees) passed as new
+   movement; and four evidence items from one Interface-EU document carried the
+   weight of four sources.
+
+### The fix (all approved except ensemble diversification — deferred by owner)
+- **Content cache** (`Crawl4AI/crawl.py`) — `record_scrape_content` /
+  `get_cached_scrape_content` beside the dedup registry (scoped, cleared with
+  it); duplicate requests in `serp_research` and the resolution scraper now
+  return the cached full content (ledger engine `cache`) instead of the
+  tombstone. Cache stores pre-truncation content; each consumer applies its own
+  budget.
+- **Truncation removed** (`resolution_criteria_scraper.py`) — per-URL budget
+  18K→100K (matching `_LLM_MAX_INPUT`); combined content that exceeds one
+  summarizer input is **batch-summarized** (`_batch_resolution_sources`, ≤3
+  calls, oversized single sources split into labelled parts — nothing dropped
+  silently, omissions are named). Summary prompt now requires reproducing
+  resolution-relevant table rows with explicit row arithmetic ("27 rows present:
+  9 Clear…") and declaring "N of M rows present" when cut off. Artifact-check
+  prompt: a headline count whose row-level composition was not retrieved is
+  "partial" and at least one retry query must target the breakdown.
+- **Wayback history** (`Adapters/Wayback.py`, new; wired into
+  `scrape_resolution_sources`) — deterministic CDX listing (monthly-collapsed,
+  18mo window, 1 retry) + up to 4 evenly spread `id_` raw snapshots + one Sonnet
+  call producing a "Resolution Source History" section (value time series,
+  update cadence, per-month rate). Not a `UrlAdapter` (keyed off the resolution
+  URL, not search results). Soft-fails to "" — history is a bonus, never a
+  blocker.
+- **Baseline reconciliation** (`compiler.py`) — new consistency-check rule:
+  every movement-implying item is classified already-reflected /
+  not-yet-reflected / "(position vs. baseline unverified)" against the
+  baseline's "as of" date; unverified candidates cannot be presented as the
+  strongest mover, and the unretrieved breakdown goes to Gaps as the blocking
+  gap. Key Evidence items now carry `[Dx]` source-document tags (same underlying
+  document = same tag). Resolution Mechanics must use a history section for flow
+  rates and never a cross-source coincidence.
+- **Gate scoped and softened** (`utils.py`, `research/pipeline.py`) —
+  `find_future_full_dates(exclude=)`; `run_research` whitelists the question's
+  own future dates (parsed from title/criteria/background/fine print) at both
+  artifact-check call sites. Annotation reworded TEMPORAL IMPOSSIBILITY →
+  TEMPORAL FLAG, distinguishing "published/observed after today" (impossible)
+  from a descriptive deadline mention (explicit disregard instruction).
+- **Forecaster discipline** (all three templates) — one-application ledger for
+  named discounts (cite-don't-reapply, undo on detection); `[Dx]`-sharing items
+  count as a single signal.
+- **Harness parity** (`eval_tools/compile_replay.py`) — mirrors the new gate
+  (computes the whitelist, strips the *saved* run's stale annotation before
+  re-gating) and now saves before printing with UTF-8 stdout — the first replay
+  attempt burned an Opus call when `print()` died on a cp1252 console **after**
+  the API call and **before** `--save`.
+
+### Verification
+- Free: syntax/imports for all touched files; `tests/test_{imports,search_chain,
+  research_degradation,resolution_firecrawl_fallback}.py` all pass; unit probes
+  replay the exact 44382 gate false positive (silent with whitelist, still fires
+  on a genuinely misdated report), cache round-trip/scope isolation, batching
+  conservation (250K → 3 labelled parts, zero chars lost).
+- Free live test: `Adapters/Wayback.py` against the actual tracker URL retrieved
+  **3 Clear (Aug 2025) → 3 (Jan 2026) → 9 (Jul 2026)** — precisely the
+  same-source series whose absence caused symptom claims 2 and 3.
+- Paid (2 Opus compiler calls, ~$0.30): `compile_replay.py` on the saved 44382
+  run. New brief: Italy demoted to "Position vs. tracker baseline unverified
+  (Italy row not retrieved)"; row-level breakdown promoted to "blocking gap"
+  naming all six unplaceable countries; explicit "do not infer a trend rate from
+  cross-source coincidence"; no temporal banner; Interface-EU items share
+  `[D2]`. Saved as `compile_replay_2026-07-10_10-13-46.md` in the question
+  folder.
+- **Not yet exercised**: the cache/truncation/Wayback paths run at research
+  time, which replay cannot reach — one live dry-run is the remaining
+  acceptance test before the next tournament batch.
+
+### Deferred (recorded so it is not re-derived)
+Ensemble diversification (one run on raw extracts / second model family) was
+proposed — forecast calls are ~11% of run tokens, so it is nearly free — and
+explicitly deferred by the owner. This is now the **third** documented instance
+of 3× same-model-same-brief reproducing a shared error at full weight (see
+2026-07-07 and 2026-06-30).
+
+### Lessons
+- A dedup registry that answers "already fetched" with **no content** turns
+  every retry of the most important URL into a guaranteed miss; dedup the
+  *fetch*, cache the *content*.
+- A fixed char budget applied at the scrape layer silently decides what the
+  whole pipeline can know; if a page must be compressed, compress it with the
+  reader (chunked summarization), never with `[:N]`.
+- For count/membership questions the counted set's composition **is** the
+  artifact; a headline count without its rows cannot be cross-checked against
+  any mover claim.
+- A flow rate is only valid same-source, same-methodology; two instruments
+  agreeing on a number is a coincidence, not a time series. The page's own
+  archive history is fetchable deterministically — search queries never find it.
+- Deterministic gates that inject directives must whitelist the question's own
+  metadata (dates, names) and phrase findings as flags, or they corrupt exactly
+  the fields they guard.
+- In replay tooling, **save before print** — console encoding must never be the
+  step that loses a paid LLM call.
+
+---
+
 ## 2026-07-09 — Serp scrape path is PDF-blind (browser crawl on `application/pdf` returns nothing) → decisive statistical releases silently lost; brief anchored on an n=1 forum comment
 
 | | |

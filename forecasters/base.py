@@ -6,10 +6,26 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from config import FORECASTER_MODELS
+from config import (
+    FORECASTER_MODELS,
+    HETEROGENEOUS_RUN_ENABLED,
+    HETEROGENEOUS_RUN_MODEL,
+)
 from llm_client import call_llm
 
 logger = logging.getLogger(__name__)
+
+
+# Prepended to the research handed to the heterogeneous (raw-input) ensemble
+# member so it knows why its material looks different from a compiled brief.
+RAW_RESEARCH_NOTE = (
+    "NOTE: This run receives the RAW research output (deduplicated but NOT "
+    "compiled into a brief). It exists to catch anything a compilation step "
+    "might have dropped or skewed, so read the material yourself and weigh "
+    "ALL of it — including search-result snippets, which sometimes hold "
+    "decisive evidence that appears nowhere else. There are no [E#] labels "
+    "here; cite evidence by source name or URL."
+)
 
 
 @dataclass
@@ -66,6 +82,31 @@ def models_for_runs(num_runs: int, models: list[str] | None) -> list[str]:
     return [pool[i % len(pool)] for i in range(max(0, num_runs))]
 
 
+def heterogeneous_run_setup(
+    num_runs: int,
+    brief_prompt: str,
+    raw_prompt: str | None,
+) -> tuple[list[str] | None, list[str] | None]:
+    """Swap the LAST ensemble run to the raw-research prompt on the
+    heterogeneous model.
+
+    Returns ``(run_prompts, models)`` for gather_forecast_runs, or
+    ``(None, None)`` when the swap does not apply (disabled, no raw view, or a
+    single-run ensemble — the compiled-brief run is never given up entirely).
+    It is a swap, not an addition: N same-model runs on one brief reproduce any
+    brief-level skew at full weight, so the third identical run buys almost no
+    information, while a raw-input run is the only member able to catch
+    evidence the compile step dropped.
+    """
+    if not HETEROGENEOUS_RUN_ENABLED or not raw_prompt or num_runs < 2:
+        return None, None
+    run_prompts = [brief_prompt] * num_runs
+    run_prompts[-1] = raw_prompt
+    models = models_for_runs(num_runs, None)
+    models[-1] = HETEROGENEOUS_RUN_MODEL
+    return run_prompts, models
+
+
 async def gather_forecast_runs(
     prompt: str,
     num_runs: int,
@@ -75,6 +116,7 @@ async def gather_forecast_runs(
     models: list[str] | None = None,
     validate: Validator | None = None,
     repair_instruction: str | None = None,
+    run_prompts: list[str] | None = None,
 ) -> list[ForecastRun]:
     """Run the forecast prompt ``num_runs`` times in parallel across an ensemble
     of models — one model per run, cycling the pool.
@@ -96,8 +138,18 @@ async def gather_forecast_runs(
     reasoning (and the rationales the binary tiebreaker and human reviewers
     read). Robust parsing + a targeted repair retry fits the format instead of
     fighting it.
+
+    ``run_prompts`` optionally overrides the prompt per run (index-aligned with
+    the runs) — used by the heterogeneous ensemble member, which reads the raw
+    research instead of the compiled brief. When omitted, every run uses
+    ``prompt``.
     """
     assigned = models_for_runs(num_runs, models)
+    prompts = list(run_prompts) if run_prompts is not None else [prompt] * len(assigned)
+    if len(prompts) != len(assigned):
+        raise ValueError(
+            f"run_prompts length {len(prompts)} != num_runs {len(assigned)}"
+        )
 
     async def _call(call_prompt: str, model: str, sublabel: str) -> tuple[str, str]:
         return await call_llm(
@@ -115,11 +167,12 @@ async def gather_forecast_runs(
 
     async def one_run(index: int, model: str) -> ForecastRun:
         tag = short_model_name(model)
+        run_prompt = prompts[index]
         # A hard call failure (provider down, rate-limited, quota exhausted) must
         # degrade the ensemble to the surviving models, never sink the whole
         # question — that is the con-2 failure mode in its starkest form.
         try:
-            response, transcript = await _call(prompt, model, f"{label}[{tag}]")
+            response, transcript = await _call(run_prompt, model, f"{label}[{tag}]")
         except Exception as exc:  # noqa: BLE001 - any provider failure is recoverable here
             err = _short_error(exc)
             logger.warning(
@@ -142,10 +195,10 @@ async def gather_forecast_runs(
             "[ensemble] %s run %d/%d (%s) failed validation: %s — repairing once.",
             label, index + 1, len(assigned), model, error,
         )
-        repair_prompt = prompt
+        repair_prompt = run_prompt
         if repair_instruction:
             repair_prompt = (
-                f"{prompt}\n\n---\n\n"
+                f"{run_prompt}\n\n---\n\n"
                 f"Your previous response could not be used: {error}\n"
                 f"{repair_instruction}"
             )

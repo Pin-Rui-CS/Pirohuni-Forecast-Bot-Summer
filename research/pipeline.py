@@ -47,6 +47,11 @@ class ResearchBundle:
     compiled_report: str = ""
     artifact_check: dict | None = None
     degraded_search_providers: list[str] = field(default_factory=list)
+    # The raw (uncompiled) provider output, carrying the same authoritative
+    # artifact-status banner as the compiled brief. Consumed by the
+    # heterogeneous ensemble run so one forecaster reads the evidence the
+    # compile step may have dropped or skewed. "" when unavailable.
+    raw_research_view: str = ""
 
 
 async def run_research(
@@ -406,12 +411,17 @@ async def run_research(
     compiled_report = _apply_artifact_status_banner(compiled_report, artifact_check)
     compiled_report = _apply_degradation_warning(compiled_report, degraded_search_providers)
 
+    raw_research_view = _apply_artifact_status_banner(
+        _build_raw_research_view(included_results), artifact_check
+    )
+
     return ResearchBundle(
         evidence_plan=evidence_plan,
         provider_results=included_results,
         compiled_report=compiled_report,
         artifact_check=artifact_check,
         degraded_search_providers=degraded_search_providers,
+        raw_research_view=raw_research_view,
     )
 
 
@@ -556,6 +566,32 @@ def _apply_degradation_warning(report: str, degraded_search_providers: list[str]
         body = report[len(title_line):].lstrip("\n")
         return f"{title_line}\n\n{warning}\n\n{body}"
     return f"{warning}\n\n{report}"
+
+
+# Ceiling for the heterogeneous run's raw-research prompt. Generous by design
+# (Sonnet's 1M context takes it easily; ~50K tokens ≈ $0.15 worst case) so the
+# raw view is genuinely raw. On the rare question whose research exceeds it,
+# the cut is announced in-band — never silent.
+_RAW_VIEW_MAX_CHARS = 200_000
+
+
+def _build_raw_research_view(provider_results: list[tuple[str, str]]) -> str:
+    """Join the (already snippet-deduplicated) provider sections for the
+    heterogeneous ensemble run — the member that reads the research uncompiled
+    so a compile-stage omission cannot poison all runs at once."""
+    if not provider_results:
+        return ""
+    joined = "\n\n---\n\n".join(
+        f"## Provider: {name}\n{content}" for name, content in provider_results
+    )
+    if len(joined) > _RAW_VIEW_MAX_CHARS:
+        dropped = len(joined) - _RAW_VIEW_MAX_CHARS
+        joined = joined[:_RAW_VIEW_MAX_CHARS].rstrip() + (
+            f"\n\n[RAW VIEW TRUNCATED — {dropped:,} chars beyond this point were "
+            f"cut for prompt-size limits. The compiled brief the other ensemble "
+            f"members read covers the full research.]"
+        )
+    return joined
 
 
 def _apply_artifact_status_banner(report: str, artifact_check: dict | None) -> str:

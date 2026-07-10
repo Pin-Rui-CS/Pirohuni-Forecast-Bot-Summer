@@ -313,11 +313,14 @@ async def call_llm(
     _label: str = "forecast",
     return_transcript: bool = False,
     cache_static_prefix: bool = False,
+    max_tokens: int | None = None,
 ) -> str | tuple[str, str]:
     """Call the LLM via OpenRouter.
 
     The returned transcript intentionally omits the user prompt; callers that
-    save transcripts store the prompt once themselves.
+    save transcripts store the prompt once themselves. ``max_tokens`` caps the
+    response length when set (used by bounded utility passes like the
+    compiler's pre-compression); when None the provider default applies.
     """
     client = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
@@ -339,15 +342,18 @@ async def call_llm(
 
     if not use_tools:
         messages = [_user_message(prompt, cache_static_prefix)]
+        request_payload: dict = {
+            "messages": messages,
+            "temperature": temperature,
+            "stream": False,
+        }
+        if max_tokens is not None:
+            request_payload["max_tokens"] = max_tokens
         response = await _create_chat_completion_with_retries(
             client,
             label=_label,
             model=model,
-            request_payload={
-                "messages": messages,
-                "temperature": temperature,
-                "stream": False,
-            },
+            request_payload=request_payload,
             validate_response=_validate_text_completion_response,
         )
         answer = response.choices[0].message.content

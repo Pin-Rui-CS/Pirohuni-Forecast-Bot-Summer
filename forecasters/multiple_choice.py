@@ -4,7 +4,13 @@ import datetime
 import logging
 import re
 
-from forecasters.base import ForecastResult, gather_forecast_runs, short_model_name
+from forecasters.base import (
+    RAW_RESEARCH_NOTE,
+    ForecastResult,
+    gather_forecast_runs,
+    heterogeneous_run_setup,
+    short_model_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,9 +278,19 @@ async def get_multiple_choice_gpt_prediction(
     question_details: dict,
     num_runs: int,
     summary_report: str,
+    raw_research: str | None = None,
 ) -> ForecastResult:
     options = question_details["options"]
     prompt = build_multiple_choice_prompt(question_details, summary_report)
+
+    raw_prompt = (
+        build_multiple_choice_prompt(
+            question_details, f"{RAW_RESEARCH_NOTE}\n\n{raw_research}"
+        )
+        if raw_research
+        else None
+    )
+    run_prompts, models = heterogeneous_run_setup(num_runs, prompt, raw_prompt)
 
     repair_instruction = (
         f"End your reply with exactly {len(options)} lines, one per option in this "
@@ -285,6 +301,8 @@ async def get_multiple_choice_gpt_prediction(
         prompt,
         num_runs,
         "mc-forecast",
+        models=models,
+        run_prompts=run_prompts,
         validate=_make_mc_validator(options),
         repair_instruction=repair_instruction,
     )

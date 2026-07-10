@@ -10,7 +10,13 @@ import numpy as np
 from pydantic import BaseModel, Field, model_validator
 from scipy import stats
 
-from forecasters.base import ForecastResult, gather_forecast_runs, short_model_name
+from forecasters.base import (
+    RAW_RESEARCH_NOTE,
+    ForecastResult,
+    gather_forecast_runs,
+    heterogeneous_run_setup,
+    short_model_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1878,6 +1884,7 @@ async def get_numeric_gpt_prediction(
     question_details: dict,
     num_runs: int,
     summary_report: str,
+    raw_research: str | None = None,
 ) -> ForecastResult:
     title = question_details["title"]
     prompt, geometry = build_numeric_prompt(question_details, summary_report)
@@ -1888,10 +1895,21 @@ async def get_numeric_gpt_prediction(
         geometry["zero_point"],
     )
 
+    raw_prompt = None
+    if raw_research:
+        # Same question geometry, different research view — geometry depends
+        # only on the question metadata.
+        raw_prompt, _ = build_numeric_prompt(
+            question_details, f"{RAW_RESEARCH_NOTE}\n\n{raw_research}"
+        )
+    run_prompts, models = heterogeneous_run_setup(num_runs, prompt, raw_prompt)
+
     runs = await gather_forecast_runs(
         prompt,
         num_runs,
         "numeric-forecast",
+        models=models,
+        run_prompts=run_prompts,
         validate=_make_numeric_validator(geometry),
         repair_instruction=_NUMERIC_REPAIR_INSTRUCTION,
     )

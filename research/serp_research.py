@@ -83,6 +83,66 @@ class SerpResearchResult:
     report: str
 
 
+# Hosts that essentially never yield scrapeable content (login walls, JS video
+# shells). Their search snippets STAY in the research output — a social post is
+# sometimes the only trace of a fact — but they are excluded from the ranking
+# payload, so ranking tokens and scrape-cycle slots are never spent on them
+# (2026-07-07 finding: 14 of 89 ranking candidates were social URLs; none ever
+# scraped successfully).
+SOCIAL_MEDIA_HOSTS = (
+    "facebook.com",
+    "instagram.com",
+    "youtube.com",
+    "youtu.be",
+    "x.com",
+    "twitter.com",
+    "reddit.com",
+    "linkedin.com",
+    "tiktok.com",
+    "threads.net",
+)
+
+
+def is_social_url(url: str) -> bool:
+    host = urlsplit((url or "").strip()).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return any(host == h or host.endswith("." + h) for h in SOCIAL_MEDIA_HOSTS)
+
+
+def exclude_social_results(results: list) -> list:
+    """Drop social-media results from a ranking payload (works for SerpAPI,
+    Tavily, and Firecrawl result objects — whichever of .link/.url exists)."""
+    return [
+        item
+        for item in results
+        if not is_social_url(getattr(item, "link", "") or getattr(item, "url", ""))
+    ]
+
+
+def scraped_ok_urls(cycles: list[Cycle]) -> set[str]:
+    """Normalised URLs whose page content was successfully scraped and fed to
+    the extract stage in any cycle."""
+    return {
+        _norm_url(scrape.url)
+        for cycle in cycles
+        for scrape in cycle.scrapes
+        if scrape.ok
+    }
+
+
+# Replaces a raw search snippet's body when the same URL was scraped in full:
+# the scraped extract is a strict superset of the snippet, so repeating the
+# snippet only spends compiler-input budget twice on the same page. Snippets
+# for URLs that were NOT scraped are never dropped — for an unscraped page the
+# snippet is the only copy of that evidence in the entire pipeline (the 44619
+# miss: the decisive items lived only in snippets of unscraped URLs).
+SNIPPET_OMITTED_NOTE = (
+    "(snippet omitted — this page was scraped in full; see 'Compiled scraped "
+    "research' above)"
+)
+
+
 async def run_serp_research(
     title: str,
     resolution_criteria: str = "",
@@ -242,6 +302,7 @@ async def rank_serp_urls(
     model: str = DEFAULT_SERP_RANKING_MODEL,
 ) -> list[RankedSerpUrlGroup]:
     """Ask an LLM to group and rank URLs worth scraping."""
+    results = exclude_social_results(results)
     if not results:
         return []
 
@@ -395,15 +456,21 @@ def format_serp_research(result: SerpResearchResult) -> str:
             )
         ranked_group_lines.append("")
 
+    scraped_urls = scraped_ok_urls(result.cycles)
     raw_lines = []
     for index, item in enumerate(result.organic_results, start=1):
+        snippet = (
+            SNIPPET_OMITTED_NOTE
+            if _norm_url(item.link) in scraped_urls
+            else (item.snippet or "Not provided.")
+        )
         raw_lines.extend(
             [
                 f"[{index}] {item.title}",
                 f"    URL: {item.link}",
                 f"    Date: {item.date or 'Not provided.'}",
                 f"    Query: {item.query}",
-                f"    Snippet: {item.snippet or 'Not provided.'}",
+                f"    Snippet: {snippet}",
                 "",
             ]
         )

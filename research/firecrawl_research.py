@@ -23,15 +23,19 @@ from research.serp_research import (
     DEFAULT_SERP_RANKING_MODEL,
     Cycle,
     RankedSerpUrlGroup,
+    SNIPPET_OMITTED_NOTE,
     _canonical_link,
     _dedupe_ranked_url_groups,
     _extract_json_value,
     _limited_gather,
+    _norm_url,
     _normalise_query,
     _parse_ranked_url_groups,
     _record_ranked_url_groups,
     build_url_date_map,
+    exclude_social_results,
     run_scrape_cycles,
+    scraped_ok_urls,
 )
 import source_ledger
 from utils import display_source_date
@@ -259,6 +263,7 @@ async def rank_firecrawl_urls(
     model: str = DEFAULT_SERP_RANKING_MODEL,
 ) -> list[RankedSerpUrlGroup]:
     """Ask an LLM to group and rank Firecrawl result URLs worth scraping."""
+    results = exclude_social_results(results)
     if not results:
         return []
 
@@ -300,8 +305,14 @@ def format_firecrawl_research(result: FirecrawlResearchResult) -> str:
             )
         ranked_group_lines.append("")
 
+    scraped_urls = scraped_ok_urls(result.cycles)
     raw_lines = []
     for index, item in enumerate(result.search_results, start=1):
+        description = (
+            SNIPPET_OMITTED_NOTE
+            if _norm_url(item.url) in scraped_urls
+            else (item.description or "Not provided.")
+        )
         raw_lines.extend(
             [
                 f"[{index}] {item.title}",
@@ -310,7 +321,7 @@ def format_firecrawl_research(result: FirecrawlResearchResult) -> str:
                 f"    Category: {item.category or 'Not provided.'}",
                 f"    Date: {item.date or 'Not provided.'}",
                 f"    Query: {item.query}",
-                f"    Description: {item.description or 'Not provided.'}",
+                f"    Description: {description}",
                 "",
             ]
         )

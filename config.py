@@ -53,6 +53,20 @@ FORECASTER_MODELS = _env_list(
 FORECASTER_TIEBREAKER_MODEL = os.getenv(
     "FORECASTER_TIEBREAKER_MODEL", DEFAULT_FORECASTER_MODEL
 )
+
+# --- Heterogeneous ensemble run ----------------------------------------------
+# When enabled (and NUM_RUNS_PER_QUESTION >= 2), the LAST ensemble run reads the
+# RAW research (deduplicated provider output) instead of the compiled brief, on
+# HETEROGENEOUS_RUN_MODEL. Three-plus incidents (2026-06-30, 2026-07-07, 44619)
+# showed N same-model runs on one compiled brief reproduce any brief-level skew
+# at full weight — the ensemble measures sampling noise, not epistemic
+# disagreement. A raw-input run is the only member that can catch evidence the
+# compile step dropped. Cost-neutral-ish: it REPLACES a run (Sonnet's cheaper
+# rate offsets the larger raw input); it does not add one.
+HETEROGENEOUS_RUN_ENABLED = _env_bool("HETEROGENEOUS_RUN_ENABLED", True)
+HETEROGENEOUS_RUN_MODEL = os.getenv(
+    "HETEROGENEOUS_RUN_MODEL", "anthropic/claude-sonnet-5"
+)
 SKIP_PREVIOUSLY_FORECASTED_QUESTIONS = True
 METACULUS_MAX_CONCURRENT_REQUESTS = int(os.getenv("METACULUS_MAX_CONCURRENT_REQUESTS", "1"))
 METACULUS_API_RATE_LIMITER = asyncio.Semaphore(METACULUS_MAX_CONCURRENT_REQUESTS)

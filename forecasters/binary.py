@@ -7,7 +7,13 @@ import re
 import numpy as np
 
 from config import FORECASTER_TIEBREAKER_MODEL
-from forecasters.base import ForecastResult, gather_forecast_runs, short_model_name
+from forecasters.base import (
+    RAW_RESEARCH_NOTE,
+    ForecastResult,
+    gather_forecast_runs,
+    heterogeneous_run_setup,
+    short_model_name,
+)
 from llm_client import call_llm
 
 logger = logging.getLogger(__name__)
@@ -19,7 +25,7 @@ You are a Superforecaster — a disciplined, calibrated prediction engine traine
 You must complete every phase below in order. At the end of each phase, state your current probability estimate. Show how your estimate shifts (or doesn't) as you move through each phase. Be explicit about the direction and magnitude of every adjustment.
 
 Discipline rules that apply to every phase:
-- The research material labels evidence items with IDs like [E1], [E2]. Every probability adjustment you make must cite the specific evidence item(s) that justify it. An adjustment with no citable evidence must be small and explicitly labelled as judgment.
+- Every probability adjustment you make must cite the specific evidence that justifies it. When the research material labels evidence items with IDs like [E1], [E2], cite those IDs; when it carries no such labels (raw, uncompiled research), cite the source name or URL instead — the requirement is a citable source, not the label format. An adjustment with no citable evidence must be small and explicitly labelled as judgment.
 - Keep arithmetic simple and show it in-line (e.g. "3 of 14 similar cases -> ~21%"). Do not perform calculations you cannot show.
 - If the Required Artifact Status says the key evidence is missing or partial, WIDEN your uncertainty and say so. Then classify each missing fact before reacting to it:
   - Contingent / current facts (vote counts, schedules, who has committed, current status): do NOT guess — treat as genuinely unknown.
@@ -82,7 +88,7 @@ Output:
 
 ## PHASE 0.5 — RESOLUTION MECHANICS (model the resolution procedure before the event)
 
-How will the resolution value actually be produced? If the question resolves by direct observation of an event, say so in one line and move on to Phase 1.
+How will the resolution value actually be produced? If the question resolves by direct observation of an event, say so in one line and move on to Phase 1 — with one check first: if the research describes a formal process around the event (an annex step sequence, a phased framework, an approval chain), note explicitly that PROCESS DOCUMENTS GATE FORMAL IMPLEMENTATION, NOT OBSERVABLE EVENTS. The sequence informs how likely the event is; it is NOT a resolution precondition. Actors routinely act out of order, symbolically, or ahead of the formal machinery when a sponsor wants a visible deliverable — carry a named "out-of-order / political-shortcut path" into Phase 2 and price it, rather than treating an uncompleted process step as a hard gate.
 
 If it resolves off a published source (a curated page, tracker, leaderboard, or scheduled data release):
 1. Enumerate the states the source can be in at the deadline as explicit branches (e.g. "not updated — the currently displayed value stands" vs "updated — showing what the update can actually contain"). Use the brief's Resolution Mechanics section; stable procedural facts (reporting calendars, disclosure lags, filing deadlines) may be resolved "[from background knowledge]" per the discipline rules.
@@ -102,13 +108,15 @@ Output format:
 Establish a starting probability using base rates and reference classes. If Phase 0.5 produced branches, the base-rate work in this phase applies WITHIN the branches where the outcome is open — do not overwrite the branch structure with a generic prior over the whole question.
 
 - Identify the most relevant reference class for this question. What is the general category of event being predicted?
-- State the historical counts or rates you are using as explicit numbers, with their source or evidence ID. Show the simple arithmetic that turns them into a base rate.
+- State the historical counts or rates you are using as explicit numbers, with their source or evidence ID. Show the simple arithmetic that turns them into a base rate. A percentage asserted without a numerator and denominator is not a base rate — if you cannot enumerate (or defensibly estimate) N qualifying cases out of D, you do not have a countable reference class: say so and reason from mechanism instead of forcing a number.
+- Check for selection effects on the class: is this case in the class because someone CHOSE it to be achievable (a first milestone of a freshly signed agreement, a pilot deliberately sized small, an announced-because-likely event)? Deliberately-selected first steps succeed at materially higher rates than the broad class of "phased plans complete on schedule". Name the direction of the bias and adjust.
 - If multiple reference classes apply, consider each and weigh them to arrive at a blended base rate. Show the weights.
-- Treat prediction market data carefully. Before weighting ANY market, state its comparability to THIS question on three axes: (1) same resolution condition, (2) same deadline/date, (3) same entity/scope. A market that differs on any axis is a weak prior to ADJUST FROM, not an anchor to match — name the adjustment's direction and rough size (e.g. an earlier-deadline market understates a later-deadline question). Real-money markets (Polymarket, Kalshi) are weighted by volume, liquidity, bid/ask spread AND comparability; Manifold is a play-money crowd signal and discounted further. A thin or non-comparable market must not dominate a well-supported inside view.
+- Treat prediction market data carefully. Before weighting ANY market, state its comparability to THIS question on three axes: (1) same resolution condition, (2) same deadline/date, (3) same entity/scope. HARD RULE: a market whose RESOLUTION CONDITION differs from this question's (a broader, narrower, or different event — e.g. "full withdrawal" vs "pilot deployment", a precondition market, a downstream-consequence market) gets ZERO weight in any blend. Use it only as a directional bound: state the floor or ceiling it implies and move on. Only a market matching the resolution condition may enter a blended base rate (deadline/scope mismatches allowed with a named, sized adjustment). Real-money markets (Polymarket, Kalshi) are weighted by volume, liquidity, bid/ask spread AND comparability; Manifold is a play-money crowd signal and discounted further. A thin or non-comparable market must not dominate a well-supported inside view.
 
-Output format:
+Output format (all four lines are required):
 - Reference class(es) identified
-- Base rate data and arithmetic, with citations
+- Base rate cases: N of D — <the count and denominator behind your rate, with the cases named or the estimation basis stated; or "No countable reference class — reasoning from mechanism">
+- Market treatment: <each market → "blend (matches resolution condition), weight W" or "bound only (condition differs): implies floor/ceiling of X%">
 - **Starting estimate: X%**
 
 ---
@@ -226,13 +234,23 @@ async def get_binary_gpt_prediction(
     question_details: dict,
     num_runs: int,
     summary_report: str,
+    raw_research: str | None = None,
 ) -> ForecastResult:
     prompt = build_binary_prompt(question_details, summary_report)
+
+    raw_prompt = (
+        build_binary_prompt(question_details, f"{RAW_RESEARCH_NOTE}\n\n{raw_research}")
+        if raw_research
+        else None
+    )
+    run_prompts, models = heterogeneous_run_setup(num_runs, prompt, raw_prompt)
 
     runs = await gather_forecast_runs(
         prompt,
         num_runs,
         "binary-forecast",
+        models=models,
+        run_prompts=run_prompts,
         validate=_validate_binary_response,
         repair_instruction=_BINARY_REPAIR_INSTRUCTION,
     )

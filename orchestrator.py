@@ -162,15 +162,24 @@ async def forecast_individual_question(
         forecast_started = time.monotonic()
         if question_type == "binary":
             result: ForecastResult = await get_binary_gpt_prediction(
-                question_details, num_runs_per_question, research_bundle.compiled_report
+                question_details,
+                num_runs_per_question,
+                research_bundle.compiled_report,
+                raw_research=research_bundle.raw_research_view,
             )
         elif question_type in ("numeric", "discrete"):
             result = await get_numeric_gpt_prediction(
-                question_details, num_runs_per_question, research_bundle.compiled_report
+                question_details,
+                num_runs_per_question,
+                research_bundle.compiled_report,
+                raw_research=research_bundle.raw_research_view,
             )
         elif question_type == "multiple_choice":
             result = await get_multiple_choice_gpt_prediction(
-                question_details, num_runs_per_question, research_bundle.compiled_report
+                question_details,
+                num_runs_per_question,
+                research_bundle.compiled_report,
+                raw_research=research_bundle.raw_research_view,
             )
         else:
             raise ValueError(f"Unknown question type: {question_type}")
