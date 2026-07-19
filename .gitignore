@@ -35,6 +35,10 @@ bot_run.log
 # Local forecast post-mortem / analysis folders (not committed)
 44267_What_will_be_the_highest_daily_number_of_PLA_aircraft_tracke/
 
+# Feedback-loop architecture rebuild — work in progress, not committed yet
+# (standalone package; nothing in the main pipeline imports it)
+feedback_loop/
+
 # Test files (local verification only, not committed)
 tests/
 test_serp_research.py

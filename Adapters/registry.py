@@ -6,6 +6,7 @@ from Adapters.Metaculus import MetaculusAdapter
 from Adapters.Pdf import PdfAdapter
 from Adapters.base import UrlAdapter
 from Adapters.Wikipedia import WikipediaAdapter
+from Adapters.YahooQuotes import YahooQuotesAdapter
 
 
 ADAPTERS: list[UrlAdapter] = [
@@ -13,6 +14,7 @@ ADAPTERS: list[UrlAdapter] = [
     GoogleTrendsAdapter(),
     GoogleSheetsAdapter(),
     WikipediaAdapter(),
+    YahooQuotesAdapter(),
     # Extension-based, so it goes after the host-specific adapters.
     PdfAdapter(),
 ]

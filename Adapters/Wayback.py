@@ -26,11 +26,32 @@ import datetime
 import logging
 import re
 from dataclasses import dataclass
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Live market/quote pages must NEVER be served from archive captures: a
+# Wayback snapshot of a quote page contains STALE prices, and misdated data
+# has already caused one incident (44267). Used both to gate the resolution
+# scraper's history pass and to gate the failed-scrape snapshot fallback.
+MARKET_DATA_DOMAINS = (
+    "finance.yahoo.com",
+    "barchart.com",
+    "marketwatch.com",
+    "investing.com",
+    "stooq.com",
+    "tradingeconomics.com",
+)
+
+
+def is_market_data_url(url: str) -> bool:
+    try:
+        netloc = urlparse(str(url)).netloc.lower()
+    except Exception:
+        return False
+    return any(netloc == d or netloc.endswith("." + d) for d in MARKET_DATA_DOMAINS)
 
 _CDX_API = "https://web.archive.org/cdx/search/cdx"
 # ``id_`` returns the original captured page without the Wayback toolbar/rewrites.
@@ -124,6 +145,57 @@ async def list_captures(
     # First row is the CDX header (["timestamp"]).
     timestamps = [str(row[0]) for row in rows[1:] if row]
     return sorted(timestamps)
+
+
+async def fetch_latest_snapshot_text(
+    url: str,
+    timeout: float = 30.0,
+    max_chars: int = _MAX_SNAPSHOT_CHARS,
+) -> WaybackSnapshot | None:
+    """Fetch the NEWEST archive capture of ``url`` as readable text.
+
+    Fallback for pages the live scrape cannot read (paywalls, bot walls —
+    the 44773 NYT case). Returns None on any failure; callers must stamp the
+    returned snapshot's capture date into whatever they store so the extract
+    stage's date discipline applies. Never call this for market/quote pages —
+    gate with is_market_data_url() first.
+    """
+    if is_market_data_url(url):
+        return None
+    timestamps = await list_captures(url)
+    if not timestamps:
+        return None
+    timestamp = timestamps[-1]  # newest
+    snapshot_url = _SNAPSHOT_URL.format(timestamp=timestamp, url=quote(url, safe=":/?&=%"))
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(snapshot_url)
+            response.raise_for_status()
+            text = _html_to_text(response.text)[:max_chars]
+    except Exception as exc:
+        logger.warning("Wayback latest-snapshot fetch failed for %s: %s", url, exc)
+        return None
+    if not text.strip():
+        return None
+    iso_date = f"{timestamp[0:4]}-{timestamp[4:6]}-{timestamp[6:8]}"
+    return WaybackSnapshot(timestamp=timestamp, iso_date=iso_date, text=text)
+
+
+async def snapshot_fallback_text(url: str, timeout: float = 30.0) -> str:
+    """Latest-capture fallback content for a page the live web will not serve.
+
+    Returns "" when unavailable. The capture date is stamped in-band so the
+    extract stage's date discipline applies to every fact in the snapshot.
+    """
+    snapshot = await fetch_latest_snapshot_text(url, timeout=timeout)
+    if snapshot is None:
+        return ""
+    return (
+        f"[WAYBACK SNAPSHOT of {url}, captured {snapshot.iso_date} — the live page "
+        f"could not be read. Every fact below is as of {snapshot.iso_date} at the "
+        "latest; do not present it as current.]\n\n"
+        f"{snapshot.text}"
+    )
 
 
 async def fetch_snapshot_history(

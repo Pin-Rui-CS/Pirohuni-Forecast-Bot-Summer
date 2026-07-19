@@ -18,7 +18,11 @@ from metaculus_client import (
     post_question_comment,
     post_question_prediction,
 )
-from monetary_cost_manager import MonetaryCostManager, get_openrouter_key_usage
+from monetary_cost_manager import (
+    MonetaryCostManager,
+    get_openrouter_key_usage,
+    research_reserve_input_tokens,
+)
 from research.pipeline import run_research
 
 logger = logging.getLogger(__name__)
@@ -144,7 +148,13 @@ async def forecast_individual_question(
     artifacts = QuestionArtifacts(question_id, post_id, title, question_type or "unknown")
     question_started = time.monotonic()
 
-    with MonetaryCostManager(hard_limit=per_question_token_hard_limit) as question_cost_manager:
+    # The reserve keeps optional research work (extra scrape cycles, provider
+    # fall-through, artifact retry) from spending the input budget that the
+    # mandatory compile + forecast tail needs (44773 incident, 2026-07-16).
+    with MonetaryCostManager(
+        hard_limit=per_question_token_hard_limit,
+        reserved_input_tokens=research_reserve_input_tokens(num_runs_per_question),
+    ) as question_cost_manager:
         research_bundle = await run_research(
             title=question_details["title"],
             resolution_criteria=question_details["resolution_criteria"],
@@ -214,6 +224,20 @@ async def forecast_individual_question(
         summary_of_forecast += f"Forecast: {result.forecast}\n"
 
     summary_of_forecast += f"Comment:\n```\n{result.comment[:200]}...\n```\n\n"
+
+    # Surface silent ensemble degradation: a run refused by the token budget or
+    # dropped on a provider failure otherwise leaves only a buried log line
+    # (the 44773 "successful" run lost its raw-view member invisibly at
+    # 245K/250K input tokens).
+    completed_runs = len(result.run_values or [])
+    if completed_runs < num_runs_per_question:
+        degradation_line = (
+            f"ENSEMBLE DEGRADED: {completed_runs}/{num_runs_per_question} forecast "
+            "runs completed (see runs.md / logs for the dropped member)"
+        )
+        logger.warning("Question %s: %s", question_id, degradation_line)
+        summary_of_forecast += f"{degradation_line}\n"
+
     summary_of_forecast += (
         f"Wall time: research {research_seconds:.1f}s + forecast {forecast_seconds:.1f}s "
         f"= {total_seconds:.1f}s total\n"

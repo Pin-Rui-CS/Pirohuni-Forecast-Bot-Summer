@@ -121,6 +121,23 @@ _MAX_CONTENT_CHARS = 8_000
 # input capacity; pages larger than the summarizer input are chunk-summarized
 # in scrape_resolution_sources rather than silently cut.
 _CRAWL4AI_CONTENT_BUDGET = 100_000
+# Reduced per-URL budget for URLs found only in the question BACKGROUND text
+# (not the resolution criteria). Background links are usually context
+# (Wikipedia primers, news articles), and on 44773 two Wikipedia pages at
+# ~60K chars each consumed two extra 15K-token summary calls. 20K (applied
+# AFTER boilerplate cleaning) keeps the head of a background-linked primary
+# source readable — the docstring case of a congress.gov bill page linked only
+# in the background — while criteria URLs keep the full 44382-safe budget.
+_BACKGROUND_CONTENT_CHARS = 20_000
+
+# The Wayback history pass reconstructs a resolution page's value history and
+# update cadence from archive captures — built for slowly-updating
+# institutional pages (the 44382 class). For live market/quote pages the live
+# scrape already contains the full price history, and archive captures would
+# only inject STALE prices (the 44267 misdating class), so it is skipped.
+# The domain list and helper live in Adapters.Wayback, shared with the
+# failed-scrape snapshot fallback.
+from Adapters.Wayback import is_market_data_url as _is_market_data_url  # noqa: E402
 
 # Lines matching any of these patterns are likely boilerplate
 _BOILERPLATE_PATTERNS = [
@@ -858,6 +875,40 @@ async def _scrape_resolution_url(
         logger.warning("Google Sheets adapter unavailable: %s", exc)
 
     # ------------------------------------------------------------------
+    # 0.5. Yahoo Finance quote pages: fetch the chart API directly — the same
+    #      data the page renders, without the scrape lottery (44773: the
+    #      resolution source BZ=F). Fail-open: the adapter itself falls back
+    #      to a plain crawl, and an empty result falls through to Firecrawl.
+    # ------------------------------------------------------------------
+    try:
+        from Adapters.YahooQuotes import YahooQuotesAdapter
+
+        _quotes_adapter = YahooQuotesAdapter()
+        if _quotes_adapter.can_handle(url):
+            try:
+                result = await _quotes_adapter.extract(url, query=question_text, timeout=timeout)
+                record_scrape_content(url, result.content)
+                content = _truncate_scrape_content(result.content)
+                if content.strip():
+                    return _record_and_return(
+                        f"adapter:{_quotes_adapter.name}",
+                        f"adapter:{_quotes_adapter.name}",
+                        content,
+                        "",
+                    )
+                logger.info(
+                    "Yahoo quotes adapter returned no content for %s; "
+                    "falling back to page scraping.", url,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Yahoo quotes adapter failed for %s: %s — falling back to "
+                    "page scraping.", url, exc,
+                )
+    except ImportError as exc:
+        logger.warning("Yahoo quotes adapter unavailable: %s", exc)
+
+    # ------------------------------------------------------------------
     # 1. Firecrawl single-page scrape (skipped once credits/auth exhausted).
     # ------------------------------------------------------------------
     if not _firecrawl_exhausted:
@@ -885,25 +936,46 @@ async def _scrape_resolution_url(
     # ------------------------------------------------------------------
     # 2. Crawl4AI basic crawl fallback.
     # ------------------------------------------------------------------
+    crawl_error = ""
     try:
         raw = await _basic_crawl_markdown(url, timeout)
         record_scrape_content(url, raw)
         content = _truncate_scrape_content(raw)
-        return _record_and_return(
-            source_ledger.ENGINE_CRAWL4AI_BASIC,
-            "crawl4ai-basic",
-            content,
-            "Crawl4AI returned no content.",
-        )
+        if content.strip():
+            return _record_and_return(
+                source_ledger.ENGINE_CRAWL4AI_BASIC, "crawl4ai-basic", content, ""
+            )
+        crawl_error = "Crawl4AI returned no content."
     except HardLimitExceededError:
         raise
     except Exception as exc:
+        crawl_error = f"{type(exc).__name__}: {exc}"
+
+    # ------------------------------------------------------------------
+    # 3. Wayback snapshot fallback: pages the live web will not serve
+    #    (paywalls, bot walls — the 44773 NYT case). Never for market/quote
+    #    pages, where an archive capture is stale price data (44267 class);
+    #    snapshot_fallback_text stamps the capture date in-band.
+    # ------------------------------------------------------------------
+    try:
+        from Adapters import Wayback as wayback_module
+
+        snapshot_text = await wayback_module.snapshot_fallback_text(url)
+    except Exception as exc:
+        logger.warning("Wayback snapshot fallback failed for %s: %s", url, exc)
+        snapshot_text = ""
+    if snapshot_text.strip():
+        record_scrape_content(url, snapshot_text)
         return _record_and_return(
-            source_ledger.ENGINE_CRAWL4AI_BASIC,
-            "crawl4ai-basic",
+            "wayback-snapshot",
+            "wayback-snapshot",
+            _truncate_scrape_content(snapshot_text),
             "",
-            f"{type(exc).__name__}: {exc}",
         )
+
+    return _record_and_return(
+        source_ledger.ENGINE_CRAWL4AI_BASIC, "crawl4ai-basic", "", crawl_error
+    )
 
 
 async def _scrape_resolution_urls(
@@ -1168,6 +1240,7 @@ async def scrape_resolution_sources(
         timeout=timeout,
     )
 
+    criteria_url_set = set(criteria_urls)
     sections: list[str] = []
     cleaned_sources: list[tuple[str, str]] = []
     for result in results:
@@ -1176,7 +1249,17 @@ async def scrape_resolution_sources(
             sections.append(f"## Source: {result.url}\n_Scrape failed: {result.error}_")
             continue
 
-        heuristic_max = _LLM_MAX_INPUT if use_llm_cleaning else _MAX_CONTENT_CHARS
+        # Criteria URLs get the full 44382-safe budget; background-only URLs
+        # get the reduced tier (they are usually context, and every char here
+        # is paid for again in the batched summary calls).
+        if use_llm_cleaning:
+            heuristic_max = (
+                _LLM_MAX_INPUT
+                if result.url in criteria_url_set
+                else _BACKGROUND_CONTENT_CHARS
+            )
+        else:
+            heuristic_max = _MAX_CONTENT_CHARS
         cleaned = _clean_content(result.content, max_chars=heuristic_max, keep_urls=False)
         if not cleaned.strip():
             sections.append(f"## Source: {result.url}\n_No usable content extracted._")
@@ -1197,12 +1280,20 @@ async def scrape_resolution_sources(
     # cadence; soft-fails to "" when the page has no usable archive history.
     history_section = ""
     if use_llm_cleaning:
-        history_section = await _build_wayback_history_section(
-            criteria_urls[0] if criteria_urls else urls[0],
-            question_text=question_text,
-            resolution_criteria=resolution_criteria,
-            model=llm_model,
-        )
+        primary_url = criteria_urls[0] if criteria_urls else urls[0]
+        if _is_market_data_url(primary_url):
+            logger.info(
+                "Skipping Wayback history for %s: a live market/quote page already "
+                "carries its own history; archive captures would only add stale prices.",
+                primary_url,
+            )
+        else:
+            history_section = await _build_wayback_history_section(
+                primary_url,
+                question_text=question_text,
+                resolution_criteria=resolution_criteria,
+                model=llm_model,
+            )
 
     if use_llm_cleaning and cleaned_sources:
         try:

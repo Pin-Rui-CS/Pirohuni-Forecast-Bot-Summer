@@ -34,18 +34,23 @@ NUM_RUNS_PER_QUESTION = 3
 # pool should hold models of *comparable* forecasting quality (con 2: a
 # materially weaker model drags the average instead of decorrelating it).
 #
-# For now the pool is intentionally a SINGLE model (Opus 4.8): we are not ready
-# to switch on cross-provider forecasting yet. The ensemble machinery stays in
-# place — with a one-model pool all runs simply use Opus, exactly the old
-# single-model behaviour. To turn multi-model back on, add ids here (or set the
-# comma-separated FORECASTER_MODELS env var), e.g. "openai/gpt-5.5". Note Gemini
-# 3.1 Pro is currently unreachable via the OpenRouter BYOK Google key (free tier,
-# daily limit 0) until that key has billing enabled or BYOK is disabled.
+# Two-model pool since 2026-07-19 (44620 post-mortem: Opus-on-brief and
+# Sonnet-on-raw made the SAME directional reasoning errors — input diversity
+# cannot decorrelate shared reasoning fallacies; a different lineage might).
+# With NUM_RUNS_PER_QUESTION=3 the pool maps: run 1 = Opus/brief,
+# run 2 = GPT/brief (paired A/B against run 1 on the identical brief),
+# run 3 = Opus -> swapped to the Sonnet raw-research member below.
+# Watch the audit table's reasoning-token column on the first GPT runs:
+# OpenAI bills chain-of-thought as output tokens, so the effective per-run
+# cost can be a multiple of the $5/$30 sticker. Note Gemini 3.1 Pro is
+# currently unreachable via the OpenRouter BYOK Google key (free tier, daily
+# limit 0) until that key has billing enabled or BYOK is disabled.
 DEFAULT_FORECASTER_MODEL = "anthropic/claude-opus-4.8"
 FORECASTER_MODELS = _env_list(
     "FORECASTER_MODELS",
     [
         DEFAULT_FORECASTER_MODEL,
+        "openai/gpt-5.6-sol",
     ],
 )
 # The tiebreaker / synthesis judge is a single fixed strong model so the final

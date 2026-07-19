@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
+import re
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
@@ -10,6 +12,7 @@ import httpx
 
 from config import SERPAPI_API_KEY
 from llm_client import call_llm
+from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
 from utils import _truncate_text, display_source_date, tweet_url_date
 import source_ledger
 from query_maker import (
@@ -19,6 +22,7 @@ from query_maker import (
     generate_google_search_query_plan,
 )
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_SERP_NUM_RESULTS = 10
 DEFAULT_SERP_RANKING_MODEL = "anthropic/claude-sonnet-5"
@@ -29,6 +33,12 @@ SERPAPI_SEARCH_URL = "https://serpapi.com/search"
 _MAX_RANKING_INPUT_RESULTS = 80
 _MAX_SCRAPE_CHARS = 18_000
 _MAX_EXTRACT_INPUT_CHARS = 90_000
+# Soft-stop gate for the scrape-cycle loop: measured extract calls ran 6K-25K
+# input tokens in chars/4 units (44773 ledger); rescaled x1.25 to the
+# 3.2-chars/token units introduced 2026-07-19 (same physical budget). A cycle
+# that cannot afford this much would eat into the input tokens reserved for
+# compile/forecast — stop cycling and report with the cycles already done.
+_EXPECTED_CYCLE_INPUT_TOKENS = 31_250
 
 
 @dataclass(frozen=True)
@@ -357,6 +367,15 @@ async def run_scrape_cycles(
     report = ""
 
     for cycle_no in range(1, max_cycles + 1):
+        if MonetaryCostManager.would_breach_input_reserve(_EXPECTED_CYCLE_INPUT_TOKENS):
+            logger.warning(
+                "Stopping scrape cycles before cycle %d: another cycle would eat into "
+                "the input tokens reserved for compile/forecast; keeping %d completed "
+                "cycle(s).",
+                cycle_no,
+                len(cycles),
+            )
+            break
         targets = _cycle_targets(groups, needed, next_index, cycle_no)
         if not targets:
             break
@@ -369,17 +388,42 @@ async def run_scrape_cycles(
             targets=targets,
             cycle_no=cycle_no,
         )
-        report, lack = await extract_serp_research(
-            title=title,
-            resolution_criteria=resolution_criteria,
-            background=background,
-            fine_print=fine_print,
-            groups=groups,
-            cycles=[*cycles, Cycle(cycle_no, scrapes, "", [])],
-            previous_report=report,
-            model=model,
-            url_dates=url_dates,
-        )
+        try:
+            report, lack = await _extract_with_one_retry(
+                cycle_no=cycle_no,
+                title=title,
+                resolution_criteria=resolution_criteria,
+                background=background,
+                fine_print=fine_print,
+                groups=groups,
+                cycles=[*cycles, Cycle(cycle_no, scrapes, "", [])],
+                previous_report=report,
+                model=model,
+                url_dates=url_dates,
+            )
+        except HardLimitExceededError:
+            raise
+        except Exception as exc:
+            # Salvage: a completed cycle's report is already parsed and
+            # validated, so a later cycle's extract failure must not discard
+            # it (44773 incident: one malformed extract response threw away
+            # the whole provider, and the search chain paid for a full
+            # replacement pass). Only salvage past the quality floor — a thin
+            # report should still fail the provider so the chain can try the
+            # next one.
+            if _has_salvageable_report(cycles, groups):
+                logger.warning(
+                    "Extract failed twice on cycle %d (%s: %s); salvaging the "
+                    "validated report from cycle %d instead of discarding the "
+                    "provider.",
+                    cycle_no,
+                    type(exc).__name__,
+                    exc,
+                    cycles[-1].cycle,
+                )
+                break
+            raise
+
         valid_names = {group.group for group in groups}
         lack = [name for name in lack if name in valid_names]
         cycles.append(Cycle(cycle=cycle_no, scrapes=scrapes, report=report, lacking_groups=lack))
@@ -388,6 +432,45 @@ async def run_scrape_cycles(
             break
 
     return cycles
+
+
+async def _extract_with_one_retry(cycle_no: int, **extract_kwargs) -> tuple[str, list[str]]:
+    """Run the extract call, retrying once on failure.
+
+    Extract failures are usually stochastic output-formatting slips (e.g. an
+    unescaped newline inside the JSON), so one fresh sample is cheap insurance
+    before falling back to salvage. Budget refusals are never retried.
+    """
+    try:
+        return await extract_serp_research(**extract_kwargs)
+    except HardLimitExceededError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Extract failed on cycle %d (%s: %s); retrying the extract call once.",
+            cycle_no,
+            type(exc).__name__,
+            exc,
+        )
+        return await extract_serp_research(**extract_kwargs)
+
+
+def _has_salvageable_report(
+    cycles: list[Cycle], groups: list[RankedSerpUrlGroup]
+) -> bool:
+    """Quality floor for salvaging after a failed extract.
+
+    There must be a previous validated cycle whose report is substantive:
+    non-empty and with at least one evidence group filled. Salvaging a thin
+    report would count the provider as a success and suppress the search
+    chain's fall-through to the next provider, which could do better.
+    """
+    if not cycles:
+        return False
+    last = cycles[-1]
+    if not last.report.strip():
+        return False
+    return len(set(last.lacking_groups)) < len({group.group for group in groups})
 
 
 async def extract_serp_research(
@@ -418,12 +501,7 @@ async def extract_serp_research(
         use_tools=False,
         _label="serp-scrape-extract",
     )
-    parsed = _extract_json_value(response)
-    if not isinstance(parsed, dict):
-        raise ValueError("Serp extraction response must be a JSON object.")
-
-    report = str(parsed.get("report", "")).strip()
-    raw_lack = parsed.get("lacking_groups", [])
+    report, raw_lack = _parse_extract_response(response)
     lack: list[str] = []
     if isinstance(raw_lack, list):
         for item in raw_lack:
@@ -436,6 +514,66 @@ async def extract_serp_research(
             if name and name not in lack:
                 lack.append(name)
     return report or previous_report, lack
+
+
+_FENCED_BLOCK_PATTERN = re.compile(r"```[a-zA-Z]*\s*\n?(.*?)```", re.DOTALL)
+
+
+def _parse_extract_response(text: str) -> tuple[str, list]:
+    """Split an extract response into (markdown report, lacking_groups list).
+
+    The report is prose and is never parsed, so it cannot fail; only the small
+    lacking_groups trailer is structured. This function NEVER raises on
+    malformed model output (the 44773 incident: one unescaped newline inside
+    the old report-inside-JSON format discarded a whole research branch).
+    Resolution order:
+    1. The LAST fenced code block that parses as a JSON object with a
+       "lacking_groups" key — report is everything before that block.
+    2. Legacy shape: the whole response is one JSON object with a "report"
+       key (old prompt format, or a model regression).
+    3. A bare (unfenced) trailing JSON object with "lacking_groups".
+    4. No trailer found: the whole text is the report and lacking_groups is
+       empty — cycles stop, and the downstream artifact-check still catches
+       any genuinely missing artifact.
+    """
+    text = str(text or "")
+
+    # 1. Last fenced block carrying lacking_groups.
+    matches = list(_FENCED_BLOCK_PATTERN.finditer(text))
+    for match in reversed(matches):
+        parsed = _try_json_object(match.group(1))
+        if parsed is not None and "lacking_groups" in parsed:
+            report = (text[: match.start()] + text[match.end():]).strip()
+            return report, parsed.get("lacking_groups") or []
+
+    # 2. Legacy: whole response is the old JSON envelope.
+    parsed = _try_json_object(text)
+    if parsed is not None and "report" in parsed:
+        return str(parsed.get("report", "")).strip(), parsed.get("lacking_groups") or []
+
+    # 3. Bare trailing JSON object with lacking_groups.
+    decoder = json.JSONDecoder()
+    for index in range(len(text) - 1, -1, -1):
+        if text[index] != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and "lacking_groups" in value:
+            return text[:index].strip(), value.get("lacking_groups") or []
+        break  # the last {...} is something else (e.g. quoted data); stop scanning
+
+    # 4. Prose only: keep everything, stop cycling.
+    return text.strip(), []
+
+
+def _try_json_object(text: str) -> dict | None:
+    try:
+        parsed = json.loads(str(text or "").strip())
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def format_serp_research(result: SerpResearchResult) -> str:
@@ -837,23 +975,45 @@ async def _scrape_targets(
                 ),
                 engine=source_ledger.ENGINE_SKIPPED_DUPLICATE,
             )
+        crawl_error = ""
         try:
             content = await basic_crawl_markdown(item.url)
             record_scrape_content(item.url, content)
-            return _finish(
-                Scrape(
-                    cycle=0,
-                    group=group.group,
-                    group_purpose=group.group_purpose,
-                    url=item.url,
-                    purpose=item.purpose,
-                    ok=bool(content.strip()),
-                    content=_truncate_text(content, _MAX_SCRAPE_CHARS),
-                    error="" if content.strip() else "Crawl4AI returned no content.",
-                ),
-                engine=source_ledger.ENGINE_CRAWL4AI_BASIC,
-            )
+            if content.strip():
+                return _finish(
+                    Scrape(
+                        cycle=0,
+                        group=group.group,
+                        group_purpose=group.group_purpose,
+                        url=item.url,
+                        purpose=item.purpose,
+                        ok=True,
+                        content=_truncate_text(content, _MAX_SCRAPE_CHARS),
+                    ),
+                    engine=source_ledger.ENGINE_CRAWL4AI_BASIC,
+                )
+            crawl_error = "Crawl4AI returned no content."
+        except HardLimitExceededError:
+            raise
         except Exception as exc:
+            crawl_error = f"{type(exc).__name__}: {exc}"
+
+        # Wayback snapshot fallback: pages the live web will not serve
+        # (paywalls, bot walls — the 44773 NYT case, where one failed live
+        # fetch tombstoned the URL for the whole run). Free (archive.org),
+        # never for market/quote pages (stale prices, the 44267 class), and
+        # the capture date is stamped in-band by snapshot_fallback_text.
+        try:
+            from Adapters import Wayback as wayback_module
+
+            snapshot_text = await wayback_module.snapshot_fallback_text(item.url)
+        except Exception as exc:
+            logger.warning(
+                "Wayback snapshot fallback failed for %s: %s", item.url, exc
+            )
+            snapshot_text = ""
+        if snapshot_text.strip():
+            record_scrape_content(item.url, snapshot_text)
             return _finish(
                 Scrape(
                     cycle=0,
@@ -861,11 +1021,24 @@ async def _scrape_targets(
                     group_purpose=group.group_purpose,
                     url=item.url,
                     purpose=item.purpose,
-                    ok=False,
-                    error=f"{type(exc).__name__}: {exc}",
+                    ok=True,
+                    content=_truncate_text(snapshot_text, _MAX_SCRAPE_CHARS),
                 ),
-                engine=source_ledger.ENGINE_CRAWL4AI_BASIC,
+                engine="wayback-snapshot",
             )
+
+        return _finish(
+            Scrape(
+                cycle=0,
+                group=group.group,
+                group_purpose=group.group_purpose,
+                url=item.url,
+                purpose=item.purpose,
+                ok=False,
+                error=crawl_error,
+            ),
+            engine=source_ledger.ENGINE_CRAWL4AI_BASIC,
+        )
 
     scrapes = await _limited_gather(
         [scrape_one(group, item) for group, item in targets],
@@ -943,15 +1116,26 @@ Ground every statement in the scraped content — never fabricate or add informa
 - Do not forecast or state whether the event will happen.
 - If a category still lacks enough useful information, request more scraping for that category.
 - Pick lacking categories only from the exact category names listed above.
-- If no more scraping is needed, return an empty lacking_groups list.
+- If no more scraping is needed, use an empty lacking_groups list.
 
-Return only valid JSON in this exact shape:
-{{
-  "report": "# SerpAPI Scraped Research\\n\\n## Category name\\n- Fact with source URL",
-  "lacking_groups": [
-    {{"group": "Exact category name", "reason": "What is still missing or unusable."}}
-  ]
-}}
+Output format — exactly two parts, in this order:
+
+PART 1: The research report as plain markdown. Start it with a "# " heading and
+organise it with "## " category sections. Write it directly — do NOT wrap it in
+JSON, quotes, or a code fence.
+
+PART 2: After the report, one fenced JSON block containing ONLY the lacking
+categories, in exactly this shape:
+
+```json
+{{"lacking_groups": [{{"group": "Exact category name", "reason": "What is still missing or unusable."}}]}}
+```
+
+If no more scraping is needed, end with:
+
+```json
+{{"lacking_groups": []}}
+```
 
 Previous compiled report:
 {previous_report or "No previous report yet."}

@@ -17,7 +17,7 @@ from config import (
     ENABLE_TAVILY_RESEARCH,
 )
 from llm_client import call_llm
-from monetary_cost_manager import HardLimitExceededError
+from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
 from utils import _truncate_text, find_future_full_dates
 import source_ledger
 
@@ -26,6 +26,13 @@ logger = logging.getLogger(__name__)
 ARTIFACT_CHECK_MODEL = "anthropic/claude-sonnet-5"
 _MAX_ARTIFACT_CHECK_INPUT_CHARS = 40_000
 _MAX_RETRY_QUERIES = 4
+# Soft-stop gates against the question's reserved compile/forecast token tail
+# (see monetary_cost_manager.research_reserve_input_tokens). Sized from the
+# 44773 run ledger (chars/4 units: full search-provider pass ~50-90K, the
+# focused artifact retry ~30K), rescaled x1.25 to the 3.2-chars/token units
+# introduced 2026-07-19 — same physical char budgets.
+_EXPECTED_SEARCH_PROVIDER_INPUT_TOKENS = 62_500
+_EXPECTED_ARTIFACT_RETRY_INPUT_TOKENS = 37_500
 ARTIFACT_RETRY_TIMEOUT_SECONDS = float(os.getenv("ARTIFACT_RETRY_TIMEOUT_SECONDS", "150"))
 
 
@@ -327,12 +334,21 @@ async def run_research(
     retry_label = _select_retry_provider_label(chosen_search_result, ordered_search_providers)
     run_retry_search = _retry_runner_for(retry_label) if retry_label else None
     pre_retry_result_count = len(included_results)
-    if (
+    wants_artifact_retry = bool(
         artifact_check
         and artifact_check.get("status") in {"missing", "partial"}
         and artifact_check.get("retry_queries")
         and run_retry_search is not None
+    )
+    if wants_artifact_retry and MonetaryCostManager.would_breach_input_reserve(
+        _EXPECTED_ARTIFACT_RETRY_INPUT_TOKENS
     ):
+        logger.warning(
+            "[research] Required artifact %s but focused retry skipped: it would eat "
+            "into the input tokens reserved for compile/forecast",
+            artifact_check.get("status"),
+        )
+    elif wants_artifact_retry:
         retry_queries = [
             str(query).strip()
             for query in artifact_check["retry_queries"][:_MAX_RETRY_QUERIES]
@@ -491,6 +507,16 @@ async def _run_search_chain(
     for name, call in ordered_providers:
         if name in exhausted:
             errored.append(f"{name} (skipped: out of credits earlier this run)")
+            continue
+        if MonetaryCostManager.would_breach_input_reserve(
+            _EXPECTED_SEARCH_PROVIDER_INPUT_TOKENS
+        ):
+            logger.warning(
+                "[research] %s: skipped — another search pass would eat into the "
+                "input tokens reserved for compile/forecast",
+                name,
+            )
+            errored.append(f"{name} (skipped: research token budget spent)")
             continue
         source_ledger.set_source_context(name, "main pass")
         result = await run_provider(name, lambda call=call: call(asknews_research))

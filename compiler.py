@@ -158,15 +158,27 @@ async def compile_research_report(
         artifact_check=artifact_check,
     )
 
-    llm_report = await _try_llm_compile(
-        title=title,
-        resolution_criteria=resolution_criteria,
-        background=background,
-        fine_print=fine_print,
-        cleaned_sections=cleaned_sections,
-        model=model,
-        artifact_check=artifact_check,
-    )
+    try:
+        llm_report = await _try_llm_compile(
+            title=title,
+            resolution_criteria=resolution_criteria,
+            background=background,
+            fine_print=fine_print,
+            cleaned_sections=cleaned_sections,
+            model=model,
+            artifact_check=artifact_check,
+        )
+    except HardLimitExceededError as exc:
+        # The compile LLM pass (including precompress) was refused by the
+        # token budget. The deterministic fallback costs zero LLM tokens, so
+        # failing the question here would only discard the research already
+        # paid for (44773 incident, 2026-07-16).
+        logger.warning(
+            "Research compiler LLM pass refused by the token budget (%s); "
+            "falling back to the deterministic brief.",
+            exc,
+        )
+        llm_report = None
     return llm_report or heuristic_report
 
 
@@ -712,7 +724,7 @@ Output exactly these Markdown sections:
 - If the automated check lists a "Closest available adjacent metric", reproduce it here and carry it into Key Evidence as an `adjacent-metric` item. Never omit a value that was actually retrieved just because it is not the exact metric.
 
 ## Resolution Mechanics
-Only when the question resolves off a published source (a curated page, tracker, leaderboard, or scheduled data release) rather than by direct observation of an event; if it resolves by direct observation, write the single bullet "Not applicable — resolves by direct observation of the event." Otherwise, at most 4 bullets, each citing its evidence:
+Only when the question resolves off a published source (a curated page, tracker, leaderboard, or scheduled data release) rather than by direct observation of an event; if it resolves by direct observation, write the bullet "Not applicable — resolves by direct observation of the event" — and when that event is one step inside a longer causal sequence (steps that must precede it, steps that normally follow it), add one bullet writing out the chain in order with the resolution event marked (e.g. "confidential draft → review → PUBLIC FILING (resolution event) → roadshow → listing"), so the forecaster can classify each report and market as upstream or downstream of the resolution event. State the chain as the sources describe it; do not attach timing conclusions to it here. Otherwise, at most 4 bullets, each citing its evidence:
 - Whether the resolution source will or may update again before the resolution deadline: stated cadence (e.g. "updated periodically"), scheduled releases, and the observed freshness gap. If the resolution-source scrape (fetched {today}) displays a data cutoff or "as of" date older than the fetch date, state both dates explicitly — that gap is direct update-cadence evidence. If the resolution material includes a "Resolution Source History" section (dated archive captures), carry its value time series and observed update cadence here — a same-source historical series is the ONLY valid basis for a flow rate; never let a cross-source coincidence stand in for one.
 - What new information CAN appear in the source before the deadline, and what CANNOT arrive in time (reporting calendars, disclosure deadlines, publication or data-pipeline lags). Distinguish activity that will be observable by the deadline from activity that happens before the deadline but is disclosed only after it.
 - Any scheduled data event between today and the deadline (filing deadline, release date) that would change what the source shows.
@@ -724,6 +736,7 @@ A list of at most 15 items. Do NOT sort by relevance — order does not matter, 
 - SELECT BY DECISION-RELEVANCE (this governs which items make the list, not their order). The items that must appear whenever the research supports them are: (1) the RULE or MECHANISM that governs how the resolution value changes over time — eligibility criteria, recovery/transition conditions, the clock or event that triggers a change, a reaction function, a scheduled decision; and (2) the CURRENT VALUE of each input that rule depends on (including the date that starts the clock, not just the date a change was announced). A precise figure that does not feed this mechanism is background color, however exact. When a number's relevance hinges on a condition (a confounder that speeds or slows the mechanism), keep the condition with the number.
 - OBSERVED BEHAVIOR OUTRANKS FORMAL PROCESS: when the question resolves on an observed event or action, a reported instance of that same behavior actually happening (a precedent, a completed prior step, a dry run) is top-tier evidence even if it carries no number and sits outside the formal process the documents describe. Do not drop a behavioral precedent in favor of one more restatement of the process rules.
 - DIRECTIONAL BALANCE (required): after drafting the list, check it as a whole. Include the strongest items pointing EACH way that the research supports — toward YES and toward NO for a binary question; toward higher and lower values otherwise. If the raw research contains a plausibly decision-relevant item pointing against the majority of your list and you have excluded it, that is a selection error: include it. A lopsided list is acceptable ONLY when the research itself contains no credible opposing items — in that case say so explicitly in the Balance Check section below. Do not manufacture balance that the research does not contain; the requirement is that no side's strongest evidence is silently dropped.
+- OBSERVATIONS ONLY: every item must be something a source actually states, shows, or prices — a fact, quote, measurement, market price, or the documented rule/mechanism itself. Never emit YOUR OWN inference, extrapolation, or timeline arithmetic (e.g. "the October target implies a September filing") as an [E#] item, even attributed to an evidence plan or labelled "synthesis" — an inference wearing an [E#] label acquires the authority of evidence and every downstream forecaster will cite it as fact. Put such reasoning in ## Derived Implications instead.
 - tier is one of: direct (measures the resolution target itself, from the resolution source or confirmed equal to it), adjacent-metric (same family but a different basis/series; state the relationship and any conversion toward the target), near-proxy (close but not identical; say in a few words why not identical), market (prediction-market signal).
 - Every item must carry the observation date/period of its value. If a value's date cannot be tied to the period the question asks about, append "(date unverified)" and do NOT label it `direct` — a value reported by a single article without a confirmable current date is not direct evidence.
 - Keep exact values, dates, counts, and odds. Never round away precision present in the source.
@@ -738,9 +751,12 @@ Exactly these three lines, filled in (required — the forecaster reads them; th
 - Strongest evidence AGAINST the event / lower values: [E#, E#, ...] — or "none found in the research"
 - Decision-relevant items EXCLUDED from Key Evidence: one short clause each with source and URL (e.g. "LAF entered vacated positions at X — site.com/url — excluded as single-sourced"); write "none" only if nothing plausibly decision-relevant was left out.
 
+## Derived Implications
+Omit this section entirely if you have none. Otherwise at most 3 bullets, labelled [I1], [I2], ... — NEVER [E#]. Each is an inference you draw by chaining evidence items (e.g. working a deadline backwards through an interval rule), and must (a) cite the [E#] items it chains and (b) name every load-bearing assumption inline — especially any assumption that a stated minimum, earliest, or latest bound is also the TYPICAL case (e.g. "[I1] From [E3]+[E5], assuming the statutory MINIMUM 15-day gap is also the typical gap — not established by the evidence — an October listing implies a September public filing"). The forecaster re-derives these from the underlying [E#] items; an [I#] is a hypothesis to check, not evidence to cite.
+
 ## Market Signals
 - One bullet per relevant market: question, current odds, volume/liquidity/open interest when present, URL. Real-money markets (Polymarket, Kalshi) before play-money (Manifold).
-- For every market, state in the same bullet whether its resolution condition MATCHES this question's or DIFFERS (broader/narrower/different event). A differing market is a directional floor or ceiling only — label it as such.
+- For every market, state in the same bullet whether its resolution condition MATCHES this question's or DIFFERS (broader/narrower/different event). A differing market is a directional floor or ceiling only — and the direction must be DERIVED BY ENTAILMENT, shown in the bullet: if the market's event requires this question's event to happen first (it sits downstream of the resolution event), its price is a FLOOR on this question; if this question's event requires the market's event, a CEILING; if neither entailment holds, write "no bound — context only". Never assert floor/ceiling without the entailment — a misassigned direction inverts how every forecaster uses the market.
 - If no market bears directly on the question, say so in one bullet and do not pad with adjacent markets.
 
 ## Gaps And Cautions

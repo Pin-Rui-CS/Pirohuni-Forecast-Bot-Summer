@@ -7,6 +7,127 @@ re-deriving the same diagnosis twice — read this before touching the forecasti
 
 ---
 
+## 2026-07-19 — Correlated directional-inference errors (floor used as ceiling, on-schedule read as late, minimum read as typical, precursor read as negative) → 17% vs 41.1% crowd on 44620; first miss with ALL prior defenses live
+
+| | |
+|---|---|
+| **Severity** | High — 44620 (Anthropic public S-1 before Sept 1, 2026, `binary`) submitted 17% (runs 19/10/17, spread 9pp); bot-tournament crowd 41.1% at close; an independent Fable review priced ~28% and this diagnosis independently re-derived ~22–30%. Resolves 2026-09-01 — unconfirmed miss, but every error is identified in the transcripts and all four push the same direction |
+| **Introduced** | Long-standing — no pipeline stage has ever represented the causal ordering of events, so every direction-of-update decision (bound direction, precursor sign, comparator clock) was free-form LLM judgment |
+| **Detected** | 2026-07-18 — independent critique by a second Fable instance (`anthropic-s1-forecast-critique.md` in the question folder); verified 2026-07-19 against runs.md/audit.md/forecast.json |
+| **Diagnosed & fixed** | 2026-07-19 (`forecasters/binary.py`, `forecasters/multiple_choice.py`, `forecasters/numeric.py`, `compiler.py`, `tests/test_44620_fixes.py` new) — **not yet committed** |
+| **Affected window** | Any question whose resolution event sits UPSTREAM of the event the news and markets track (filing before listing, vote before enactment, signature before ratification, registration before election) — all evidence about the downstream target gets mapped onto the upstream event as a discount, when the upstream event is strictly easier |
+
+### Symptom
+All three runs built a NO-leaning case from four inferences, each wrong in the
+same direction: (1) Polymarket "IPO (listing) by Sept 30: 5.5%" — a listing
+requires the public S-1 weeks earlier, so this is a FLOOR on the filing
+question — was used as downward pressure (Run 3: "Polymarket CDF → DOWN,
+16% → 14%"; Run 2 derived the floor logic correctly, then anchored at 13%
+anyway); the informative Oct-31 line at 42% was never decomposed. (2) At 6.5
+weeks confidential vs SpaceX's 7-week confidential→public precedent, all runs
+concluded "running slower than SpaceX" / "extrapolation already falsified" —
+a downward update taken BEFORE the comparator duration had elapsed (Run 3
+applied it twice, violating the one-application ledger). (3) The statutory
+≥15-day prospectus-before-roadshow MINIMUM was used as the typical gap,
+pushing the implied filing date past the cutoff; realistic 3–5 week runways
+straddle it. (4) Mid-July testing-the-waters meetings — the immediate
+UPSTREAM precursor of the flip, on textbook spacing for a late-August filing
+— were coded as a negative update by all three runs (Run 3: 30% → 20%).
+Run 3 additionally put 5% on "public S-1 already filed but unreported"
+(EDGAR is monitored in real time; <1% is right), which pushed its substantive
+~13% up to the 17% median — error-induced false convergence.
+
+### Root cause
+The pipeline has no representation of the causal/temporal ordering of events,
+so every directional inference is left to free-form judgment — and the same
+fallacies reproduced across two models, two input views, and the compiler:
+- **Compiler**: emitted its own inference as evidence item [E7] ("October
+  target implies a mid-to-late September public S-1 — Evidence Plan
+  synthesis"), which both brief-reading runs cited as a top-2 driver — the
+  2026-06-30 defect class (derived conclusion smuggled through a data
+  channel) in a second channel. Its Market Signals section asserted the
+  anti-inference outright ("...requires the S-1 earlier, so these are a
+  directional ceiling on completion, NOT a floor on filing").
+- **Forecasters**: the 44619 bounds-only market rule requires stating "floor
+  or ceiling" but nothing verified the direction was derived correctly, so
+  all runs confidently filled the field with a floor used as a ceiling. No
+  rule governed precursor-stage sign, comparator-elapsed arithmetic, or
+  minimum-vs-typical intervals.
+- **Defense stack blind spot**: every prior defense was LIVE and worked as
+  designed — retrieval was complete (no truncation, temporal gate clean,
+  fabrication guards held), the heterogeneous raw-research Sonnet member ran
+  (219K chars in) and still converged, because input diversity cannot
+  diversify shared REASONING errors. The 9pp spread sat far under the 30pp
+  tiebreaker gate — correlated errors produce low spread by construction, so
+  a spread-gated adjudicator can never fire on exactly this failure class.
+
+### The fix (all prompt-layer, following the 44379 lesson: required output fields, not prose admonitions)
+- **Event chain** (`binary.py` Phase 0.5) — when the resolution event is one
+  step in a longer sequence, the run must write the chain with the resolution
+  event marked, classify every market/timing item upstream/same/downstream,
+  and inherit two hard directions: DOWNSTREAM probabilities are FLOORS (can
+  only push up); UPSTREAM progress is not delay (sign requires an
+  early/on-schedule/late judgment vs typical spacing). Required output line.
+- **Bound direction by entailment** (`binary.py` Phase 1; compact variants in
+  `multiple_choice.py`/`numeric.py`) — the "Market treatment" field now
+  demands the entailment ("<which event entails which> → FLOOR/CEILING/no
+  bound"), plus: a bound is not an anchor; never apply a floor as downward
+  pressure. Compiler's Market Signals mirror rule: floor/ceiling must be
+  DERIVED BY ENTAILMENT in the bullet, else "no bound — context only".
+- **Timing-signal arithmetic** (`binary.py` Phase 2; compact variant in
+  MC/numeric discipline rules) — required "Timing signals:" output line:
+  elapsed-vs-comparator ("running slower" forbidden while elapsed <
+  comparator) and minimum-vs-typical (statutory minimum is a legal floor;
+  central case uses the typical interval).
+- **FINAL OUTPUT audit fields** (`binary.py`) — "Directional audit:" (each
+  bound/timing signal → direction applied; self-repair instruction if a floor
+  went downward etc.) and "Discount ledger:" (each named discount → the ONE
+  phase it moved the number; undo duplicates). End-of-run reconciliation is
+  the anti-decay mechanism: models fill final-output templates reliably.
+- **Compiler observations-only Key Evidence** (`compiler.py`) — [E#] items
+  must be things a source states/shows/prices; compiler inferences move to a
+  new optional "## Derived Implications" section, labelled [I1..I3], each
+  citing the [E#]s it chains and naming every load-bearing assumption
+  (min-as-typical trap called out); forecaster re-derives, never cites [I#]
+  as evidence. Resolution Mechanics gains an event-chain bullet for
+  direct-observation questions embedded in a process.
+- **Unobserved-state branch cap** (`binary.py` discipline rules) — widening
+  never licenses inventing mass for a specific unobserved state; an "already
+  happened but unreported" branch is sized by source observability
+  (real-time public register ⇒ well under 1%).
+
+### Verification
+- `tests/test_44620_fixes.py` (new, free): 11/11 — event-chain required line,
+  entailment-derived bounds (binary + compiler), timing arithmetic, audit
+  fields with self-repair wording, observability cap, Derived Implications
+  contract, MC/numeric compact rules, and all 44619 contracts still present
+  after the restructure.
+- `tests/test_44619_fixes.py` 16/16, `tests/test_imports.py` all OK.
+- **Not yet exercised**: a paid replay of the saved 44620 brief against the
+  new binary template (checks the floor is applied upward and the SpaceX
+  clock is read as on-schedule), and a compile replay to confirm [E7]
+  becomes [I1] with its assumption named.
+
+### Lessons
+- When the resolution event is UPSTREAM of the event everyone reports on and
+  prices, every piece of downstream evidence arrives frame-inverted; without
+  an explicit event-chain representation, LLMs map it as a discount on the
+  strictly-easier upstream event. Same family as (inverse of) the
+  formal-process-as-gate conflation.
+- A required field enforces only what it makes checkable: "state the floor or
+  ceiling" was reliably filled — with the wrong direction. Fields must demand
+  the DERIVATION (the entailment), not just the label.
+- Input-diverse ensemble members catch omission errors, not reasoning errors;
+  spread-gating cannot catch correlated errors (they produce low spread).
+  The remaining uncovered defense is an adjudicator gated on checkable logic
+  violations rather than disagreement — proposed, not yet built.
+- "Not yet, at 93% of the comparator's duration" is on-schedule, not late;
+  a statutory minimum is not a typical interval; a precursor stage occurring
+  on time is not evidence against its successor. All three are the same
+  mistake: reading an in-progress clock as a verdict.
+
+---
+
 ## 2026-07-10 — Compiler-input head-truncation cut ALL of a question's YES evidence → 7% vs ~35–45% fair value; brief-level skew reproduced by 3 same-model runs
 
 | | |

@@ -30,7 +30,7 @@ Discipline rules that apply to every phase:
 - If the Required Artifact Status says the key evidence is missing or partial, WIDEN your uncertainty and say so. Then classify each missing fact before reacting to it:
   - Contingent / current facts (vote counts, schedules, who has committed, current status): do NOT guess — treat as genuinely unknown.
   - Stable institutional, legal, or procedural facts (how an established process works, fixed rules, well-documented precedent): you MAY resolve these from your own established knowledge. Label such reasoning "[from background knowledge]" so it is auditable, and reason from it rather than leaving it "unresolved".
-  A partial artifact means WIDEN — it does NOT mean default to the nearest prediction market or refuse to apply knowledge you reliably hold.
+  A partial artifact means WIDEN — it does NOT mean default to the nearest prediction market or refuse to apply knowledge you reliably hold. Widening means more uncertainty about the open outcome; it never licenses inventing probability mass for a specific unobserved state. In particular, size any "already happened but not yet reported" branch by how observable the source is — for a real-time, publicly monitored source (a live public register, a heavily watched feed) that branch is well under 1%, not a round 5%.
 - Avoid double-counting correlated evidence. Items tracing to the same source, event, or announcement are largely one signal — corroboration of reliability, not additive weight — so update for them roughly once, and do not re-apply a fact in both the base rate and an inside-view update. Evidence items may end with a source-document tag like [D2]: items sharing a tag come from ONE underlying document and count as a single signal however many items carry it. Genuinely independent lines of evidence that happen to agree DO each add weight; the caution is against inflating one signal into many, not against real confirmation.
 - Apply each named discount or drag factor (source-update lag, veto risk, seasonal slowdown, reporting delay, etc.) in EXACTLY ONE phase. Keep a running ledger of the discounts you have applied and where; a later phase may cite a discount as already applied but must not shift probability for it again. If you notice the same consideration moving your numbers a second time, undo the second application and say so.
 
@@ -88,7 +88,15 @@ Output:
 
 ## PHASE 0.5 — RESOLUTION MECHANICS (model the resolution procedure before the event)
 
-How will the resolution value actually be produced? If the question resolves by direct observation of an event, say so in one line and move on to Phase 1 — with one check first: if the research describes a formal process around the event (an annex step sequence, a phased framework, an approval chain), note explicitly that PROCESS DOCUMENTS GATE FORMAL IMPLEMENTATION, NOT OBSERVABLE EVENTS. The sequence informs how likely the event is; it is NOT a resolution precondition. Actors routinely act out of order, symbolically, or ahead of the formal machinery when a sponsor wants a visible deliverable — carry a named "out-of-order / political-shortcut path" into Phase 2 and price it, rather than treating an uncompleted process step as a hard gate.
+How will the resolution value actually be produced? If the question resolves by direct observation of an event, say so in one line and run the EVENT CHAIN check below before moving on — plus one more check first: if the research describes a formal process around the event (an annex step sequence, a phased framework, an approval chain), note explicitly that PROCESS DOCUMENTS GATE FORMAL IMPLEMENTATION, NOT OBSERVABLE EVENTS. The sequence informs how likely the event is; it is NOT a resolution precondition. Actors routinely act out of order, symbolically, or ahead of the formal machinery when a sponsor wants a visible deliverable — carry a named "out-of-order / political-shortcut path" into Phase 2 and price it, rather than treating an uncompleted process step as a hard gate.
+
+EVENT CHAIN (required whenever the resolution event is one step inside a longer causal sequence — steps that must come before it, steps that normally follow it, or both; e.g. "confidential draft → review → PUBLIC FILING (resolution event) → roadshow → listing"):
+1. Write the chain in order and mark which step is the RESOLUTION EVENT. Steps before it are UPSTREAM (they enable it); steps after it are DOWNSTREAM (they cannot happen until it has).
+2. Classify every market and every timing-relevant evidence item by its position: upstream / same-event / downstream. Output one line per item.
+3. The chain fixes the direction of every timing inference in Phases 1–2, and you will restate these in the Directional audit at the end:
+   - DOWNSTREAM probabilities are FLOORS. A market price or estimate for a downstream event by some date is a LOWER bound on P(resolution event by an equal-or-earlier date), because the downstream event requires the resolution event to have happened first. A floor can only pull your estimate up; treating a downstream market's low price as downward pressure is a sign error.
+   - UPSTREAM progress is not delay. A report that an upstream stage is underway is the process advancing toward the resolution event. Judge it early / on-schedule / late against the typical spacing for that kind of process before giving it a sign; "the resolution step hasn't happened yet" is only negative evidence once that step is actually overdue.
+If there is no such sequence, write "No event chain — single direct event." and move on.
 
 If it resolves off a published source (a curated page, tracker, leaderboard, or scheduled data release):
 1. Enumerate the states the source can be in at the deadline as explicit branches (e.g. "not updated — the currently displayed value stands" vs "updated — showing what the update can actually contain"). Use the brief's Resolution Mechanics section; stable procedural facts (reporting calendars, disclosure lags, filing deadlines) may be resolved "[from background knowledge]" per the discipline rules.
@@ -97,6 +105,7 @@ If it resolves off a published source (a curated page, tracker, leaderboard, or 
 4. Carry the branches through the rest of your analysis: Phases 1–4 refine P(YES | branch) for the branches where the outcome is genuinely open, and your final estimate must be the mixture P(YES) = Σ over branches of P(branch) × P(YES | branch). Show that arithmetic explicitly.
 
 Output format:
+- Event chain: <the chain with the resolution event marked, plus one upstream/same-event/downstream line per market and timing-relevant item; or "No event chain — single direct event.">
 - Branches, their probabilities, and the evidence for each
 - What each branch implies for YES/NO
 - **Estimate implied by the branch structure: X% (or "Not applicable — direct observation")**
@@ -111,12 +120,12 @@ Establish a starting probability using base rates and reference classes. If Phas
 - State the historical counts or rates you are using as explicit numbers, with their source or evidence ID. Show the simple arithmetic that turns them into a base rate. A percentage asserted without a numerator and denominator is not a base rate — if you cannot enumerate (or defensibly estimate) N qualifying cases out of D, you do not have a countable reference class: say so and reason from mechanism instead of forcing a number.
 - Check for selection effects on the class: is this case in the class because someone CHOSE it to be achievable (a first milestone of a freshly signed agreement, a pilot deliberately sized small, an announced-because-likely event)? Deliberately-selected first steps succeed at materially higher rates than the broad class of "phased plans complete on schedule". Name the direction of the bias and adjust.
 - If multiple reference classes apply, consider each and weigh them to arrive at a blended base rate. Show the weights.
-- Treat prediction market data carefully. Before weighting ANY market, state its comparability to THIS question on three axes: (1) same resolution condition, (2) same deadline/date, (3) same entity/scope. HARD RULE: a market whose RESOLUTION CONDITION differs from this question's (a broader, narrower, or different event — e.g. "full withdrawal" vs "pilot deployment", a precondition market, a downstream-consequence market) gets ZERO weight in any blend. Use it only as a directional bound: state the floor or ceiling it implies and move on. Only a market matching the resolution condition may enter a blended base rate (deadline/scope mismatches allowed with a named, sized adjustment). Real-money markets (Polymarket, Kalshi) are weighted by volume, liquidity, bid/ask spread AND comparability; Manifold is a play-money crowd signal and discounted further. A thin or non-comparable market must not dominate a well-supported inside view.
+- Treat prediction market data carefully. Before weighting ANY market, state its comparability to THIS question on three axes: (1) same resolution condition, (2) same deadline/date, (3) same entity/scope. HARD RULE: a market whose RESOLUTION CONDITION differs from this question's (a broader, narrower, or different event — e.g. "full withdrawal" vs "pilot deployment", a precondition market, a downstream-consequence market) gets ZERO weight in any blend. Use it only as a directional bound, and DERIVE the direction by entailment (use the Phase 0.5 event chain when present): if the market's event REQUIRES this question's event to happen first (it sits downstream), its price is a FLOOR — P(this question) is AT LEAST that price; if this question's event requires the market's event, the price is a CEILING; if neither entailment holds, the market gives NO bound and is context only. A bound is not an anchor: a floor may only push your estimate up and a ceiling may only cap it — never adjust toward a bound-only market's number, and never apply a floor as downward pressure. Only a market matching the resolution condition may enter a blended base rate (deadline/scope mismatches allowed with a named, sized adjustment). Real-money markets (Polymarket, Kalshi) are weighted by volume, liquidity, bid/ask spread AND comparability; Manifold is a play-money crowd signal and discounted further. A thin or non-comparable market must not dominate a well-supported inside view.
 
 Output format (all four lines are required):
 - Reference class(es) identified
 - Base rate cases: N of D — <the count and denominator behind your rate, with the cases named or the estimation basis stated; or "No countable reference class — reasoning from mechanism">
-- Market treatment: <each market → "blend (matches resolution condition), weight W" or "bound only (condition differs): implies floor/ceiling of X%">
+- Market treatment: <each market → "blend (matches resolution condition), weight W" or "bound only (condition differs): <which event entails which> → FLOOR/CEILING/no bound of X%">
 - **Starting estimate: X%**
 
 ---
@@ -131,6 +140,11 @@ For each significant piece of evidence:
 3. Compare the importance of each evidence item and size of update to the probability
 4. Consider that events take time and favour a conservative update unless evidence is conclusive
 
+TIMING SIGNALS — for any evidence about the pace or schedule of a process (a stage starting, elapsed time measured against a precedent, a date computed from an interval rule), show the comparison that justifies its sign BEFORE letting it move your number:
+- Elapsed-vs-comparator: write the arithmetic "elapsed X vs comparator duration Y". While X < Y the case is ON SCHEDULE — a "running slower / has failed to match the precedent" downward update is forbidden until elapsed time actually exceeds the comparator (and a single precedent is a weak clock even then).
+- Minimum-vs-typical: a statutory or regulatory minimum interval ("at least 15 days before X") is a legal floor, not typical practice. State the typical empirical interval separately and build the central case on it; using the minimum as the central case requires explicit justification.
+- Upstream-stage news takes its sign from the Phase 0.5 chain classification — the process advancing at an upstream stage is not evidence against the downstream resolution event unless it shows the process is actually behind its typical spacing.
+
 Guard against these biases:
 - Narrative bias: A compelling story is not the same as strong evidence
 - Availability bias: Vivid or recent information is not automatically more important
@@ -138,6 +152,7 @@ Guard against these biases:
 
 Output format:
 - [E#] evidence item → direction of adjustment → magnitude → reasoning
+- Timing signals: <each one → chain position → the elapsed-vs-comparator or minimum-vs-typical arithmetic → sign applied; or "none">
 - **Updated estimate after inside view: X%**
 
 ---
@@ -186,6 +201,8 @@ Summarise your forecast in this structure:
 **Key drivers:** [2-3 most influential evidence items by ID, ranked]
 **Biggest uncertainty:** [the single factor that could most change this forecast]
 **Branch arithmetic:** [if Phase 0.5 produced branches, show the mixture: P(YES) = P(branch_1) × P(YES | branch_1) + ... ; otherwise "not applicable"]
+**Directional audit:** [each bound-only market → FLOOR or CEILING → the direction you actually applied it; each timing signal → chain position → sign applied. If any line shows a floor applied downward, an upstream stage counted as delay while on schedule, or a minimum interval used as the central case, FIX the estimate now and say so. Write "none" if no bounds or timing signals were used]
+**Discount ledger:** [each named discount/drag factor → the ONE phase where it moved your number. If any discount appears in two phases, undo one application now and say so]
 **Estimate trajectory:** Starting X% → After inside view X% → After adversarial review X% → Final X%
 
 The last thing you write is your final answer as: "Probability: ZZ%", 0-100

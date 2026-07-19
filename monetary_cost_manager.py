@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import threading
 import time
 from contextvars import ContextVar
@@ -19,9 +20,67 @@ OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
 # Pass as extra_body on chat.completions.create so OpenRouter returns the
 # detailed usage breakdown (completion_tokens_details.reasoning_tokens, cost).
 OPENROUTER_USAGE_ACCOUNTING: Final[dict[str, Any]] = {"usage": {"include": True}}
-CHARACTERS_PER_TOKEN = 4
-DEFAULT_INPUT_TOKEN_HARD_LIMIT = 250_000
-DEFAULT_OUTPUT_TOKEN_HARD_LIMIT = 50_000
+# 3.2 chars/token (was 4 until 2026-07-19): the Sonnet-5/Opus-4.7+ tokenizer
+# is denser than the old models', and the pipeline's text is URL/table-heavy
+# markdown, which tokenizes worse than prose — chars/4 consistently
+# under-estimated real billed tokens by ~20-25% (the recurring gap between
+# the audit table's implied cost and actual OpenRouter usage). Every budget
+# below is denominated in THESE estimated-token units; when this constant
+# changes, the budgets must be rescaled by the same factor or every physical
+# char budget silently shrinks (they were rescaled ×1.25 with this change).
+CHARACTERS_PER_TOKEN = 3.2
+# 375K in 3.2-chars units == the 300K chars/4-units limit calibrated on the
+# 44773 A/B analysis (raised from 250K there): the measured full pipeline on
+# a heavy question (research ~160K + compile ~69K + 3-run ensemble incl. the
+# raw-view member ~66K, all in chars/4 units) never fit in the pre-raise
+# limit — it forced every heavy question to sacrifice either the compile
+# (failed run) or an ensemble member (the "successful" run silently dropped
+# its raw-view run at 245K/250K). With the research reserve below, research
+# keeps its measured natural appetite while the full tail always fits.
+DEFAULT_INPUT_TOKEN_HARD_LIMIT = 375_000
+DEFAULT_OUTPUT_TOKEN_HARD_LIMIT = 62_500
+
+# Slice of the per-question input-token budget held back for the mandatory tail
+# (compiler precompress + compile + forecaster ensemble), so that optional
+# research work (scrape cycles, provider fall-through, artifact retry)
+# soft-stops early instead of spending right up to the hard limit and starving
+# the calls that produce the deliverable. Calibrated on question 44773's two
+# runs (2026-07-16): the failed run spent 230K of 250K on research and the
+# compile call was refused; the "successful" rerun finished at 245,126/250,000
+# and silently dropped its heterogeneous raw-view ensemble run — refused by
+# this same limit pre-flight (forecast.json extra.ensemble: dropped=true, no
+# ledger row). Measured tail: compile phase 69,240 (precompress 23,033 +
+# 14,403 + Opus compile 31,804), brief-based forecast runs 7,888 each, and the
+# raw-view run scales with research size (its prompt ceiling is 200K chars =
+# 62.5K estimated tokens; with research gated it runs smaller).
+# Values are in 3.2-chars estimated-token units (the chars/4 calibration from
+# 44773 — 70K/10K/30K — rescaled ×1.25; same physical char budgets).
+# Override with the RESEARCH_RESERVE_INPUT_TOKENS env var.
+_RESERVE_BASE_INPUT_TOKENS = 87_500
+_RESERVE_PER_FORECAST_RUN_INPUT_TOKENS = 12_500
+_RESERVE_HETEROGENEOUS_RUN_EXTRA_INPUT_TOKENS = 37_500
+
+
+def research_reserve_input_tokens(num_forecast_runs: int) -> int:
+    """Input tokens to hold back from research for the compile+forecast tail."""
+    override = os.getenv("RESEARCH_RESERVE_INPUT_TOKENS", "").strip()
+    if override:
+        return max(0, int(override))
+    reserve = (
+        _RESERVE_BASE_INPUT_TOKENS
+        + max(1, num_forecast_runs) * _RESERVE_PER_FORECAST_RUN_INPUT_TOKENS
+    )
+    # The raw-view heterogeneous member replaces the LAST run when the ensemble
+    # has >= 2 runs (forecasters.base.heterogeneous_run_setup); its prompt is
+    # the raw research view, far larger than the compiled brief.
+    if num_forecast_runs >= 2:
+        try:
+            from config import HETEROGENEOUS_RUN_ENABLED
+        except Exception:
+            HETEROGENEOUS_RUN_ENABLED = True
+        if HETEROGENEOUS_RUN_ENABLED:
+            reserve += _RESERVE_HETEROGENEOUS_RUN_EXTRA_INPUT_TOKENS
+    return reserve
 
 
 class HardLimitExceededError(Exception):
@@ -39,6 +98,15 @@ class OpenRouterUsageRecord:
     model_used: str
     duration_seconds: float = 0.0
     reasoning_tokens: int = 0
+    # OpenRouter-reported ground truth (requires the usage-accounting
+    # extra_body, which llm_client always sends). The char-based estimates
+    # above stay for continuity; these are the numbers billing actually uses.
+    native_input_tokens: int = 0
+    native_output_tokens: int = 0
+    cached_input_tokens: int = 0
+    # usage.cost (OpenRouter credits) + cost_details.upstream_inference_cost
+    # (the provider bill when the key is BYOK, as this project's is).
+    cost_usd: float = 0.0
 
 
 class OpenRouterUsageHandle:
@@ -66,14 +134,24 @@ class OpenRouterUsageHandle:
 
     def record_response(self, response: Any) -> None:
         reasoning_tokens = count_openrouter_reasoning_tokens(response)
+        native = extract_openrouter_native_usage(response)
         if not self._finished:
             for record in self._records:
                 record.reasoning_tokens = reasoning_tokens
+                record.native_input_tokens = native["prompt_tokens"]
+                record.native_output_tokens = native["completion_tokens"]
+                record.cached_input_tokens = native["cached_tokens"]
+                record.cost_usd = native["cost_usd"]
             logger.info(
-                "[reasoning] %s | model=%s | reasoning_tokens=%d",
+                "[usage] %s | model=%s | native in/out=%d/%d | reasoning=%d | "
+                "cached=%d | cost=$%.6f",
                 self._name_of_task,
                 self._model,
+                native["prompt_tokens"],
+                native["completion_tokens"],
                 reasoning_tokens,
+                native["cached_tokens"],
+                native["cost_usd"],
             )
         self.record_output_characters(count_openrouter_output_characters(response))
 
@@ -115,6 +193,7 @@ class MonetaryCostManager:
         input_token_hard_limit: int = DEFAULT_INPUT_TOKEN_HARD_LIMIT,
         output_token_hard_limit: int = DEFAULT_OUTPUT_TOKEN_HARD_LIMIT,
         log_usage_when_called: bool = False,
+        reserved_input_tokens: int = 0,
     ) -> None:
         if hard_limit < 0:
             raise ValueError("hard_limit must be positive or zero")
@@ -122,9 +201,23 @@ class MonetaryCostManager:
             raise ValueError("input_token_hard_limit must be positive or zero")
         if output_token_hard_limit < 0:
             raise ValueError("output_token_hard_limit must be positive or zero")
+        if reserved_input_tokens < 0:
+            raise ValueError("reserved_input_tokens must be positive or zero")
+        if (
+            reserved_input_tokens
+            and input_token_hard_limit
+            and reserved_input_tokens >= input_token_hard_limit
+        ):
+            logger.warning(
+                "reserved_input_tokens (%d) >= input_token_hard_limit (%d): "
+                "all reserve-gated research work will be skipped for this manager",
+                reserved_input_tokens,
+                input_token_hard_limit,
+            )
         self.hard_limit: Final[float] = hard_limit
         self.input_token_hard_limit: Final[int] = input_token_hard_limit
         self.output_token_hard_limit: Final[int] = output_token_hard_limit
+        self.reserved_input_tokens: Final[int] = reserved_input_tokens
         self._log_usage_when_called = log_usage_when_called
         self._records: list[OpenRouterUsageRecord] = []
         self._lock = threading.RLock()
@@ -166,6 +259,26 @@ class MonetaryCostManager:
             return sum(record.reasoning_tokens for record in self._records)
 
     @property
+    def total_native_input_tokens(self) -> int:
+        with self._lock:
+            return sum(record.native_input_tokens for record in self._records)
+
+    @property
+    def total_native_output_tokens(self) -> int:
+        with self._lock:
+            return sum(record.native_output_tokens for record in self._records)
+
+    @property
+    def total_cached_input_tokens(self) -> int:
+        with self._lock:
+            return sum(record.cached_input_tokens for record in self._records)
+
+    @property
+    def total_cost_usd(self) -> float:
+        with self._lock:
+            return sum(record.cost_usd for record in self._records)
+
+    @property
     def total_tokens(self) -> int:
         return self.total_input_tokens + self.total_output_tokens
 
@@ -193,6 +306,10 @@ class MonetaryCostManager:
                     model_used=record.model_used,
                     duration_seconds=record.duration_seconds,
                     reasoning_tokens=record.reasoning_tokens,
+                    native_input_tokens=record.native_input_tokens,
+                    native_output_tokens=record.native_output_tokens,
+                    cached_input_tokens=record.cached_input_tokens,
+                    cost_usd=record.cost_usd,
                 )
                 for record in self._records
             ]
@@ -208,6 +325,10 @@ class MonetaryCostManager:
             f"  total_output_characters: {self.total_output_characters}",
             f"  total_output_tokens: {self.total_output_tokens}",
             f"  total_reasoning_tokens: {self.total_reasoning_tokens}  # provider-reported; included in output billing, not in the char-based estimates above",
+            f"  total_native_input_tokens: {self.total_native_input_tokens}  # OpenRouter-reported; ground truth vs the char-based estimates",
+            f"  total_native_output_tokens: {self.total_native_output_tokens}",
+            f"  total_cached_input_tokens: {self.total_cached_input_tokens}  # served from prompt cache (billed at the cache-read rate)",
+            f"  total_cost_usd: {self.total_cost_usd:.6f}  # OpenRouter-reported actual cost (credits + BYOK upstream)",
             f"  output_token_hard_limit: {self.output_token_hard_limit}",
             f"  total_tokens: {self.total_tokens}",
             f"  total_token_hard_limit: {self.hard_limit}",
@@ -220,6 +341,30 @@ class MonetaryCostManager:
     @classmethod
     def get_active_cost_managers(cls) -> list[MonetaryCostManager]:
         return cls._active_managers.get()
+
+    @classmethod
+    def would_breach_input_reserve(cls, estimated_input_tokens: float = 0) -> bool:
+        """True when optional research work should soft-stop.
+
+        Checks every active manager that declares both an input hard limit and
+        a reserved tail: would spending ``estimated_input_tokens`` more push
+        total input past (limit - reserve)? Unlike
+        ``raise_error_if_limit_would_be_reached`` this never raises — callers
+        skip the optional step and proceed to compile/forecast with what they
+        have, so budget exhaustion degrades the research, never the deliverable.
+        Managers without a reserve never gate.
+        """
+        if estimated_input_tokens < 0:
+            raise ValueError("estimated_input_tokens must be positive or zero")
+        for manager in cls._active_managers.get():
+            if not manager.input_token_hard_limit or not manager.reserved_input_tokens:
+                continue
+            research_budget = (
+                manager.input_token_hard_limit - manager.reserved_input_tokens
+            )
+            if manager.total_input_tokens + estimated_input_tokens > research_budget:
+                return True
+        return False
 
     @classmethod
     def raise_error_if_limit_would_be_reached(
@@ -338,6 +483,41 @@ def count_serialized_characters(value: Any) -> int:
         return len(str(value))
 
 
+def _coerce_int(value: Any) -> int:
+    try:
+        return max(0, int(value)) if value is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerce_float(value: Any) -> float:
+    try:
+        return max(0.0, float(value)) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def extract_openrouter_native_usage(response: Any) -> dict[str, Any]:
+    """OpenRouter-reported usage: native token counts and actual USD cost.
+
+    Requires the request to carry OPENROUTER_USAGE_ACCOUNTING (llm_client does).
+    ``cost_usd`` sums OpenRouter credits (``usage.cost``, non-BYOK) and the
+    upstream provider bill (``usage.cost_details.upstream_inference_cost``,
+    BYOK) so it is correct under either billing mode. Missing fields read as 0,
+    so a provider that omits the breakdown degrades gracefully.
+    """
+    usage = _get_field(response, "usage")
+    prompt_details = _get_field(usage, "prompt_tokens_details")
+    cost_details = _get_field(usage, "cost_details")
+    return {
+        "prompt_tokens": _coerce_int(_get_field(usage, "prompt_tokens")),
+        "completion_tokens": _coerce_int(_get_field(usage, "completion_tokens")),
+        "cached_tokens": _coerce_int(_get_field(prompt_details, "cached_tokens")),
+        "cost_usd": _coerce_float(_get_field(usage, "cost"))
+        + _coerce_float(_get_field(cost_details, "upstream_inference_cost")),
+    }
+
+
 def count_openrouter_reasoning_tokens(response: Any) -> int:
     """Provider-reported reasoning tokens (0 when the model didn't think or the
     provider omitted the breakdown)."""
@@ -375,8 +555,8 @@ def count_openrouter_output_characters(response: Any) -> int:
 
 def _format_usage_markdown_table(records: list[OpenRouterUsageRecord]) -> str:
     lines = [
-        "| no. | name of task | input characters | input tokens | output characters | output tokens | reasoning tokens | seconds | model used |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| no. | name of task | input characters | input tokens | output characters | output tokens | reasoning tokens | native in | native out | cached in | cost usd | seconds | model used |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for record in records:
         lines.append(
@@ -388,6 +568,10 @@ def _format_usage_markdown_table(records: list[OpenRouterUsageRecord]) -> str:
             f"{record.output_characters} | "
             f"{record.output_tokens} | "
             f"{record.reasoning_tokens} | "
+            f"{record.native_input_tokens} | "
+            f"{record.native_output_tokens} | "
+            f"{record.cached_input_tokens} | "
+            f"{record.cost_usd:.6f} | "
             f"{record.duration_seconds:.1f} | "
             f"{_table_cell(record.model_used)} |"
         )
