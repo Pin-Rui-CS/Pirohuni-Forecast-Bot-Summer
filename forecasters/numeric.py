@@ -623,10 +623,22 @@ def pmf_spec_to_cdf(spec: dict, grid: np.ndarray) -> list[float]:
     if not values or not probabilities:
         raise ValueError("pmf: values and probabilities must be nonempty")
     if len(values) != len(probabilities):
-        raise ValueError(
-            f"pmf: values and probabilities must have the same length, got "
-            f"{len(values)} and {len(probabilities)}"
-        )
+        # Tolerate a small off-by-one/two slip (long hand-enumerated lists make
+        # these more likely) instead of dropping the whole run; a large mismatch
+        # still means the lists don't correspond and must fail.
+        if abs(len(values) - len(probabilities)) <= 2:
+            n = min(len(values), len(probabilities))
+            logger.warning(
+                "pmf: values/probabilities length mismatch (%d vs %d); "
+                "truncating both to %d entries.",
+                len(values), len(probabilities), n,
+            )
+            values, probabilities = values[:n], probabilities[:n]
+        else:
+            raise ValueError(
+                f"pmf: values and probabilities must have the same length, got "
+                f"{len(values)} and {len(probabilities)}"
+            )
 
     probs = np.array(probabilities, dtype=float)
     if np.any(~np.isfinite(probs)) or np.any(probs < 0):
@@ -666,6 +678,182 @@ def _coerce_pmf_value(value) -> float:
     if text.endswith("+"):
         text = text[:-1]
     return float(text)
+
+
+# ---------------------------------------------------------------------------
+# Coarse-support PMF repair (2026-07-20, question 44798)
+#
+# A model asked for a PMF over ~100 outcomes may economize by listing only
+# every 2nd (or 5th, 10th) value — a smooth curve sampled on a coarse grid,
+# not a claim that the skipped outcomes are impossible. Taken literally, the
+# skipped bins get zero mass; PMF-space ensemble averaging then produces an
+# even/odd "comb" (44798: every odd Metascore at ~half weight). The repair
+# spreads each listed value's mass over its centered cell (halfway to each
+# neighbor), which is mean-preserving in the interior and an exact no-op on
+# full support. Mass never leaves [min(support), max(support)] — edge cells
+# are clamped — so an open bound can never regain the 2026-06-26 tail pileup.
+#
+# A comb can also be CORRECT (outcomes with parity/bloc structure), so a gap
+# is only filled when at least one other run puts mass on the skipped bins
+# (single-run ensembles fill by default: genuine parity questions normally get
+# a matching coarse grid from Metaculus, in which case there is no gap at all).
+# ---------------------------------------------------------------------------
+
+# Support pairs needed before regular spacing is read as a coarsened grid
+# (a 2-3 point support with equal gaps is more plausibly multimodal).
+_COARSE_MIN_GAPS_FOR_UNIFORM = 4
+# Fraction of gaps that must equal the modal gap for "uniformly coarse".
+_COARSE_UNIFORM_GAP_SHARE = 0.8
+# Irregular supports only get gaps this small filled; larger holes are kept
+# flat (an intentional bimodal valley must survive the repair).
+_COARSE_MAX_IRREGULAR_FILL_BINS = 3
+# Another run's per-bin mass above this marks the bin as "possible".
+_COARSE_CORROBORATION_MASS = 1e-6
+
+
+def _spread_mass_over_cell(
+    out: np.ndarray, mass: float, left: float, right: float
+) -> None:
+    """Add ``mass`` uniformly over the index-space interval [left, right],
+    where bin k occupies [k - 0.5, k + 0.5]. Overlap-proportional, so the
+    cells of neighboring support points tile without loss."""
+    width = right - left
+    if width <= 0:
+        return
+    k0 = int(np.floor(left + 0.5))
+    k1 = int(np.ceil(right - 0.5))
+    for k in range(max(k0, 0), min(k1, len(out) - 1) + 1):
+        overlap = min(right, k + 0.5) - max(left, k - 0.5)
+        if overlap > 0:
+            out[k] += mass * overlap / width
+
+
+def repair_coarse_pmf_run_cdfs(
+    raw_cdfs: list[np.ndarray],
+    run_values: list[dict],
+    grid: np.ndarray,
+) -> tuple[list[np.ndarray], list[str | None]]:
+    """Fill grid bins that a pmf run's support skipped (see block comment).
+
+    Operates on the per-run CDFs already evaluated on the question grid, so
+    the snapping/tolerance semantics are exactly ``pmf_spec_to_cdf``'s.
+    Returns (possibly-repaired CDFs, per-run note or None). Guarantees per
+    repaired run: in-grid mass conserved, CDF monotone, no mass moved outside
+    the run's own support span, non-pmf runs and full-support pmfs untouched.
+    """
+    n = len(raw_cdfs)
+    bin_masses = [np.diff(np.asarray(c, dtype=float), prepend=0.0) for c in raw_cdfs]
+    repaired: list[np.ndarray] = []
+    notes: list[str | None] = []
+
+    for i, parsed in enumerate(run_values):
+        masses = bin_masses[i]
+        if parsed.get("kind") != "pmf" or len(masses) < 3:
+            repaired.append(raw_cdfs[i])
+            notes.append(None)
+            continue
+
+        # Bin 0 is the at/below-lower-bound cell, not an outcome bin; the
+        # repair never spreads into or out of it.
+        occupied = [int(j) for j in np.nonzero(masses[1:] > 1e-12)[0] + 1]
+        gaps = [b - a for a, b in zip(occupied, occupied[1:])]
+        if not gaps or all(g == 1 for g in gaps):
+            repaired.append(raw_cdfs[i])
+            notes.append(None)
+            continue
+
+        modal_gap = max(set(gaps), key=gaps.count)
+        uniform_coarse = (
+            len(gaps) >= _COARSE_MIN_GAPS_FOR_UNIFORM
+            and modal_gap >= 2
+            and gaps.count(modal_gap) / len(gaps) >= _COARSE_UNIFORM_GAP_SHARE
+        )
+
+        if n > 1:
+            others_max = np.max(
+                [m for k, m in enumerate(bin_masses) if k != i], axis=0
+            )
+        else:
+            others_max = None  # single run: no cross-signal, fill by default
+
+        fill_gap: list[bool] = []
+        uncorroborated = 0
+        for a, b in zip(occupied, occupied[1:]):
+            skipped = b - a - 1
+            if skipped == 0:
+                fill_gap.append(False)
+                continue
+            eligible = uniform_coarse or skipped <= _COARSE_MAX_IRREGULAR_FILL_BINS
+            corroborated = others_max is None or bool(
+                np.all(others_max[a + 1 : b] > _COARSE_CORROBORATION_MASS)
+            )
+            if eligible and not corroborated:
+                uncorroborated += skipped
+            fill_gap.append(eligible and corroborated)
+
+        if not any(fill_gap):
+            repaired.append(raw_cdfs[i])
+            notes.append(None)
+            continue
+
+        new_masses = np.zeros_like(masses)
+        new_masses[0] = masses[0]
+        for idx, b in enumerate(occupied):
+            left = (
+                (occupied[idx - 1] + b) / 2.0
+                if idx > 0 and fill_gap[idx - 1]
+                else b - 0.5
+            )
+            right = (
+                (b + occupied[idx + 1]) / 2.0
+                if idx < len(occupied) - 1 and fill_gap[idx]
+                else b + 0.5
+            )
+            _spread_mass_over_cell(new_masses, float(masses[b]), left, right)
+
+        filled_bins = sum(
+            b - a - 1 for (a, b), f in zip(zip(occupied, occupied[1:]), fill_gap) if f
+        )
+        note = (
+            f"coarse pmf support repaired: spread mass into {filled_bins} skipped "
+            f"grid bin(s) (support spacing ~{modal_gap} grid bins)"
+        )
+        if uncorroborated:
+            note += (
+                f"; left {uncorroborated} skipped bin(s) untouched (no other "
+                "run places mass there)"
+            )
+        repaired.append(
+            np.maximum.accumulate(np.clip(np.cumsum(new_masses), 0.0, 1.0))
+        )
+        notes.append(note)
+
+    return repaired, notes
+
+
+def comb_check(final_cdf: list[float]) -> dict:
+    """Detect a sawtooth ("comb") pattern in a submitted distribution: many
+    material up/down alternations of adjacent bin masses across the central
+    region. A smooth unimodal curve alternates ~once; the 44798 comb dozens of
+    times. Warn-only signal — legitimate combs exist (parity-structured
+    outcomes), so this flags for audit rather than blocking submission."""
+    pmf = np.diff(np.asarray(final_cdf, dtype=float), prepend=0.0)
+    peak = float(pmf.max()) if len(pmf) else 0.0
+    if peak <= 0.0:
+        return {"alternations": 0, "region_bins": 0, "flagged": False}
+    body = np.nonzero(pmf >= 0.05 * peak)[0]
+    seg = pmf[body[0] : body[-1] + 1]
+    if len(seg) < 4:
+        return {"alternations": 0, "region_bins": int(len(seg)), "flagged": False}
+    diffs = np.diff(seg)
+    # Only count moves that are material relative to the local level, so the
+    # gentle flanks of a smooth curve contribute nothing.
+    significant = np.abs(diffs) >= 0.15 * np.maximum(seg[:-1], seg[1:])
+    signs = np.sign(diffs) * significant
+    signs = signs[signs != 0]
+    alternations = int(np.sum(signs[:-1] * signs[1:] < 0)) if len(signs) > 1 else 0
+    flagged = alternations >= 6 and alternations >= 0.5 * (len(seg) - 2)
+    return {"alternations": alternations, "region_bins": int(len(seg)), "flagged": flagged}
 
 
 def nominal_grid(
@@ -802,7 +990,10 @@ def distribution_guidance_for_question(
         '"probabilities": [<floats>]}}} '
         f"using outcome values like: {value_text}. Probabilities must be nonnegative and "
         "will be normalized. Use the open-ended upper-tail value when the question has one. "
-        "Prefer this pmf form for count questions."
+        "Prefer this pmf form for count questions. List CONSECUTIVE outcome values with no "
+        "skips — include every value between the lowest and highest you consider plausible, "
+        "even when its probability is tiny. Never coarsen to every 2nd or 5th value: a "
+        "skipped value is treated as literally zero probability, not interpolated."
     )
     return header, pmf_note
 
@@ -1630,9 +1821,13 @@ def aggregate_run_cdfs(cdfs: list[np.ndarray], use_pmf: bool) -> np.ndarray:
 MAX_PMF_OUTCOMES = 30
 
 # Genuine integer-count questions (step == 1) use the native PMF up to this many
-# outcomes regardless of MAX_PMF_OUTCOMES. A PMF over integers can never
-# staircase here (the submission grid step always equals the outcome step), and
-# it tapers cleanly at the bounds. The continuous path, by contrast, sets
+# outcomes regardless of MAX_PMF_OUTCOMES. The submission grid step equals the
+# outcome step here, so a *full-support* PMF cannot staircase — but the MODEL
+# can still emit coarser-than-grid support (44798: every 2nd score), which
+# combs after PMF-space averaging; ``repair_coarse_pmf_run_cdfs`` handles that
+# case rather than this routing constant (do not re-tune it: 30 → staircase
+# 2026-06-24 ↔ 100 → open-bound spike 2026-06-26). A full-support integer PMF
+# tapers cleanly at the bounds. The continuous path, by contrast, sets
 # cdf[0] = CDF(lower_bound), which collapses the ENTIRE lower tail of a smooth
 # family into the single `<lower` cell — a tall boundary spike whenever the
 # median sits within a few sigma of an open bound (e.g. a rig count near 559 on
@@ -1761,20 +1956,21 @@ def numeric_response_to_raw_cdf(
         spec = {"type": "pmf", "params": parsed["pmf"]}
         raw_cdf = np.asarray(pmf_spec_to_cdf(spec, grid))
         parsed["spec"] = spec
-        # Guard against the staircase failure: a PMF whose distinct values are
-        # far coarser than the grid resolution produces point-mass spikes
-        # instead of a continuous curve. Expected for true count questions
-        # (use_pmf), a bug for fine-resolution discrete grids.
-        if not geometry.get("use_pmf", True):
-            values, _ = _parse_pmf_params(parsed["pmf"])
-            outcome_count = geometry.get("outcome_count") or len(grid)
-            if len(set(values)) * 3 < outcome_count:
-                logger.warning(
-                    "sanity check warning: fine-resolution discrete question got a "
-                    "coarse PMF (%d distinct values over %d grid bins); this renders "
-                    "as point-mass spikes, not a continuous curve.",
-                    len(set(values)), outcome_count,
-                )
+        # Guard against the staircase/comb failure: a PMF whose distinct values
+        # are far coarser than the grid resolution produces point-mass spikes.
+        # This fires for count questions too (44798: a step-2 support on a
+        # step-1 grid combed the ensemble average) — the old `not use_pmf`
+        # gate assumed integer-grid PMFs always arrive with full support.
+        values, _ = _parse_pmf_params(parsed["pmf"])
+        outcome_count = geometry.get("outcome_count") or len(grid)
+        if len(set(values)) * 3 < outcome_count:
+            logger.warning(
+                "sanity check warning: discrete question got a coarse PMF "
+                "(%d distinct values over %d grid bins); this renders as "
+                "point-mass spikes — repair_coarse_pmf_run_cdfs will fill "
+                "corroborated gaps before aggregation.",
+                len(set(values)), outcome_count,
+            )
         return raw_cdf, parsed, reasoning, "PMF over outcome values; no unit conversion applied.", False
 
     # Mixture of smooth families (a single family is a 1-component mixture).
@@ -1916,6 +2112,7 @@ async def get_numeric_gpt_prediction(
     )
 
     raw_cdfs: list[np.ndarray] = []
+    kept_records: list[dict] = []
     comments: list[str] = []
     transcripts: list[str] = []
     run_values: list[dict] = []
@@ -1973,6 +2170,7 @@ async def get_numeric_gpt_prediction(
         log_numeric_cdf_sanity_checks(location_values, grid, raw_cdf.tolist())
 
         raw_cdfs.append(raw_cdf)
+        kept_records.append(record)
         transcripts.append(run.transcript)
         run_values.append(parsed)
         repaired_note = " (repaired)" if run.repaired else ""
@@ -2007,6 +2205,20 @@ async def get_numeric_gpt_prediction(
             run_values=run_values,
             extra={"geometry": geometry, "ensemble": ensemble, "abstained": True},
         )
+
+    # Coarse-support repair (44798): a pmf run that skipped grid values gets
+    # its mass spread over the skipped bins — but only bins some other run
+    # considers possible — BEFORE averaging, so a step-2 support cannot comb
+    # the ensemble. No-op for full-support pmfs and mixture runs.
+    raw_cdfs, repair_notes = repair_coarse_pmf_run_cdfs(raw_cdfs, run_values, grid)
+    for i, note in enumerate(repair_notes):
+        if note is None:
+            continue
+        logger.warning(
+            "[ensemble] numeric run (%s): %s", kept_records[i]["model"], note
+        )
+        kept_records[i]["coarse_support_repaired"] = True
+        comments[i] += f"\n\n_Post-parse repair: {note}._"
 
     aggregated = aggregate_run_cdfs(raw_cdfs, geometry["use_pmf"])
 
@@ -2044,21 +2256,37 @@ async def get_numeric_gpt_prediction(
     logger.info("aggregated from %d run(s)", len(raw_cdfs))
     log_cdf_summary("final standardized distribution summary:", final_cdf)
 
+    # Shape audit on exactly what will be submitted. Warn-only (legitimate
+    # combs exist for parity-structured outcomes), but the verdict is persisted
+    # to forecast.json — a log line alone goes unread in an overnight batch.
+    comb = comb_check(final_cdf) if geometry["use_pmf"] else None
+    if comb and comb["flagged"]:
+        logger.warning(
+            "sanity check warning: submitted distribution looks comb-shaped "
+            "(%d material alternations over %d central bins); check the runs' "
+            "pmf supports and the repair notes.",
+            comb["alternations"], comb["region_bins"],
+        )
+
+    aggregation_label = "PMF-averaged" if geometry["use_pmf"] else "quantile-averaged"
     final_comment_sections = [
         f"## Rationale {i+1}\n{comment}" for i, comment in enumerate(comments)
     ]
     final_comment = (
-        f"Aggregated CDF (quantile-averaged across {len(raw_cdfs)} runs): "
+        f"Aggregated CDF ({aggregation_label} across {len(raw_cdfs)} runs): "
         f"`{str(final_cdf)[:100]}...`\n\n" + "\n\n".join(final_comment_sections)
     )
 
+    extra = {"geometry": geometry, "ensemble": ensemble}
+    if comb is not None:
+        extra["comb_check"] = comb
     return ForecastResult(
         forecast=final_cdf,
         comment=final_comment,
         prompt=prompt,
         run_transcripts=transcripts,
         run_values=run_values,
-        extra={"geometry": geometry, "ensemble": ensemble},
+        extra=extra,
     )
 
 

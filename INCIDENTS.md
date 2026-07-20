@@ -7,6 +7,107 @@ re-deriving the same diagnosis twice — read this before touching the forecasti
 
 ---
 
+## 2026-07-20 — Coarse (step-2) PMF support taken as literal point masses + PMF-space averaging → even/odd "comb" submitted on 44798; odd scores at ~half weight
+
+| | |
+|---|---|
+| **Severity** | Medium — 44798 (Halo: Campaign Evolved Metascore, `discrete`, 100 integer outcomes) submitted a sawtooth: every even score ~2x the probability of adjacent odd scores (P(80)=.088, P(81)=.046, P(82)=.090). Center/median unaffected (~81); the penalty lands only if resolution hits an odd score (~half the intended probability there). Question closed 2026-07-20 06:00Z — cannot be resubmitted |
+| **Introduced** | Long-standing latent; exposed by the 2026-06-26 fix. `MAX_PMF_INTEGER_OUTCOMES = 100` routes 100-outcome integer questions to the native-PMF path on the assumption "a PMF over integers can never staircase (grid step equals outcome step)" — true only when the model enumerates every integer. At exactly 100 outcomes, models economize |
+| **Detected** | 2026-07-20 — owner review of the rendered 44798 distribution ("shape is very weird") |
+| **Diagnosed & fixed** | 2026-07-20 (`forecasters/numeric.py`, `tests/test_44798_comb_fix.py` new) — **not yet committed** |
+| **Affected window** | Any `use_pmf` question where a run's PMF support skips grid values — likeliest on wide integer grids (31–100 outcomes) where enumeration is tedious. Fine-resolution (`not use_pmf`) pmf responses render the same spikes and are repaired by the same pass |
+
+### Symptom
+The final CDF rose in alternating small/large steps across 60–100. Cause visible
+in runs.md: Sonnet returned its PMF on values [58, 60, 62, …, 100] — a smooth
+bell centered on 80 *sampled every 2 points* — while Opus and GPT enumerated
+(mostly) every integer. `pmf_spec_to_cdf` placed each listed value as an exact
+point mass (zero on every odd score), and `aggregate_run_cdfs` (`use_pmf` path)
+averaged PMFs bin-by-bin, so odd bins got 2-of-3 runs' mass and even bins got
+Sonnet's double-sized step-2 masses on top. The existing coarse-PMF warning was
+gated on `not use_pmf` — excluded, by design, exactly the case that fired — and
+was log-only anyway. Secondary: the run comment's "quantile-averaged" label was
+hardcoded (this path PMF-averages); the flat 0.0001/bin left ramp is just the
+min-step CDF floor (~0.55% mass, harmless).
+
+### Root cause
+No layer represented the difference between "the model assigns zero to these
+outcomes" and "the model didn't bother listing them." The elicitation prompt's
+example ("values like: 1, 2, 3, … 20, ...") never required full coverage; the
+transform took the support literally; aggregation averaged in PMF space; and no
+shape check ran on what was submitted (the 2026-06-24 lesson — "verify the
+rendered density" — was never mechanized).
+
+### The fix (`forecasters/numeric.py`; design reviewed for regressions against this log before implementation)
+- **`repair_coarse_pmf_run_cdfs`** — deterministic second pass after all runs
+  parse, before aggregation: spreads each listed value's mass over its centered
+  cell (halfway to each neighbor, cells tile → mass conserved, mean preserved
+  in the interior; NOT trailing-gap CDF interpolation, which biases the mean
+  left by ~(g−1)/2 bins). Exact no-op on full support; mixture runs untouched;
+  edge cells clamped so mass never leaves [min(support), max(support)] (the
+  2026-06-26 open-bound pileup cannot return). Fill rules: uniformly coarse
+  support (≥4 gaps, modal gap ≥2 covering ≥80%) fills everywhere; irregular
+  support fills only gaps ≤3 bins (a bimodal valley survives). **Cross-run
+  gate**: a gap is filled only if another valid run puts mass on the skipped
+  bins — a comb ALL runs agree on is preserved (parity/bloc-structured outcomes
+  are legitimate; smearing them would be worse than the bug). Single-run
+  ensembles fill by default. Never silent: logged, `coarse_support_repaired`
+  recorded in the ensemble record, note appended to the run's rationale.
+- **`comb_check`** — shape audit of the exact submitted CDF (`use_pmf` only):
+  counts material adjacent-bin alternations (≥15% of local level) over the
+  central region; ≥6 alternations covering ≥half the region flags. Warn-only
+  (legitimate combs exist) but persisted to forecast.json `extra` — a log line
+  alone goes unread in an overnight batch.
+- **NOT a validation failure** — a coarse support must never hard-fail
+  `_make_numeric_validator`: a run whose repair retry also fails is DROPPED
+  (base.py), and losing a good forecast over a cosmetic defect is worse than
+  the comb. Routing constants deliberately untouched (30 ↔ staircase
+  2026-06-24; 100 ↔ open-bound spike 2026-06-26 — that knob has oscillated).
+- **Prompt hardening** — the pmf note now requires CONSECUTIVE values, no
+  skips, tiny probabilities included ("a skipped value is treated as literally
+  zero probability"). Frequency reducer only; the deterministic repair is the
+  defense (prose rules decay — 2026-07-07 lesson).
+- **Tolerant pmf parse** — a ≤2-entry values/probabilities length mismatch now
+  truncates with a logged warning instead of raising (which dropped the whole
+  run); larger mismatches still raise. Pairs with the prompt change, which
+  makes long hand-enumerated lists — and off-by-one slips — more common.
+- **Housekeeping** — coarse-PMF warning un-gated from `not use_pmf`; the false
+  "can never staircase" comment corrected; aggregation label now says
+  PMF-averaged/quantile-averaged per the actual path.
+
+### Verification
+- `tests/test_44798_comb_fix.py` (new, free): 13/13 — no-op on full support,
+  mixture passthrough, step-2 repair (mass conserved, monotone, odd bins
+  filled, mean shift <0.3 bins, support-span clamp), parity comb preserved
+  when all runs agree, bimodal valleys preserved (2- and 3-point supports),
+  single-run default fill, irregular support fills only small gaps (19-bin
+  valley stays empty), off-grid tail mass untouched, comb_check flags sawtooth
+  not smooth, tolerant length mismatch, prompt contract, and a **golden replay
+  of the saved 44798 run_values**: Sonnet repaired (20 bins filled; bin 59
+  correctly left — no other run corroborates it), aggregate alternations
+  29 → 1, flagged → clean, median unchanged at 81.
+- `tests/test_imports.py`, `test_44619_fixes.py` 16/16, `test_44620_fixes.py`
+  11/11, `test_nominal_grid.py`, `test_unit_normalization.py` all pass.
+  `test_numeric_elicitation.py`/`test_curve_quality.py` fail identically with
+  and without this change (pre-existing June `percentiles_to_cdf` breakage).
+
+### Lessons
+- "The submission grid step equals the outcome step" guarantees a full-support
+  PMF cannot staircase — it says nothing about the MODEL's support. Any layer
+  that consumes model-enumerated structure must handle it being sparser than
+  the schema allows.
+- A sparse support is ambiguous between laziness and information ("these
+  outcomes are impossible"). Disambiguate with evidence — here, whether other
+  runs put mass on the skipped bins — rather than assuming either reading.
+- When repairing by redistribution, spread symmetrically: trailing-gap
+  interpolation looks equivalent and silently shifts the mean by half the
+  coarsening step.
+- A guard whose gate encodes the failure's impossibility ("can never happen
+  for use_pmf") is the guard that misses it. Warnings also need a persistence
+  channel; a 3am log line protects nothing.
+
+---
+
 ## 2026-07-19 — Correlated directional-inference errors (floor used as ceiling, on-schedule read as late, minimum read as typical, precursor read as negative) → 17% vs 41.1% crowd on 44620; first miss with ALL prior defenses live
 
 | | |
