@@ -156,6 +156,12 @@ def reset_scrape_dedupe_scope(token: object) -> None:
     _SCRAPE_DEDUPE_SCOPE.reset(token)
 
 
+def get_scrape_dedupe_scope() -> str:
+    """Return the dedupe scope active in the current async context."""
+
+    return _SCRAPE_DEDUPE_SCOPE.get()
+
+
 def _scoped_scrape_key(url: str, scope: str) -> str:
     return f"{scope}\0{canonical_scrape_url(url)}"
 

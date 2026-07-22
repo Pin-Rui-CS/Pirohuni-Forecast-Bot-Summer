@@ -10,7 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from config import SERPAPI_API_KEY
+from config import ENABLE_FIRECRAWL_GENERAL_SCRAPE, SERPAPI_API_KEY
 from llm_client import call_llm
 from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
 from utils import _truncate_text, display_source_date, tweet_url_date
@@ -33,6 +33,9 @@ SERPAPI_SEARCH_URL = "https://serpapi.com/search"
 _MAX_RANKING_INPUT_RESULTS = 80
 _MAX_SCRAPE_CHARS = 18_000
 _MAX_EXTRACT_INPUT_CHARS = 90_000
+# Firecrawl's own page-render timeout for general research scrapes (its HTTP
+# client gets +15 s headroom on top; see research.firecrawl_scrape).
+_FIRECRAWL_GENERAL_TIMEOUT_SECONDS = 30
 # Soft-stop gate for the scrape-cycle loop: measured extract calls ran 6K-25K
 # input tokens in chars/4 units (44773 ledger); rescaled x1.25 to the
 # 3.2-chars/token units introduced 2026-07-19 (same physical budget). A cycle
@@ -975,6 +978,64 @@ async def _scrape_targets(
                 ),
                 engine=source_ledger.ENGINE_SKIPPED_DUPLICATE,
             )
+
+        # Firecrawl first (main-content markdown, JS/PDF rendering, bot-wall
+        # bypass); Crawl4AI below stays as the free fallback. The shared
+        # per-question credit budget in research.firecrawl_scrape hard-caps
+        # spend and reserves first claim for the resolution-path URLs.
+        firecrawl_error = ""
+        if ENABLE_FIRECRAWL_GENERAL_SCRAPE:
+            from research.firecrawl_scrape import (
+                GENERAL_MAX_AGE_MS,
+                FirecrawlBudgetExceededError,
+                FirecrawlCreditError,
+                firecrawl_exhausted,
+                firecrawl_scrape_markdown,
+                mark_firecrawl_exhausted,
+            )
+
+            if not firecrawl_exhausted():
+                try:
+                    content = await firecrawl_scrape_markdown(
+                        item.url,
+                        _FIRECRAWL_GENERAL_TIMEOUT_SECONDS,
+                        max_age_ms=GENERAL_MAX_AGE_MS,
+                    )
+                    record_scrape_content(item.url, content)
+                    if content.strip():
+                        return _finish(
+                            Scrape(
+                                cycle=0,
+                                group=group.group,
+                                group_purpose=group.group_purpose,
+                                url=item.url,
+                                purpose=item.purpose,
+                                ok=True,
+                                content=_truncate_text(content, _MAX_SCRAPE_CHARS),
+                            ),
+                            engine=source_ledger.ENGINE_FIRECRAWL,
+                        )
+                    firecrawl_error = "Firecrawl returned no content."
+                except FirecrawlCreditError as exc:
+                    mark_firecrawl_exhausted()
+                    firecrawl_error = f"{exc}"
+                    logger.warning(
+                        "Firecrawl exhausted (credits/auth) on %s — falling back "
+                        "to Crawl4AI for the rest of this run: %s",
+                        item.url,
+                        exc,
+                    )
+                except FirecrawlBudgetExceededError as exc:
+                    firecrawl_error = f"{exc}"
+                    logger.info("%s", exc)
+                except Exception as exc:
+                    firecrawl_error = f"{type(exc).__name__}: {exc}"
+                    logger.warning(
+                        "Firecrawl scrape failed for %s: %s — falling back to Crawl4AI.",
+                        item.url,
+                        firecrawl_error,
+                    )
+
         crawl_error = ""
         try:
             content = await basic_crawl_markdown(item.url)
@@ -1027,6 +1088,14 @@ async def _scrape_targets(
                 engine="wayback-snapshot",
             )
 
+        combined_error = "; ".join(
+            part
+            for part in (
+                f"firecrawl: {firecrawl_error}" if firecrawl_error else "",
+                f"crawl4ai: {crawl_error}" if crawl_error else "",
+            )
+            if part
+        )
         return _finish(
             Scrape(
                 cycle=0,
@@ -1035,7 +1104,7 @@ async def _scrape_targets(
                 url=item.url,
                 purpose=item.purpose,
                 ok=False,
-                error=crawl_error,
+                error=combined_error or "scrape returned no content",
             ),
             engine=source_ledger.ENGINE_CRAWL4AI_BASIC,
         )

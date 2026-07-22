@@ -99,6 +99,19 @@ ENABLE_FIRECRAWL_RESEARCH = _env_bool("ENABLE_FIRECRAWL_RESEARCH", True)
 ENABLE_TAVILY_RESEARCH = _env_bool("ENABLE_TAVILY_RESEARCH", True)
 ENABLE_PREDICTION_MARKET_RESEARCH = _env_bool("ENABLE_PREDICTION_MARKET_RESEARCH", True)
 FIRECRAWL_SEARCH_TBS = os.getenv("FIRECRAWL_SEARCH_TBS", "").strip()
+# Firecrawl-first scraping of general research URLs (the serp_research scrape
+# cycles). Resolution-criteria scraping always tries Firecrawl when a key is
+# present; this toggle only governs the general research path.
+ENABLE_FIRECRAWL_GENERAL_SCRAPE = _env_bool("ENABLE_FIRECRAWL_GENERAL_SCRAPE", True)
+# Hard per-question Firecrawl credit cap shared by the resolution and general
+# research paths. Resolution URLs get first claim: until the resolution scraper
+# finishes, general research must leave FIRECRAWL_RESOLUTION_CREDIT_RESERVE
+# credits of the cap untouched (10 matches scrape_resolution_sources'
+# max_urls). See research/firecrawl_scrape.py for the budget semantics.
+FIRECRAWL_QUESTION_CREDIT_CAP = int(os.getenv("FIRECRAWL_QUESTION_CREDIT_CAP", "25"))
+FIRECRAWL_RESOLUTION_CREDIT_RESERVE = int(
+    os.getenv("FIRECRAWL_RESOLUTION_CREDIT_RESERVE", "10")
+)
 # Tavily search depth: basic|advanced|fast|ultra-fast (basic = 1 credit/query).
 TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "basic").strip()
 

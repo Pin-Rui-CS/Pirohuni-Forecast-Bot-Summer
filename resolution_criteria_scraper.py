@@ -25,56 +25,29 @@ import os
 import re
 from dataclasses import dataclass
 
-import httpx
-
-from config import FIRECRAWL_API_KEY, OPENROUTER_API_KEY, llm_rate_limiter  # noqa: E402
+from config import OPENROUTER_API_KEY, llm_rate_limiter  # noqa: E402
 from monetary_cost_manager import (  # noqa: E402
     OPENROUTER_USAGE_ACCOUNTING,
     HardLimitExceededError,
     MonetaryCostManager,
 )
 
-logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Firecrawl single-page scrape configuration
-# ---------------------------------------------------------------------------
 # Resolution sources are scraped with Firecrawl FIRST (its rendering handles
 # JS-heavy and PDF sources well); the local Crawl4AI basic crawl is the
-# fallback. See _scrape_resolution_url for the ordering and fallback rules.
-_FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v2/scrape"
-# onlyMainContent=True lets Firecrawl strip nav/header/footer chrome at the DOM
-# level. Flip to False if a resolution miss ever traces back to a dropped
-# sidebar/widget stat (e.g. a bare "Predictions 3,903,957" count).
-_FIRECRAWL_ONLY_MAIN_CONTENT = True
-# Reuse a page scraped within the last hour; resolution values are
-# time-sensitive so we do not want Firecrawl's 2-day default cache.
-_FIRECRAWL_MAX_AGE_MS = 3_600_000
-
-# Substrings in a Firecrawl error/status that mean the key cannot recover this
-# run (out of credits, auth failure). Mirrors research.pipeline's marker set.
-_FIRECRAWL_EXHAUSTION_MARKERS = (
-    "402",
-    "payment required",
-    "401",
-    "unauthorized",
-    "invalid api key",
-    "403",
-    "forbidden",
-    "insufficient",
-    "out of credit",
-    "no credit",
-    "quota",
-    "usage limit",
+# fallback. The Firecrawl client, exhaustion flag, and per-question credit
+# budget live in research.firecrawl_scrape (shared with the general research
+# scrape path); resolution scrapes pass priority=True, which gives them first
+# claim on the per-question credit cap.
+from research.firecrawl_scrape import (  # noqa: E402
+    RESOLUTION_MAX_AGE_MS,
+    FirecrawlCreditError as _FirecrawlCreditError,
+    firecrawl_exhausted,
+    firecrawl_scrape_markdown,
+    mark_firecrawl_exhausted,
+    release_resolution_reserve,
 )
 
-# Process-level memo: once Firecrawl signals credit/auth exhaustion, every later
-# URL this run skips straight to the Crawl4AI fallback without re-probing.
-_firecrawl_exhausted = False
-
-
-class _FirecrawlCreditError(RuntimeError):
-    """Raised when Firecrawl fails in a way that will not recover this run."""
+logger = logging.getLogger(__name__)
 
 
 def _get_openrouter_api_key() -> str:
@@ -704,66 +677,6 @@ async def _basic_crawl_markdown(url: str, timeout: int) -> str:
     return await basic_crawl_markdown(url, timeout=timeout)
 
 
-def _looks_like_firecrawl_exhaustion(text: str) -> bool:
-    lowered = str(text or "").lower()
-    return any(marker in lowered for marker in _FIRECRAWL_EXHAUSTION_MARKERS)
-
-
-async def _firecrawl_scrape_markdown(url: str, timeout: int) -> str:
-    """Scrape one page with Firecrawl's /v2/scrape endpoint; return raw markdown.
-
-    Single-page only — no crawling or link-following. Raises
-    ``_FirecrawlCreditError`` when the failure is a credit/auth exhaustion (so
-    the caller can stop probing Firecrawl for the rest of the run), and a plain
-    exception on any other failure (so the caller falls back to Crawl4AI for
-    just that URL). Returns "" if the page yielded no markdown.
-    """
-    if not FIRECRAWL_API_KEY:
-        raise _FirecrawlCreditError("Missing FIRECRAWL_API_KEY for Firecrawl scraping.")
-
-    # PDF parsing is enabled by Firecrawl's defaults, so no "parsers" field is
-    # sent (its value is an array of objects, and a malformed field would 400
-    # every scrape and silently route everything to the Crawl4AI fallback).
-    payload = {
-        "url": url,
-        "formats": ["markdown"],
-        "onlyMainContent": _FIRECRAWL_ONLY_MAIN_CONTENT,
-        "maxAge": _FIRECRAWL_MAX_AGE_MS,
-        "timeout": max(1, int(timeout)) * 1000,
-    }
-    # Give the HTTP client a little headroom over Firecrawl's own page timeout.
-    async with httpx.AsyncClient(timeout=max(1, int(timeout)) + 15) as client:
-        response = await client.post(
-            _FIRECRAWL_SCRAPE_URL,
-            headers={
-                "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-
-    if response.status_code in (401, 402, 403, 429):
-        raise _FirecrawlCreditError(
-            f"Firecrawl scrape returned HTTP {response.status_code} for {url}: {response.text[:300]}"
-        )
-    response.raise_for_status()
-
-    body = response.json()
-    if not isinstance(body, dict):
-        raise ValueError(f"Firecrawl scrape response for {url!r} was not a JSON object.")
-    if body.get("success") is False:
-        error = body.get("error") or body.get("message") or body
-        if _looks_like_firecrawl_exhaustion(error):
-            raise _FirecrawlCreditError(f"Firecrawl scrape error for {url!r}: {error}")
-        raise ValueError(f"Firecrawl scrape error for {url!r}: {error}")
-
-    data = body.get("data", body)
-    markdown = ""
-    if isinstance(data, dict):
-        markdown = str(data.get("markdown") or "")
-    return markdown
-
-
 async def _scrape_resolution_url(
     url: str,
     question_text: str,
@@ -783,7 +696,6 @@ async def _scrape_resolution_url(
     raw page markdown (no relevance filter, no link-following) so short,
     semantically-thin facts (e.g. a bare "Predictions 3,903,957") are preserved.
     """
-    global _firecrawl_exhausted
     import source_ledger
 
     from Crawl4AI.crawl import claim_scrape_url, get_cached_scrape_content, record_scrape_content
@@ -911,9 +823,11 @@ async def _scrape_resolution_url(
     # ------------------------------------------------------------------
     # 1. Firecrawl single-page scrape (skipped once credits/auth exhausted).
     # ------------------------------------------------------------------
-    if not _firecrawl_exhausted:
+    if not firecrawl_exhausted():
         try:
-            raw = await _firecrawl_scrape_markdown(url, timeout)
+            raw = await firecrawl_scrape_markdown(
+                url, timeout, max_age_ms=RESOLUTION_MAX_AGE_MS, priority=True
+            )
             record_scrape_content(url, raw)
             content = _truncate_scrape_content(raw)
             if content.strip():
@@ -922,7 +836,7 @@ async def _scrape_resolution_url(
                 )
             logger.info("Firecrawl returned no content for %s; falling back to Crawl4AI.", url)
         except _FirecrawlCreditError as exc:
-            _firecrawl_exhausted = True
+            mark_firecrawl_exhausted()
             logger.warning(
                 "Firecrawl exhausted (credits/auth) on %s: %s — falling back to "
                 "Crawl4AI for this and all remaining resolution URLs this run.",
@@ -1224,6 +1138,7 @@ async def scrape_resolution_sources(
             urls.append(url)
     if not urls:
         logger.info("No external URLs found in question text or resolution criteria.")
+        release_resolution_reserve()
         return ""
 
     if len(urls) > max_urls:
@@ -1232,13 +1147,19 @@ async def scrape_resolution_sources(
         )
         urls = urls[:max_urls]
     logger.info("Found %d resolution URL(s): %s", len(urls), urls)
-    results = await _scrape_resolution_urls(
-        list(urls),
-        question_text=question_text,
-        resolution_criteria=resolution_criteria,
-        max_concurrent=max_concurrent,
-        timeout=timeout,
-    )
+    try:
+        results = await _scrape_resolution_urls(
+            list(urls),
+            question_text=question_text,
+            resolution_criteria=resolution_criteria,
+            max_concurrent=max_concurrent,
+            timeout=timeout,
+        )
+    finally:
+        # Resolution scraping holds first claim on the per-question Firecrawl
+        # credit budget; once its URLs are done (or failed), hand the rest of
+        # the cap to the general research path.
+        release_resolution_reserve()
 
     criteria_url_set = set(criteria_urls)
     sections: list[str] = []
