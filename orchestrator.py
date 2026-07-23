@@ -24,6 +24,7 @@ from monetary_cost_manager import (
     research_reserve_input_tokens,
 )
 from research.pipeline import run_research
+import research_trace
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,7 @@ async def forecast_individual_question(
         return summary_of_forecast
 
     artifacts = QuestionArtifacts(question_id, post_id, title, question_type or "unknown")
+    research_trace.begin_question(artifacts.dir)
     question_started = time.monotonic()
 
     # The reserve keeps optional research work (extra scrape cycles, provider
@@ -260,6 +262,7 @@ async def forecast_individual_question(
         usage_yaml_table=usage_yaml_table,
         url_events=source_ledger.drain_events(scope),
     )
+    research_trace.finalize()
     artifacts.save_forecast_json(
         {
             "question_details": _question_snapshot(question_details),

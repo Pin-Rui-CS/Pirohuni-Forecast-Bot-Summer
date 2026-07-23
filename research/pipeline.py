@@ -19,6 +19,7 @@ from config import (
 from llm_client import call_llm
 from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
 from utils import _truncate_text, find_future_full_dates
+import research_trace
 import source_ledger
 
 logger = logging.getLogger(__name__)
@@ -300,6 +301,19 @@ async def run_research(
         if should_include_provider_result(name, content):
             included_results.append((name, content or ""))
 
+    # Trace every provider outcome — research.md keeps only the included ones,
+    # so an excluded/unavailable provider is otherwise invisible post-hoc.
+    # The evidence plan already emitted its own (richer) event.
+    for name, content in results:
+        if name == "Evidence Plan":
+            continue
+        research_trace.emit(
+            "provider",
+            name,
+            content or "",
+            status="included" if should_include_provider_result(name, content) else "excluded",
+        )
+
     if not included_results:
         return ResearchBundle(
             evidence_plan=evidence_plan,
@@ -325,6 +339,12 @@ async def run_research(
         provider_results=included_results,
         question_dates=question_dates,
     )
+    research_trace.emit(
+        "artifact_check",
+        "artifact check v1 (pre-retry)",
+        artifact_check or {},
+        meta={"chain": "artifact_check", "version": 1},
+    )
 
     # Stage 5: focused retry aimed only at the missing artifact. Reuse the search
     # provider that already returned usable results this run, so the retry never
@@ -347,6 +367,19 @@ async def run_research(
             "[research] Required artifact %s but focused retry skipped: it would eat "
             "into the input tokens reserved for compile/forecast",
             artifact_check.get("status"),
+        )
+        research_trace.emit(
+            "retry_decision",
+            "focused artifact retry",
+            {
+                "wants_retry": True,
+                "ran": False,
+                "reason": "skipped: would breach the compile/forecast input reserve",
+                "artifact_status": artifact_check.get("status"),
+                "retry_queries": artifact_check.get("retry_queries") or [],
+                "retry_provider": retry_label,
+            },
+            status="skipped",
         )
     elif wants_artifact_retry:
         retry_queries = [
@@ -386,7 +419,21 @@ async def run_research(
                     timeout=ARTIFACT_RETRY_TIMEOUT_SECONDS,
                 ),
             )
-            if should_include_provider_result(*retry_result):
+            retry_included = should_include_provider_result(*retry_result)
+            research_trace.emit(
+                "retry_decision",
+                "focused artifact retry",
+                {
+                    "wants_retry": True,
+                    "ran": True,
+                    "included": retry_included,
+                    "artifact_status": artifact_check.get("status"),
+                    "retry_queries": retry_queries,
+                    "retry_provider": retry_label,
+                },
+                status="ok" if retry_included else "no-usable-result",
+            )
+            if retry_included:
                 included_results.append((retry_result[0], retry_result[1] or ""))
             else:
                 if _is_quota_or_auth_error(retry_result[1]):
@@ -396,6 +443,28 @@ async def run_research(
                 # web search was unavailable.
                 if chosen_search_result is None and _is_unavailable_result(retry_result[1]):
                     degraded_search_providers.append(f"Focused Artifact Retry ({retry_label})")
+    else:
+        no_retry_reason = (
+            "artifact status is %r (retry only fires on missing/partial)"
+            % (artifact_check or {}).get("status")
+            if (artifact_check or {}).get("status") not in {"missing", "partial"}
+            else (
+                "artifact check returned no retry queries"
+                if not (artifact_check or {}).get("retry_queries")
+                else "no retry-capable search provider available"
+            )
+        )
+        research_trace.emit(
+            "retry_decision",
+            "focused artifact retry",
+            {
+                "wants_retry": False,
+                "ran": False,
+                "reason": no_retry_reason,
+                "artifact_status": (artifact_check or {}).get("status"),
+                "retry_queries": (artifact_check or {}).get("retry_queries") or [],
+            },
+        )
 
     # Stage 5.5: if the focused retry actually added evidence, re-run the
     # verification gate on the augmented evidence. The Stage-4 check ran on
@@ -412,6 +481,13 @@ async def run_research(
         )
         if refreshed_check is not None:
             artifact_check = refreshed_check
+        research_trace.emit(
+            "artifact_check",
+            "artifact check v2 (post-retry reconcile)",
+            refreshed_check or {},
+            status="ok" if refreshed_check is not None else "failed",
+            meta={"chain": "artifact_check", "version": 2},
+        )
 
     # Stage 6: compile everything into the forecast-ready brief.
     from compiler import compile_research_report
@@ -424,8 +500,20 @@ async def run_research(
         provider_results=included_results,
         artifact_check=artifact_check,
     )
+    research_trace.emit(
+        "brief",
+        "compiler output (pre-banner)",
+        compiled_report,
+        meta={"chain": "brief"},
+    )
     compiled_report = _apply_artifact_status_banner(compiled_report, artifact_check)
     compiled_report = _apply_degradation_warning(compiled_report, degraded_search_providers)
+    research_trace.emit(
+        "brief",
+        "compiled brief (as sent to forecasters)",
+        compiled_report,
+        meta={"chain": "brief"},
+    )
 
     raw_research_view = _apply_artifact_status_banner(
         _build_raw_research_view(included_results), artifact_check

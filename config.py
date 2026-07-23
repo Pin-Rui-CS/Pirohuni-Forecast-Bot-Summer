@@ -114,6 +114,10 @@ FIRECRAWL_RESOLUTION_CREDIT_RESERVE = int(
 )
 # Tavily search depth: basic|advanced|fast|ultra-fast (basic = 1 credit/query).
 TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "basic").strip()
+# Research evolution trace: per-question trace/ folder + evolution.md showing
+# how the research changed step by step (see docs/research_trace_plan.md).
+# Deterministic write-through only — zero added LLM calls, never fails a run.
+ENABLE_RESEARCH_TRACE = _env_bool("ENABLE_RESEARCH_TRACE", True)
 
 # Tournament IDs
 Q4_2024_AI_BENCHMARKING_ID = 32506

@@ -5,6 +5,7 @@ import json
 from llm_client import call_llm
 from monetary_cost_manager import HardLimitExceededError
 from utils import _truncate_text
+import research_trace
 
 
 DEFAULT_EVIDENCE_PLAN_MODEL = "anthropic/claude-sonnet-5"
@@ -41,11 +42,22 @@ async def build_evidence_plan(
             _label="evidence-plan",
         )
         parsed = _extract_json_object(response)
-        return _format_plan(parsed)
+        plan = _format_plan(parsed)
+        research_trace.emit("evidence_plan", "evidence plan", plan, meta={"model": model})
+        return plan
     except HardLimitExceededError:
         raise
     except Exception as exc:
-        return _fallback_plan(title, exc)
+        plan = _fallback_plan(title, exc)
+        research_trace.emit(
+            "evidence_plan",
+            "evidence plan",
+            plan,
+            status="fallback",
+            error=f"{type(exc).__name__}: {exc}",
+            meta={"model": model},
+        )
+        return plan
 
 
 def _build_prompt(

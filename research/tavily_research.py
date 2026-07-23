@@ -35,6 +35,7 @@ from research.serp_research import (
     run_scrape_cycles,
     scraped_ok_urls,
 )
+import research_trace
 import source_ledger
 from utils import display_source_date
 
@@ -159,6 +160,12 @@ async def build_tavily_research_result(
             round_label="search",
             detail=f"query: {result.query}",
         )
+    research_trace.emit(
+        "search_results",
+        "tavily results (per-query rank order)",
+        research_trace.format_search_results(search_results),
+        meta={"queries": queries, "result_count": len(search_results)},
+    )
     ranked_url_groups = await rank_tavily_urls(
         title=title,
         resolution_criteria=resolution_criteria,
@@ -239,6 +246,7 @@ async def rank_tavily_urls(
         results=results[:_MAX_RANKING_INPUT_RESULTS],
         max_ranked_urls=max_ranked_urls,
     )
+    research_trace.emit("rank", "tavily ranking prompt", prompt, meta={"model": model})
     response = await call_llm(
         prompt,
         model=model,
@@ -248,7 +256,13 @@ async def rank_tavily_urls(
     )
     parsed = _extract_json_value(response)
     ranked_groups = _parse_ranked_url_groups(parsed)
-    return _dedupe_ranked_url_groups(ranked_groups, max_ranked_urls)
+    deduped_groups = _dedupe_ranked_url_groups(ranked_groups, max_ranked_urls)
+    research_trace.emit(
+        "rank",
+        "tavily ranked url groups",
+        research_trace.ranked_groups_payload(deduped_groups),
+    )
+    return deduped_groups
 
 
 def format_tavily_research(result: TavilyResearchResult) -> str:

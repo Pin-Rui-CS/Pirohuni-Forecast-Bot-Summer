@@ -15,6 +15,7 @@ from monetary_cost_manager import (
     MonetaryCostManager,
 )
 from utils import _truncate_text
+import research_trace
 
 logger = logging.getLogger(__name__)
 
@@ -430,10 +431,34 @@ async def _compress_section_text(name: str, content: str, target_chars: int) -> 
             "compiler precompress failed for section %r: %s: %s",
             name, type(exc).__name__, exc,
         )
+        # The exception type is otherwise lost (a $0 ledger row with no error
+        # text — the 44804 "0.0s precompress" mystery). Record it.
+        research_trace.emit(
+            "precompress",
+            name,
+            "",
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}",
+            meta={"target_chars": target_chars, "input_chars": len(content)},
+        )
         return None
     compressed = (compressed or "").strip()
     if not compressed:
+        research_trace.emit(
+            "precompress",
+            name,
+            "",
+            status="failed",
+            error="compression call returned empty output",
+            meta={"target_chars": target_chars, "input_chars": len(content)},
+        )
         return None
+    research_trace.emit(
+        "precompress",
+        name,
+        compressed,
+        meta={"target_chars": target_chars, "input_chars": len(content)},
+    )
     return (
         f"[Section condensed by a lossless-compression pass from "
         f"{len(content):,} to {len(compressed):,} chars — duplicates and "
@@ -453,6 +478,14 @@ def _visible_truncate(name: str, content: str, target_chars: int) -> str:
     )
     logger.warning(
         "compiler budget truncation: dropped %d chars from section %r", dropped, name
+    )
+    research_trace.emit(
+        "precompress",
+        name,
+        content[max(0, target_chars):],
+        status="truncated",
+        error=f"visible truncation dropped {dropped} chars from the tail",
+        meta={"target_chars": target_chars, "input_chars": len(content)},
     )
     return content[: max(0, target_chars)].rstrip() + marker
 
@@ -561,6 +594,23 @@ async def _try_llm_compile(
         return None
 
     cleaned_sections = await _fit_sections_to_budget(cleaned_sections)
+    # Byte-exact record of what the compiler can know. "Dropped by the
+    # compiler" vs "never reached the compiler" (the 44619 forensic) becomes
+    # a grep against this payload.
+    research_trace.emit(
+        "compiler_input",
+        "fitted sections (byte-exact compiler input)",
+        "\n\n".join(
+            f"===== SECTION: {name} ({len(content):,} chars) =====\n{content}"
+            for name, content in cleaned_sections
+        ),
+        meta={
+            "model": model,
+            "sections": [
+                {"name": name, "chars": len(content)} for name, content in cleaned_sections
+            ],
+        },
+    )
 
     prompt = _build_compiler_prompt(
         title=title,

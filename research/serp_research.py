@@ -14,6 +14,7 @@ from config import ENABLE_FIRECRAWL_GENERAL_SCRAPE, SERPAPI_API_KEY
 from llm_client import call_llm
 from monetary_cost_manager import HardLimitExceededError, MonetaryCostManager
 from utils import _truncate_text, display_source_date, tweet_url_date
+import research_trace
 import source_ledger
 from query_maker import (
     DEFAULT_QUERY_COUNT,
@@ -246,6 +247,12 @@ async def build_serp_research_result(
             round_label="search",
             detail=f"query: {result.query}",
         )
+    research_trace.emit(
+        "search_results",
+        "serpapi results (per-query rank order)",
+        research_trace.format_search_results(organic_results),
+        meta={"queries": queries, "result_count": len(organic_results)},
+    )
     ranked_url_groups = await rank_serp_urls(
         title=title,
         resolution_criteria=resolution_criteria,
@@ -327,6 +334,7 @@ async def rank_serp_urls(
         results=results[:_MAX_RANKING_INPUT_RESULTS],
         max_ranked_urls=max_ranked_urls,
     )
+    research_trace.emit("rank", "serp ranking prompt", prompt, meta={"model": model})
     response = await call_llm(
         prompt,
         model=model,
@@ -336,7 +344,13 @@ async def rank_serp_urls(
     )
     parsed = _extract_json_value(response)
     ranked_groups = _parse_ranked_url_groups(parsed)
-    return _dedupe_ranked_url_groups(ranked_groups, max_ranked_urls)
+    deduped_groups = _dedupe_ranked_url_groups(ranked_groups, max_ranked_urls)
+    research_trace.emit(
+        "rank",
+        "serp ranked url groups",
+        research_trace.ranked_groups_payload(deduped_groups),
+    )
+    return deduped_groups
 
 
 def _record_ranked_url_groups(groups: list[RankedSerpUrlGroup]) -> None:
@@ -430,6 +444,21 @@ async def run_scrape_cycles(
         valid_names = {group.group for group in groups}
         lack = [name for name in lack if name in valid_names]
         cycles.append(Cycle(cycle=cycle_no, scrapes=scrapes, report=report, lacking_groups=lack))
+        # Trace each cycle's report BEFORE the next cycle rewrites it — only the
+        # final version survives into research.md, so cycle-over-cycle drops are
+        # otherwise invisible (the 44267 "correction discarded" class).
+        trace_tool, trace_phase = source_ledger.current_context()
+        research_trace.emit(
+            "extract_report",
+            f"{trace_tool} extract report — cycle {cycle_no}",
+            report,
+            meta={
+                "chain": f"extract:{trace_tool}:{trace_phase}",
+                "cycle": cycle_no,
+                "lacking_groups": lack,
+                "scraped_urls": [scrape.url for scrape in scrapes],
+            },
+        )
         needed = set(lack)
         if not needed:
             break
@@ -870,6 +899,20 @@ async def _scrape_targets(
                 chars=len(scrape.content),
                 round_label=f"cycle {cycle_no}",
                 detail=group.group,
+            )
+            tool, phase = source_ledger.current_context()
+            research_trace.emit(
+                "scrape",
+                scrape.url,
+                scrape.content if scrape.ok else (scrape.error or "(no content)"),
+                status="ok" if scrape.ok else "failed",
+                error="" if scrape.ok else scrape.error,
+                meta={
+                    "engine": engine,
+                    "group": group.group,
+                    "cycle": cycle_no,
+                    "phase": f"{tool} / {phase}",
+                },
             )
             return scrape
 

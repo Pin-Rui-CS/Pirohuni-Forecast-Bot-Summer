@@ -910,7 +910,19 @@ async def _scrape_resolution_urls(
                 timeout=timeout,
             )
 
-    return await asyncio.gather(*(scrape_one(url) for url in urls))
+    results = await asyncio.gather(*(scrape_one(url) for url in urls))
+    import research_trace
+
+    for result in results:
+        research_trace.emit(
+            "scrape",
+            result.url,
+            result.content if result.success else (result.error or "(no content)"),
+            status="ok" if result.success else "failed",
+            error="" if result.success else result.error,
+            meta={"engine": result.provider_used, "phase": "resolution"},
+        )
+    return results
 
 
 # ===========================================================================
