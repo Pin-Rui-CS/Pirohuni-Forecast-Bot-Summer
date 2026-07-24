@@ -212,9 +212,9 @@ The last thing you write is your final answer as: "Probability: ZZ%", 0-100
 def extract_probability_from_response_as_percentage_not_decimal(
     forecast_text: str,
 ) -> float:
-    matches = re.findall(r"(\d+)%", forecast_text)
+    matches = re.findall(r"(\d+(?:\.\d+)?)\s*%", forecast_text)
     if matches:
-        number = int(matches[-1])
+        number = round(float(matches[-1]))
         number = min(99, max(1, number))
         return number
     else:

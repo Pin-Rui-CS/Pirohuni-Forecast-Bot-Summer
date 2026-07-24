@@ -33,7 +33,8 @@ bot_run.log
 *_What_will_*.txt
 
 # Local forecast post-mortem / analysis folders (not committed)
-44267_What_will_be_the_highest_daily_number_of_PLA_aircraft_tracke/
+44805_Will_the_2026_World_Humanoid_Robot_Games_1500-meter_run_be_w
+44806_Will_the_Official_Loch_Ness_Monster_Sightings_Register_repor
 
 # Feedback-loop architecture rebuild — work in progress, not committed yet
 # (standalone package; nothing in the main pipeline imports it)
